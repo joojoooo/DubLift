@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>DubLift · Local audio studio</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/" aria-label="DubLift home"
+        ><span class="mark">D<span>↗</span></span
+        >DubLift<span class="tag">LOCAL</span></a
+      >
+      <div class="connection">
+        <span id="connection-dot" class="dot"></span
+        ><span id="connection">Connecting…</span>
+      </div>
+    </header>
+    <main>
+      <section class="intro">
+        <div>
+          <p class="eyebrow">YOUR PICTURE. YOUR LANGUAGE.</p>
+          <h1>A better view.<br /><span>In Italiano.</span></h1>
+          <p class="lede">
+            Keep the quality you chose. Add Italian audio, aligned to your
+            source, one segment at a time.
+          </p>
+        </div>
+        <div class="install panel">
+          <span class="eyebrow">ADD TO YOUR PLAYER</span>
+          <h2>One local connection.</h2>
+          <p>
+            Install this manifest in Stremio or Nuvio. Use this computer’s LAN
+            address when playing on another device.
+          </p>
+          <div class="copy-row">
+            <input
+              id="manifest"
+              readonly
+              aria-label="Addon manifest URL"
+            /><button
+              id="copy-manifest"
+              class="icon-button"
+              title="Copy manifest URL"
+            >
+              Copy
+            </button>
+          </div>
+          <a id="install" class="button primary" href="#"
+            >Install in Stremio ↗</a
+          >
+        </div>
+      </section>
+      <section class="stats" aria-label="Runtime diagnostics">
+        <div>
+          <span class="small">MEDIA ENGINE</span
+          ><strong id="engine-state">Checking…</strong>
+        </div>
+        <div>
+          <span class="small">PLAYING / LISTED</span
+          ><strong id="session-count">0</strong>
+        </div>
+        <div>
+          <span class="small">ROLLING CACHE</span
+          ><strong id="cache-size">0 MiB</strong>
+        </div>
+        <div>
+          <span class="small">ORIGIN BYTES READ</span
+          ><strong id="origin-bytes">0 MiB</strong>
+        </div>
+      </section>
+      <div class="workspace">
+        <section class="playback">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">NOW IN DUBLIFT</span>
+              <h2>Latest streams & playback</h2>
+            </div>
+            <span class="pill">VIDEO · STREAM COPY</span>
+          </div>
+          <p id="lookup-status" class="help" role="status"></p>
+          <p class="help">New lookups replace old results while keeping current playback. Selecting another stream keeps only that playback. Inactive sessions and their caches expire after one hour.</p>
+          <div id="sessions">
+            <div id="empty" class="empty">
+              <div class="wave">▂ ▅ ▃ ▇ ▄ ▆ ▂</div>
+              <h3>Your next stream starts here.</h3>
+              <p>
+                Choose a DubLift stream in your player, or resolve a title
+                below. Active sessions and audio controls appear here.
+              </p>
+            </div>
+          </div>
+          <details class="panel resolver" open>
+            <summary>
+              Resolve a title
+              <span class="small">DEVELOPMENT & DIAGNOSTICS</span>
+            </summary>
+            <form id="resolve-form">
+              <label
+                >Title preset<select id="preset">
+                  <option value="">Custom ID</option>
+                  <optgroup label="Movies">
+                    <option value="movie:687163">Project Hail Mary</option>
+                    <option value="movie:1204680">Coyote vs. Acme</option>
+                    <option value="movie:603">The Matrix</option>
+                    <option value="movie:27205">Inception</option>
+                    <option value="movie:157336">Interstellar</option>
+                  </optgroup>
+                  <optgroup label="Series">
+                    <option value="series:81349">Devs</option>
+                    <option value="series:299939">
+                      Monster: The Lizzie Borden Story
+                    </option>
+                    <option value="series:95350">Lanterns</option>
+                    <option value="series:94997">House of the Dragon</option>
+                    <option value="series:94605">Arcane</option>
+                  </optgroup>
+                </select></label
+              >
+              <div class="two-col">
+                <label
+                  >Type<select id="content-type">
+                    <option value="movie">Movie</option>
+                    <option value="series">Series</option>
+                  </select></label
+                ><label
+                  >Content ID<input
+                    id="content-id"
+                    placeholder="tt0133093 or tmdb:603"
+                    required
+                /></label>
+              </div>
+              <p class="help">
+                Series IDs include the episode: <code>tmdb:81349:1:1</code>. IDs
+                are forwarded to the configured addon.
+              </p>
+              <button class="button secondary" type="submit">
+                Find streams →</button
+              ><span id="resolve-status" role="status"></span>
+            </form>
+          </details>
+          <details class="panel">
+            <summary>Activity log</summary>
+            <ol id="events" class="events">
+              <li>No events yet.</li>
+            </ol>
+          </details>
+        </section>
+        <aside>
+          <form id="settings-form" class="panel settings">
+            <div class="section-heading">
+              <div>
+                <span class="eyebrow">MAKE IT YOURS</span>
+                <h2>Source settings</h2>
+              </div>
+            </div>
+            <p class="help">
+              Saved privately on this device. New users configure their own
+              upstream addons.
+            </p>
+            <div id="addons"></div>
+            <button id="add-addon" type="button" class="text-button">
+              + Add upstream addon
+            </button>
+            <hr />
+            <label class="switch-row"
+              ><input id="prefer-proxy" type="checkbox" /><span
+                ><strong>Prefer proxying upstream media through DubLift</strong
+                ><small
+                  >Off: let the player fetch eligible video directly from its
+                  origin. Headers, generated media and file remuxing still use
+                  DubLift.</small
+                ></span
+              ></label
+            >
+            <div class="direct-settings">
+              <label class="switch-row"
+                ><input id="direct-playback" type="checkbox" /><span
+                  ><strong>Use direct Vixsrc audio when possible</strong
+                  ><small
+                    >Let the player fetch untouched audio and video itself. Once
+                    their playlists are loaded, fully direct playback can
+                    continue after DubLift stops.</small
+                  ></span
+                ></label
+              ><label
+                >Direct audio tolerance<select id="direct-mode">
+                  <option value="finite">Only when all samples agree</option>
+                  <option value="infinite">
+                    Infinite · synchronize in the player
+                  </option>
+                </select></label
+              ><label id="direct-tolerance-label"
+                >Maximum absolute offset (seconds)<input
+                  id="direct-tolerance"
+                  type="number"
+                  min="0"
+                  step="0.001"
+                  value="0.125"
+              /></label>
+              <p class="help">
+                Default: ±0.125 seconds. Infinite skips the alignment threshold;
+                use the calculated delay in your player. Required headers or
+                remuxing can still need DubLift. Proxy preference takes
+                priority.
+              </p>
+            </div>
+            <label
+              >Minimum alignment confidence
+              <div class="range-row">
+                <input
+                  id="confidence"
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                /><output id="confidence-value">68%</output>
+              </div></label
+            ><label
+              >Search radius (seconds)<input
+                id="search-radius"
+                type="number"
+                min="5"
+                max="180"
+                required
+            /></label>
+            <label>Alignment samples<input id="alignment-samples" type="number" min="1" max="12" required /></label>
+            <p class="help">Samples run from near the beginning through later playback. One sample is fastest; finite direct-audio mode needs at least two samples to check the runtime.</p>
+            <label class="switch-row"><input id="start-immediately" type="checkbox"><span><strong>Start immediately with offset 0</strong><small>Play as soon as essential source preparation finishes. Apply the calculated offset to new audio segments when analysis finishes. Off: wait only for the first near-start sample, then play while the remaining samples run.</small></span></label>
+            <details>
+              <summary>Advanced settings</summary>
+              <label
+                >Public base URL<input
+                  id="public-url"
+                  type="url"
+                  placeholder="http://192.168.1.20:7000" /></label
+              ><label
+                >Listen address <small>Requires restart</small
+                ><input id="listen" required /></label
+              ><label
+                >Rolling cache (MiB)<input
+                  id="cache-mb"
+                  type="number"
+                  min="32"
+                  max="2048"
+                  required /></label
+              ><label>FFmpeg executable<input id="ffmpeg" required /></label
+              ><label>ffprobe executable<input id="ffprobe" required /></label
+              ><label
+                >Vixsrc base URL<input
+                  id="vix-base"
+                  type="url"
+                  required /></label
+              ><label
+                >TMDB API read token
+                <small>Optional IMDb mapping fallback</small
+                ><input id="tmdb-token" type="password" autocomplete="off"
+              /></label>
+            </details>
+            <button class="button primary save" type="submit">
+              Save settings</button
+            ><span id="save-state" role="status"></span>
+          </form>
+          <div class="footnote">
+            <span>↗</span>
+            <p>
+              Video stays at its original quality.<br />Only requested segments
+              and short audio windows are read. No full-file download.
+            </p>
+          </div>
+        </aside>
+      </div>
+    </main>
+    <footer>
+      DubLift <span>Local by design · Linux + Android / Termux</span>
+    </footer>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <template id="session-template"
+      ><article class="panel session">
+        <div class="session-top"><span class="eyebrow content"></span><span class="playback-badge"></span></div>
+        <h3 class="content-name"></h3>
+        <strong class="name"></strong>
+        <p class="stream-title"></p>
+        <p class="description"></p>
+        <p class="file-details help"></p>
+        <p class="status" role="status"></p>
+        <p class="sample-progress help" role="status"></p>
+        <div class="session-metrics">
+          <div>
+            <span class="small">LAST REQUESTED AREA</span
+            ><strong class="position">—</strong>
+          </div>
+          <div>
+            <span class="small">CONFIDENCE</span
+            ><strong class="confidence">—</strong>
+          </div>
+          <div>
+            <span class="small">OFFSET</span
+            ><strong class="offset">0.000 s</strong>
+          </div>
+        </div>
+        <div class="confidence-bar"><span></span></div>
+        <p class="tracks help"></p>
+        <div class="delivery-info">
+          <strong class="delivery-mode"></strong>
+          <p class="delivery-reason help"></p>
+          <p class="player-delay help"></p>
+        </div>
+        <label class="player-position-label" hidden
+          >Current player position (seconds)<input
+            class="player-position"
+            type="number"
+            min="0"
+            step="1"
+            placeholder="Needed to realign fully direct playback"
+        /></label>
+        <div class="actions">
+          <button class="button primary prepare">Prepare playback</button
+          ><button class="button secondary realign">
+            Realign from current position</button
+          ><button class="text-button copy">Copy HLS URL</button>
+        </div>
+        <details>
+          <summary>Fine-tune synchronization</summary>
+          <p class="help">
+            Positive offset plays Vixsrc audio later. Changes apply to upcoming
+            segments; seek or reopen playback to clear the player’s buffered
+            audio.
+          </p>
+          <form class="offset-form">
+            <label
+              >Manual offset (seconds)<input
+                class="manual"
+                type="number"
+                step="0.001"
+                min="-3600"
+                max="3600"
+                placeholder="Automatic" /></label
+            ><button class="button secondary">Apply</button
+            ><button type="button" class="text-button automatic">
+              Use automatic
+            </button>
+          </form>
+          <div class="actions">
+            <button class="text-button analyze">Analyze again</button
+            ><button class="text-button reset">
+              Reset saved synchronization
+            </button>
+          </div>
+          <p class="proxy help"></p>
+          <pre class="anchors"></pre>
+        </details>
+        <ul class="errors"></ul></article
+    ></template>
+  </body>
+</html>

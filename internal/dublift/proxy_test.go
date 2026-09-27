@@ -1,0 +1,111 @@
+package dublift
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestProxyPreferenceHeadersAndRange(t *testing.T) {
+	var header string
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header = r.Header.Get("X-Required")
+		http.ServeContent(w, r, "segment.ts", time.Time{}, strings.NewReader("0123456789abcdef"))
+	}))
+	defer origin.Close()
+	cfg, e := OpenConfig(filepath.Join(t.TempDir(), "config.json"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	server, e := NewServer(cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer server.Close()
+	v := server.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{URL: origin.URL})
+	direct := v.addResource(Origin{URL: origin.URL}, 42, true, false)
+	request := httptest.NewRequest("GET", direct, nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, request)
+	if w.Code != 307 || w.Header().Get("Location") != origin.URL {
+		t.Fatal("proxy preference off did not use direct playback", w.Code)
+	}
+	if v.Position != 42 {
+		t.Fatal("redirect playback position not tracked")
+	}
+	cfgValue := cfg.Get()
+	cfgValue.PreferProxy = true
+	if e = cfg.Save(cfgValue); e != nil {
+		t.Fatal(e)
+	}
+	request = httptest.NewRequest("GET", direct, nil)
+	request.Header.Set("Range", "bytes=3-7")
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, request)
+	if w.Code != 206 || w.Header().Get("Content-Range") != "bytes 3-7/16" || w.Body.String() != "34567" {
+		t.Fatalf("range changed: %d %v %s", w.Code, w.Header(), w.Body.String())
+	}
+	cfgValue.PreferProxy = false
+	cfg.Save(cfgValue)
+	forced := v.addResource(Origin{origin.URL, http.Header{"X-Required": {"forward-me"}}}, 50, true, false)
+	request = httptest.NewRequest("GET", forced, nil)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, request)
+	if w.Code != 200 || header != "forward-me" {
+		t.Fatal("required header was not transparently proxied")
+	}
+}
+func TestSubtitleShift(t *testing.T) {
+	raw := "WEBVTT\n\n00:00:09.000 --> 00:00:13.000\nCiao.\n"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, raw) }))
+	defer origin.Close()
+	h, e := ParseHLS([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:20\n#EXTINF:20,\nsub.vtt\n#EXT-X-ENDLIST\n"), Origin{URL: origin.URL + "/sub.m3u8"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	server := &Server{Net: NewNetwork()}
+	b, e := server.subtitles(context.Background(), &Session{}, Track{Asset: &Asset{HLS: h}}, 10, 6, 2, 1.4)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !bytes.Contains(b, []byte("00:00:11.000 --> 00:00:15.000")) || !bytes.Contains(b, []byte("MPEGTS:126000")) {
+		t.Fatalf("incorrect subtitle shift: %s", b)
+	}
+}
+
+func TestMappedSubtitlesUseRelativeAudioClockAndCache(t *testing.T) {
+	requests := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		io.WriteString(w, "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:126000\n\n00:00:09.000 --> 00:00:13.000\nCiao.\n")
+	}))
+	defer origin.Close()
+	h, err := ParseHLS([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:20\n#EXTINF:20,\nsub.vtt\n#EXT-X-ENDLIST\n"), Origin{URL: origin.URL + "/sub.m3u8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := NewByteCache(1 << 20)
+	ctx := context.Background()
+	cache.Get(ctx, "subtitle-clock:english", func() ([]byte, error) { return []byte("1.4"), nil })
+	server := &Server{Net: NewNetwork(), Engine: &Engine{Cache: cache}}
+	v := &Session{vixEnglish: &Track{Asset: &Asset{ID: "english"}}}
+	track := Track{Asset: &Asset{ID: "subtitles", HLS: h}}
+	for range 2 {
+		b, err := server.subtitles(ctx, v, track, 10, 6, 2, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(b, []byte("00:00:11.000 --> 00:00:15.000")) || !bytes.Contains(b, []byte("MPEGTS:90000")) {
+			t.Fatalf("native subtitle clock counted twice: %s", b)
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("subtitle text fetched %d times instead of cached", requests)
+	}
+}

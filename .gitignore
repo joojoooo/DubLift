@@ -1,0 +1,11 @@
+.local/
+bin/
+dist/
+*.log
+*.test
+coverage.out
+.env
+.env.*
+config.json
+alignment.json
+playback.key
