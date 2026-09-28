@@ -19,48 +19,55 @@
       </div>
     </header>
     <main>
-      <section class="intro">
-        <div>
-          <p class="eyebrow">YOUR PICTURE. YOUR LANGUAGE.</p>
-          <h1>A better view.<br /><span>In Italiano.</span></h1>
-          <p class="lede">
-            Keep the quality you chose. Add Italian audio, aligned to your
-            source, one segment at a time.
-          </p>
+      <nav class="tabs" aria-label="Dashboard sections">
+        <button class="tab active" type="button" data-view="streams" aria-current="page">Streams</button>
+        <button class="tab" type="button" data-view="settings">Settings</button>
+      </nav>
+      <section id="wizard" class="wizard panel" hidden aria-label="Guided setup">
+        <div class="wizard-heading">
+          <div><span class="eyebrow">GET STARTED</span><h2>Set up DubLift</h2></div>
+          <span id="wizard-progress" class="small"></span>
         </div>
-        <div class="install panel">
-          <span class="eyebrow">ADD TO YOUR PLAYER</span>
-          <h2>One local connection.</h2>
-          <p>
-            Install this manifest in Stremio or Nuvio. Use this computer’s LAN
-            address when playing on another device.
-          </p>
-          <div class="copy-row">
-            <input
-              id="manifest"
-              readonly
-              aria-label="Addon manifest URL"
-            /><button
-              id="copy-manifest"
-              class="icon-button"
-              title="Copy manifest URL"
-            >
-              Copy
-            </button>
+        <div class="wizard-steps" aria-hidden="true"><span>Install</span><span>Sources</span><span>Playback</span></div>
+        <div class="wizard-step" data-step="0">
+          <h3>Install DubLift in your player</h3>
+          <p class="help">Add this manifest in Stremio or Nuvio. This step continues when your player requests it.</p>
+          <div class="copy-row"><input id="manifest" readonly aria-label="Addon manifest URL" /><button id="copy-manifest" class="icon-button" type="button">Copy</button></div>
+          <a id="install" class="button primary" href="#">Install in Stremio ↗</a>
+          <p class="help install-warning">Stremio may refuse to install a local HTTP addon through this button. If that happens, copy the manifest URL above and paste it into Stremio’s Add-ons page manually.</p>
+          <p id="manifest-wait" class="help" role="status">Waiting for a manifest request…</p>
+        </div>
+        <div class="wizard-step" data-step="1" hidden>
+          <h3>Connect upstream addons</h3>
+          <p class="help">Paste an upstream addon manifest URL to get started. Need one? <a class="inline-link" href="https://pengu.uk/" target="_blank" rel="noopener noreferrer">PenguPlay</a> is a recommended option.</p>
+          <div id="wizard-addons"></div>
+          <button id="wizard-add-addon" type="button" class="text-button">+ Add upstream addon</button>
+        </div>
+        <div class="wizard-step" data-step="2" hidden>
+          <h3>Choose your playback defaults</h3>
+          <p class="help">These can be changed any time in Settings.</p>
+          <div class="wizard-fields">
+            <label>Maximum Italian results<input id="wizard-max-results" type="number" min="1" max="100" required /></label>
+            <label>Parallel source checks<input id="wizard-parallelism" type="number" min="1" max="16" required /></label>
+            <label>Source check timeout (seconds)<input id="wizard-timeout" type="number" min="1" max="120" required /></label>
+            <label>Alignment samples<input id="wizard-samples" type="number" min="1" max="12" required /></label>
           </div>
-          <a id="install" class="button primary" href="#"
-            >Install in Stremio ↗</a
-          >
         </div>
+        <div class="wizard-actions">
+          <button id="wizard-back" class="button secondary" type="button" hidden>Back</button>
+          <button id="wizard-next" class="button primary" type="button">Continue</button>
+        </div>
+        <p id="wizard-error" class="help" role="alert"></p>
       </section>
+      <div id="streams-view" class="view">
       <section class="stats" aria-label="Runtime diagnostics">
-        <div>
-          <span class="small">MEDIA ENGINE</span
-          ><strong id="engine-state">Checking…</strong>
-        </div>
         <div>
           <span class="small">PLAYING / LISTED</span
           ><strong id="session-count">0</strong>
+        </div>
+        <div>
+          <span class="small">ITALIAN RESULTS</span
+          ><strong id="italian-count">0 / 0</strong>
         </div>
         <div>
           <span class="small">ROLLING CACHE</span
@@ -71,28 +78,49 @@
           ><strong id="origin-bytes">0 MiB</strong>
         </div>
       </section>
+      <section id="playing-section" class="playing-section" aria-label="Playback and preparation" hidden>
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">PLAYING &amp; PREPARING</span>
+            <h2>Playback</h2>
+          </div>
+        </div>
+        <div id="playing-sessions" class="session-list"></div>
+      </section>
       <div class="workspace">
         <section class="playback">
           <div class="section-heading">
             <div>
               <span class="eyebrow">NOW IN DUBLIFT</span>
-              <h2>Latest streams & playback</h2>
+              <h2>Stream results</h2>
             </div>
             <span class="pill">VIDEO · STREAM COPY</span>
           </div>
           <p id="lookup-status" class="help" role="status"></p>
-          <p class="help">New lookups replace old results while keeping current playback. Selecting another stream keeps only that playback. Inactive sessions and their caches expire after one hour.</p>
-          <div id="sessions">
+          <p class="help">New lookups replace these results while keeping current playback. Selecting another stream replaces the current playback. Inactive sessions and their caches expire after one hour.</p>
+          <div id="stream-filters" class="stream-filters" role="group" aria-label="Filter streams">
+            <span class="small">FILTER STREAMS</span>
+            <button id="filter-italian" type="button" aria-pressed="false">Italian only</button>
+            <button id="filter-hls" type="button" aria-pressed="false">HLS</button>
+            <button id="filter-mkv" type="button" aria-pressed="false">MKV</button>
+            <span id="filter-count" class="help" role="status"></span>
+          </div>
+          <div id="sessions" class="session-list">
             <div id="empty" class="empty">
               <div class="wave">▂ ▅ ▃ ▇ ▄ ▆ ▂</div>
               <h3>Your next stream starts here.</h3>
               <p>
                 Choose a DubLift stream in your player, or resolve a title
-                below. Active sessions and audio controls appear here.
+                below. Stream results appear here, and playback preparation has its own section.
               </p>
             </div>
+            <p id="no-results" class="help" hidden>No other streams are listed. Resolve a title below to find more.</p>
+            <div id="filter-empty" class="empty" hidden>
+              <h3>No streams match these filters.</h3>
+              <button id="clear-filters" class="text-button" type="button">Clear filters</button>
+            </div>
           </div>
-          <details class="panel resolver" open>
+          <details class="panel resolver">
             <summary>
               Resolve a title
               <span class="small">DEVELOPMENT & DIAGNOSTICS</span>
@@ -148,17 +176,19 @@
             </ol>
           </details>
         </section>
-        <aside>
+      </div>
+      </div>
+      <section id="settings-view" class="view settings-page" hidden>
+        <div class="settings-intro"><h1>Settings</h1><button id="run-setup" type="button" class="button secondary">Run setup again</button></div>
           <form id="settings-form" class="panel settings">
             <div class="section-heading">
               <div>
-                <span class="eyebrow">MAKE IT YOURS</span>
+                <span class="eyebrow">UPSTREAM</span>
                 <h2>Source settings</h2>
               </div>
             </div>
             <p class="help">
-              Saved privately on this device. New users configure their own
-              upstream addons.
+              Saved on this server. Changes to sources apply to new streams.
             </p>
             <div id="addons"></div>
             <button id="add-addon" type="button" class="text-button">
@@ -170,6 +200,7 @@
             <label class="switch-row"><input id="bypass-source-checks" type="checkbox" /><span><strong>Bypass source checks when listing</strong><small>Return HTTP streams with Italian audio as soon as Vixsrc Italian audio is confirmed. Check each source when you play it or click Check &amp; prepare. The result limit and parallel setting apply only when this is off.</small></span></label>
             <p class="help">Start checks in upstream order and apply results in that order. Up to the selected number run at once; the Italian result limit also caps checks in flight. Unchecked streams keep their original links.</p>
             <hr />
+            <h3>Playback delivery</h3>
             <label class="switch-row"
               ><input id="prefer-proxy" type="checkbox" /><span
                 ><strong>Prefer proxying upstream media through DubLift</strong
@@ -212,6 +243,8 @@
                 priority.
               </p>
             </div>
+            <hr />
+            <h3>Audio alignment</h3>
             <label
               >Minimum alignment confidence
               <div class="range-row">
@@ -268,18 +301,10 @@
               Save settings</button
             ><span id="save-state" role="status"></span>
           </form>
-          <div class="footnote">
-            <span>↗</span>
-            <p>
-              Video stays at its original quality.<br />Only requested segments
-              and short audio windows are read. No full-file download.
-            </p>
-          </div>
-        </aside>
-      </div>
+      </section>
     </main>
     <footer>
-      DubLift <span>Local by design · Linux + Android / Termux</span>
+      DubLift <span>Local by design</span>
     </footer>
     <div id="toast" role="status" aria-live="polite"></div>
     <template id="session-template"

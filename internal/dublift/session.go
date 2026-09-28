@@ -124,6 +124,7 @@ type Session struct {
 	Revision            int       `json:"revision"`
 	stream              Stream
 	prepare             sync.Once
+	preparationStarted  bool
 	ready               chan struct{}
 	prepareErr          error
 	video               *Asset
@@ -208,6 +209,9 @@ func (s *Server) newSessionIDLocked(c Content, stream Stream, id string) *Sessio
 }
 func (s *Server) prepareSession(ctx context.Context, v *Session) error {
 	v.prepare.Do(func() {
+		v.mu.Lock()
+		v.preparationStarted = true
+		v.mu.Unlock()
 		go func() {
 			defer close(v.ready)
 			if v.listedReady != nil {

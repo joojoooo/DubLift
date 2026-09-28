@@ -1,6 +1,7 @@
 package dublift
 
 import (
+	"bytes"
 	"context"
 	"crypto/cipher"
 	"embed"
@@ -11,11 +12,11 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,19 +24,20 @@ import (
 var dashboard embed.FS
 
 type Server struct {
-	Config       *Config
-	Net          *Network
-	Engine       *Engine
-	Alignments   *AlignmentStore
-	mu           sync.Mutex
-	sessions     map[string]*Session
-	events       []string
-	ctx          context.Context
-	cancel       context.CancelFunc
-	generation   uint64
-	lookupCancel context.CancelFunc
-	lookupStatus string
-	playbackKey  cipher.AEAD
+	Config           *Config
+	Net              *Network
+	Engine           *Engine
+	Alignments       *AlignmentStore
+	mu               sync.Mutex
+	sessions         map[string]*Session
+	events           []string
+	ctx              context.Context
+	cancel           context.CancelFunc
+	generation       uint64
+	lookupCancel     context.CancelFunc
+	lookupStatus     string
+	playbackKey      cipher.AEAD
+	manifestRequests atomic.Uint64
 }
 
 func NewServer(c *Config) (*Server, error) {
@@ -107,6 +109,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/manifest.json":
+		s.manifestRequests.Add(1)
 		jsonResponse(w, 200, map[string]any{"id": "local.dublift", "version": "0.1.0", "name": "DubLift", "description": "Your high-quality streams with synchronized Italian audio. Runs on your local network.", "resources": []string{"stream"}, "types": []string{"movie", "series"}, "catalogs": []any{}, "behaviorHints": map[string]any{"configurable": true, "configurationRequired": len(s.Config.Get().Addons) == 0}})
 	case strings.HasPrefix(r.URL.Path, "/stream/"):
 		s.streams(w, r)
@@ -121,7 +124,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			b, _ := dashboard.ReadFile("web/index.html")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: http: https:; frame-ancestors 'none'")
 			w.Write(b)
 			return
 		}
@@ -172,82 +175,67 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			failure(w, 400, err)
 			return
 		}
+		if len(cfg.Addons) == 0 {
+			failure(w, 400, errors.New("at least one upstream addon is required"))
+			return
+		}
+		cfg.SetupCompleted = s.Config.Get().SetupCompleted
+		if err := cfg.Validate(); err != nil {
+			failure(w, 400, err)
+			return
+		}
+		if err := s.populateAddonNames(r.Context(), &cfg); err != nil {
+			failure(w, 400, err)
+			return
+		}
 		if err := s.Config.Save(cfg); err != nil {
 			failure(w, 400, err)
 			return
 		}
 		s.Engine.Cache.Resize(int64(cfg.CacheMB) << 20)
-		jsonResponse(w, 200, map[string]any{"ok": true, "note": "Listen address changes apply after restarting. Source changes apply to new sessions."})
+		jsonResponse(w, 200, cfg)
+	case "/api/addon-name":
+		if r.Method != "POST" {
+			w.WriteHeader(405)
+			return
+		}
+		var req struct {
+			ManifestURL string `json:"manifestURL"`
+		}
+		if err := decodeRequest(w, r, &req); err != nil {
+			failure(w, 400, err)
+			return
+		}
+		details, err := s.addonDetails(r.Context(), req.ManifestURL)
+		if err != nil {
+			failure(w, 400, err)
+			return
+		}
+		jsonResponse(w, 200, details)
+	case "/api/setup-complete":
+		if r.Method != "POST" {
+			w.WriteHeader(405)
+			return
+		}
+		cfg := s.Config.Get()
+		cfg.SetupCompleted = true
+		if err := s.Config.Save(cfg); err != nil {
+			failure(w, 500, err)
+			return
+		}
+		jsonResponse(w, 200, map[string]bool{"ok": true})
 	case "/api/status":
 		if r.Method != "GET" {
 			w.WriteHeader(405)
 			return
 		}
-		s.mu.Lock()
-		sessions := make([]*Session, 0, len(s.sessions))
-		for _, v := range s.sessions {
-			sessions = append(sessions, v)
+		jsonResponse(w, 200, s.status(r))
+	case "/api/events":
+		if r.Method != "GET" {
+			w.WriteHeader(405)
+			return
 		}
-		events := append([]string{}, s.events...)
-		s.mu.Unlock()
-		snapshots := []map[string]any{}
-		for _, v := range sessions {
-			v.mu.Lock()
-			view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "order": v.Order, "playing": v.Playing, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "sourceCheckDeferred": v.SourceCheckDeferred, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "url": s.playbackURL(r, v)}
-			if v.Passthrough {
-				view["url"] = v.stream.URL
-			}
-			if v.listedReady != nil {
-				select {
-				case <-v.listedReady:
-					view["checked"] = true
-				default:
-					view["checked"] = false
-				}
-			} else {
-				view["checked"] = true
-			}
-			v.mu.Unlock()
-			select {
-			case <-v.ready:
-				view["duration"] = v.Duration
-				view["proxyReason"] = v.ProxyReason
-				view["alignment"] = s.Alignments.Get(v.Key)
-				view["ready"] = v.prepareErr == nil
-				tracks := []map[string]string{}
-				for _, t := range v.tracks {
-					tracks = append(tracks, map[string]string{"name": t.Name, "language": t.Lang, "id": t.ID})
-				}
-				view["tracks"] = tracks
-				if v.prepareErr == nil {
-					view["directPlayback"] = s.deliveryFor(v)
-					v.mu.Lock()
-					view["loadedDelivery"] = v.delivery
-					v.mu.Unlock()
-				}
-			default:
-			}
-			snapshots = append(snapshots, view)
-		}
-		sort.SliceStable(snapshots, func(i, j int) bool {
-			a, b := snapshots[i], snapshots[j]
-			if a["playing"].(bool) != b["playing"].(bool) {
-				return a["playing"].(bool)
-			}
-			return a["order"].(int) < b["order"].(int)
-		})
-		ffmpegOK := false
-		if _, err := exec.LookPath(s.Config.Get().FFmpeg); err == nil {
-			ffmpegOK = true
-		}
-		ffprobeOK := false
-		if _, err := exec.LookPath(s.Config.Get().FFprobe); err == nil {
-			ffprobeOK = true
-		}
-		s.mu.Lock()
-		lookupStatus := s.lookupStatus
-		s.mu.Unlock()
-		jsonResponse(w, 200, map[string]any{"sessions": snapshots, "lookupStatus": lookupStatus, "events": events, "cacheBytes": s.Engine.Cache.Used(), "originBytes": s.Net.Bytes.Load(), "ffmpeg": ffmpegOK, "ffprobe": ffprobeOK, "manifestURL": s.base(r) + "/manifest.json"})
+		s.statusEvents(w, r)
 	case "/api/resolve":
 		if r.Method != "POST" {
 			w.WriteHeader(405)
@@ -268,6 +256,210 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.sessionAction(w, r)
 	}
+}
+
+func (s *Server) status(r *http.Request) map[string]any {
+	s.mu.Lock()
+	sessions := make([]*Session, 0, len(s.sessions))
+	for _, v := range s.sessions {
+		sessions = append(sessions, v)
+	}
+	events := append([]string{}, s.events...)
+	s.mu.Unlock()
+	snapshots := []map[string]any{}
+	for _, v := range sessions {
+		v.mu.Lock()
+		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, v.listedAsset), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "sourceCheckDeferred": v.SourceCheckDeferred, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "url": s.playbackURL(r, v)}
+		if v.Passthrough {
+			view["url"] = v.stream.URL
+		}
+		if v.listedReady != nil {
+			select {
+			case <-v.listedReady:
+				view["checked"] = true
+			default:
+				view["checked"] = false
+			}
+		} else {
+			view["checked"] = true
+		}
+		v.mu.Unlock()
+		select {
+		case <-v.ready:
+			view["preparationDone"] = true
+			view["sourceFormat"] = streamSourceFormat(v.stream, v.video)
+			view["duration"] = v.Duration
+			view["proxyReason"] = v.ProxyReason
+			view["alignment"] = s.Alignments.Get(v.Key)
+			view["ready"] = v.prepareErr == nil
+			tracks := []map[string]string{}
+			for _, t := range v.tracks {
+				tracks = append(tracks, map[string]string{"name": t.Name, "language": t.Lang, "id": t.ID})
+			}
+			view["tracks"] = tracks
+			if v.prepareErr == nil {
+				view["directPlayback"] = s.deliveryFor(v)
+				v.mu.Lock()
+				view["loadedDelivery"] = v.delivery
+				v.mu.Unlock()
+			}
+		default:
+		}
+		snapshots = append(snapshots, view)
+	}
+	sort.SliceStable(snapshots, func(i, j int) bool {
+		a, b := snapshots[i], snapshots[j]
+		if a["playing"].(bool) != b["playing"].(bool) {
+			return a["playing"].(bool)
+		}
+		return a["order"].(int) < b["order"].(int)
+	})
+	s.mu.Lock()
+	lookupStatus := s.lookupStatus
+	s.mu.Unlock()
+	cfg := s.Config.Get()
+	return map[string]any{"sessions": snapshots, "lookupStatus": lookupStatus, "events": events, "cacheBytes": s.Engine.Cache.Used(), "cacheMaxBytes": int64(cfg.CacheMB) << 20, "originBytes": s.Net.Bytes.Load(), "manifestURL": s.base(r) + "/manifest.json", "manifestRequests": s.manifestRequests.Load()}
+}
+
+func streamSourceFormat(stream Stream, asset *Asset) string {
+	if asset != nil {
+		if asset.HLS != nil {
+			return "hls"
+		}
+		if asset.Index.Container == "matroska" {
+			return "mkv"
+		}
+		return "other"
+	}
+	path := ""
+	if u, err := url.Parse(stream.URL); err == nil {
+		path = strings.ToLower(u.Path)
+	}
+	filename := strings.ToLower(stream.BehaviorHints.Filename)
+	switch {
+	case strings.HasSuffix(path, ".m3u8"):
+		return "hls"
+	case strings.HasSuffix(path, ".mkv"):
+		return "mkv"
+	case strings.HasSuffix(filename, ".m3u8"):
+		return "hls"
+	case strings.HasSuffix(filename, ".mkv"):
+		return "mkv"
+	default:
+		return "other"
+	}
+}
+
+func (s *Server) statusEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		failure(w, 500, errors.New("streaming unavailable"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Connection", "keep-alive")
+	var previous []byte
+	quietTicks := 0
+	updates := time.NewTicker(time.Second)
+	defer updates.Stop()
+	for {
+		state, err := json.Marshal(s.status(r))
+		if err != nil {
+			return
+		}
+		if !bytes.Equal(state, previous) {
+			if _, err := w.Write(append(append([]byte("data: "), state...), '\n', '\n')); err != nil {
+				return
+			}
+			flusher.Flush()
+			previous = state
+			quietTicks = 0
+		} else {
+			quietTicks++
+			if quietTicks >= 15 {
+				if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+					return
+				}
+				flusher.Flush()
+				quietTicks = 0
+			}
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-s.ctx.Done():
+			return
+		case <-updates.C:
+		}
+	}
+}
+
+type addonDetails struct {
+	Name string `json:"name"`
+	Icon string `json:"icon"`
+}
+
+func (s *Server) addonDetails(ctx context.Context, manifestURL string) (addonDetails, error) {
+	if _, err := httpURL(manifestURL); err != nil {
+		return addonDetails{}, err
+	}
+	if !strings.HasSuffix(strings.Split(manifestURL, "?")[0], "/manifest.json") {
+		return addonDetails{}, errors.New("upstream URL must end with /manifest.json")
+	}
+	work, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	b, finalURL, err := s.Net.Fetch(work, Origin{URL: manifestURL}, manifestLimit)
+	if err != nil {
+		return addonDetails{}, err
+	}
+	var manifest struct {
+		Name string `json:"name"`
+		Logo string `json:"logo"`
+		Icon string `json:"icon"`
+	}
+	if json.Unmarshal(b, &manifest) != nil || strings.TrimSpace(manifest.Name) == "" {
+		return addonDetails{}, errors.New("upstream manifest has no addon name")
+	}
+	details := addonDetails{Name: strings.TrimSpace(manifest.Name)}
+	iconValue := strings.TrimSpace(manifest.Logo)
+	if iconValue == "" {
+		iconValue = strings.TrimSpace(manifest.Icon)
+	}
+	if strings.HasPrefix(iconValue, "data:image/") && len(iconValue) <= 128<<10 {
+		details.Icon = iconValue
+	} else if icon, err := url.Parse(iconValue); err == nil && icon.String() != "" {
+		base, _ := url.Parse(finalURL)
+		resolved := base.ResolveReference(icon)
+		if _, err := httpURL(resolved.String()); err == nil {
+			details.Icon = resolved.String()
+		}
+	}
+	return details, nil
+}
+
+func (s *Server) populateAddonNames(ctx context.Context, cfg *Settings) error {
+	previous := s.Config.Get().Addons
+	for i := range cfg.Addons {
+		found := false
+		for _, old := range previous {
+			if cfg.Addons[i].ManifestURL == old.ManifestURL && old.Name != "" {
+				cfg.Addons[i].Name = old.Name
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		details, err := s.addonDetails(ctx, cfg.Addons[i].ManifestURL)
+		if err != nil {
+			return err
+		}
+		cfg.Addons[i].Name = details.Name
+	}
+	return nil
 }
 func decodeRequest(w http.ResponseWriter, r *http.Request, v any) error {
 	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10))

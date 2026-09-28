@@ -2,8 +2,13 @@
 const $ = (id) => document.getElementById(id);
 let settings,
   toastTimer,
-  polling = false;
+  latestStatus,
+  setupStep = -1,
+  manifestBaseline = null;
 const cards = new Map();
+const addonDetailsCache = new Map();
+const streamFilters = { italian: false, hls: false, mkv: false };
+const streamFilterKey = "dublift.streamFilters.v1";
 async function api(path, data) {
   const response = await fetch(
     path,
@@ -18,6 +23,17 @@ async function api(path, data) {
   const result = await response.json();
   if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
   return result;
+}
+function lookupAddonDetails(url) {
+  if (!addonDetailsCache.has(url)) {
+    const request = api("/api/addon-name", { manifestURL: url });
+    addonDetailsCache.set(url, request);
+    const clear = () => {
+      if (addonDetailsCache.get(url) === request) addonDetailsCache.delete(url);
+    };
+    request.then(clear, clear);
+  }
+  return addonDetailsCache.get(url);
 }
 function toast(message) {
   $("toast").textContent = message;
@@ -40,40 +56,160 @@ async function copy(text) {
   }
 }
 const mb = (n) => (n / 1048576).toFixed(1) + " MiB";
+const setText = (el, value) => {
+  const text = String(value ?? "");
+  if (el.textContent !== text) el.textContent = text;
+};
 const clock = (n) => {
   n = Math.max(0, Math.floor(n || 0));
   return [Math.floor(n / 3600), Math.floor(n / 60) % 60, n % 60]
     .map((v) => String(v).padStart(2, "0"))
     .join(":");
 };
-function addonRow(addon = { name: "", manifestURL: "" }) {
+function completeAddonURL(input) {
+  if (!input.value.trim() || !input.checkValidity()) return false;
+  try {
+    const url = new URL(input.value.trim());
+    return ["http:", "https:"].includes(url.protocol) && url.pathname.endsWith("/manifest.json");
+  } catch { return false; }
+}
+function syncAddonControls(container) {
+  const rows = [...container.children];
+  const button = container === $("addons") ? $("add-addon") : $("wizard-add-addon");
+  button.disabled = rows.length >= 20 || rows.some((row) => !completeAddonURL(row.querySelector("input")));
+  for (const row of rows) row.querySelector(".remove").hidden = rows.length <= 1;
+}
+function addonRow(addon = { name: "", manifestURL: "" }, container = $("addons")) {
   const row = document.createElement("div");
   row.className = "addon";
-  for (const [key, label, type] of [
-    ["name", "Addon name", "text"],
-    ["manifestURL", "Manifest URL · private", "password"],
-  ]) {
-    const l = document.createElement("label");
-    l.textContent = label;
-    const input = document.createElement("input");
-    input.dataset.key = key;
-    input.type = type;
-    input.autocomplete = "off";
-    input.required = true;
-    input.value = addon[key];
-    input.placeholder =
-      key === "name" ? "My upstream addon" : "https://…/manifest.json";
-    l.append(input);
-    row.append(l);
+  const details = document.createElement("div");
+  details.className = "addon-details";
+  details.hidden = true;
+  const icon = document.createElement("img");
+  icon.className = "addon-icon";
+  icon.alt = "";
+  icon.hidden = true;
+  const fallback = document.createElement("span");
+  fallback.className = "addon-icon addon-icon-fallback";
+  const name = document.createElement("strong");
+  name.className = "addon-name";
+  details.append(icon, fallback, name);
+  row.append(details);
+  const label = document.createElement("label");
+  label.textContent = "Manifest URL";
+  const input = document.createElement("input");
+  input.type = "url";
+  input.autocomplete = "url";
+  input.required = true;
+  input.value = addon.manifestURL;
+  const status = document.createElement("p");
+  status.className = "addon-status help";
+  status.setAttribute("role", "status");
+  status.hidden = true;
+  let debounce;
+  function showDetails(result) {
+    row.dataset.name = result.name;
+    name.textContent = result.name;
+    fallback.textContent = result.name.charAt(0).toUpperCase();
+    fallback.hidden = !!result.icon;
+    icon.hidden = !result.icon;
+    if (result.icon) icon.src = result.icon;
+    details.hidden = false;
+    status.hidden = true;
   }
+  icon.onerror = () => { icon.hidden = true; fallback.hidden = false; };
+  async function fetchDetails() {
+    const url = input.value.trim();
+    if (!url || !input.checkValidity()) return;
+    status.textContent = "Checking addon…";
+    status.hidden = false;
+    try {
+      const result = await lookupAddonDetails(url);
+      if (input.value.trim() === url) showDetails(result);
+    } catch (err) {
+      if (input.value.trim() === url) {
+        details.hidden = true;
+        status.textContent = err.message;
+        status.hidden = false;
+      }
+    }
+  }
+  input.addEventListener("input", () => {
+    clearTimeout(debounce);
+    details.hidden = true;
+    status.hidden = true;
+    row.dataset.name = "";
+    if (input.checkValidity()) debounce = setTimeout(fetchDetails, 450);
+    syncAddonControls(container);
+  });
+  input.addEventListener("change", () => {
+    clearTimeout(debounce);
+    fetchDetails();
+    syncAddonControls(container);
+  });
+  label.append(input);
+  row.append(label, status);
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "text-button remove";
   remove.textContent = "Remove addon";
-  remove.onclick = () => row.remove();
+  remove.onclick = () => {
+    if (container.children.length <= 1) return;
+    row.remove();
+    syncAddonControls(container);
+  };
   row.append(remove);
-  $("addons").append(row);
+  container.append(row);
+  syncAddonControls(container);
+  if (addon.name && addon.manifestURL) showDetails({ name: addon.name, icon: "" });
+  if (addon.manifestURL) fetchDetails();
 }
+const readAddons = (container) => [...container.children].map((row) => ({
+  name: row.dataset.name || "",
+  manifestURL: row.querySelector("input").value.trim(),
+}));
+const inPlaybackSection = (session) => session.playing || session.preparationStarted;
+function applyStreamFilters(sessions) {
+  let shown = 0;
+  let resultCount = 0;
+  for (const session of sessions) {
+    const card = cards.get(session.id);
+    if (inPlaybackSection(session)) {
+      card.hidden = false;
+      continue;
+    }
+    resultCount++;
+    const italian = session.checked !== false && !session.passthrough;
+    const format = !streamFilters.hls && !streamFilters.mkv || !!streamFilters[session.sourceFormat];
+    const matches = (!streamFilters.italian || italian) && format;
+    card.hidden = !matches;
+    if (matches) shown++;
+  }
+  $("empty").hidden = !!sessions.length;
+  $("no-results").hidden = !sessions.length || resultCount > 0;
+  $("filter-empty").hidden = !resultCount || shown > 0;
+  setText($("filter-count"), resultCount
+    ? `Showing ${shown} of ${resultCount}`
+    : "");
+}
+function setStreamFilters(next) {
+  for (const key of Object.keys(streamFilters)) {
+    streamFilters[key] = next[key] === true;
+    $("filter-" + key).setAttribute("aria-pressed", String(streamFilters[key]));
+  }
+  try { localStorage.setItem(streamFilterKey, JSON.stringify(streamFilters)); }
+  catch { /* The filters still work for this page session. */ }
+  if (latestStatus) applyStreamFilters(latestStatus.sessions);
+}
+try {
+  const stored = JSON.parse(localStorage.getItem(streamFilterKey) || "{}");
+  setStreamFilters(stored && typeof stored === "object" ? stored : {});
+} catch { setStreamFilters({}); }
+for (const key of Object.keys(streamFilters)) {
+  $("filter-" + key).onclick = () =>
+    setStreamFilters({ ...streamFilters, [key]: !streamFilters[key] });
+}
+$("clear-filters").onclick = () => setStreamFilters({});
 const fields = {
   publicURL: "public-url",
   listen: "listen",
@@ -103,7 +239,15 @@ async function loadSettings() {
   $("confidence").value = settings.minConfidence;
   confidenceLabel();
   $("addons").replaceChildren();
-  settings.addons.forEach(addonRow);
+  settings.addons.forEach((addon) => addonRow(addon));
+  if (!settings.addons.length) addonRow(undefined, $("addons"));
+  $("wizard-addons").replaceChildren();
+  settings.addons.forEach((addon) => addonRow(addon, $("wizard-addons")));
+  if (!settings.addons.length) addonRow(undefined, $("wizard-addons"));
+  $("wizard-max-results").value = settings.maxItalianResults;
+  $("wizard-parallelism").value = settings.sourceCheckParallelism;
+  $("wizard-timeout").value = settings.sourceCheckTimeoutSeconds;
+  $("wizard-samples").value = settings.alignmentSamples;
 }
 function confidenceLabel() {
   $("confidence-value").textContent =
@@ -119,6 +263,11 @@ $("direct-mode").onchange = directControls;
 $("direct-playback").onchange = directControls;
 $("confidence").oninput = confidenceLabel;
 $("add-addon").onclick = () => addonRow();
+$("wizard-add-addon").onclick = () => addonRow(undefined, $("wizard-addons"));
+async function saveConfig(cfg) {
+  settings = await api("/api/settings", cfg);
+  await loadSettings();
+}
 $("settings-form").onsubmit = async (e) => {
   e.preventDefault();
   const cfg = { ...settings };
@@ -135,24 +284,93 @@ $("settings-form").onsubmit = async (e) => {
       ? null
       : Number($("direct-tolerance").value);
   cfg.minConfidence = Number($("confidence").value);
-  cfg.addons = [...$("addons").children].map((row) =>
-    Object.fromEntries(
-      [...row.querySelectorAll("input")].map((i) => [
-        i.dataset.key,
-        i.value.trim(),
-      ]),
-    ),
-  );
+  cfg.addons = readAddons($("addons"));
   try {
-    await api("/api/settings", cfg);
-    settings = cfg;
-    $("save-state").textContent = "Saved on this device.";
+    await saveConfig(cfg);
+    $("save-state").textContent = "Saved on this server.";
     toast("Settings saved");
   } catch (err) {
     toast(err.message);
   }
 };
 $("copy-manifest").onclick = () => copy($("manifest").value);
+function showView(view) {
+  $("streams-view").hidden = view !== "streams";
+  $("settings-view").hidden = view !== "settings";
+  for (const tab of document.querySelectorAll(".tab")) {
+    const active = tab.dataset.view === view;
+    tab.classList.toggle("active", active);
+    if (active) tab.setAttribute("aria-current", "page");
+    else tab.removeAttribute("aria-current");
+  }
+}
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.onclick = () => showView(tab.dataset.view);
+}
+function renderWizard() {
+  $("wizard").hidden = setupStep < 0;
+  document.body.classList.toggle("setting-up", setupStep >= 0);
+  if (setupStep < 0) return;
+  $("wizard-progress").textContent = `Step ${setupStep + 1} of 3`;
+  for (const section of document.querySelectorAll(".wizard-step"))
+    section.hidden = Number(section.dataset.step) !== setupStep;
+  for (const [index, label] of [...document.querySelectorAll(".wizard-steps span")].entries())
+    label.classList.toggle("active", index === setupStep);
+  $("wizard-back").hidden = setupStep === 0;
+  $("wizard-next").textContent = setupStep === 2 ? "Finish setup" : "Continue";
+  $("wizard-error").textContent = "";
+}
+function startWizard() {
+  setupStep = 0;
+  manifestBaseline = latestStatus?.manifestRequests ?? null;
+  renderWizard();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+$("run-setup").onclick = startWizard;
+$("wizard-back").onclick = () => { setupStep--; renderWizard(); };
+async function finishWizard() {
+  try {
+    await api("/api/setup-complete", {});
+    settings.setupCompleted = true;
+    setupStep = -1;
+    renderWizard();
+    showView("streams");
+    toast("Setup complete. You can run it again from Settings.");
+  } catch (err) { $("wizard-error").textContent = err.message; }
+}
+$("wizard-next").onclick = async () => {
+  const button = $("wizard-next");
+  button.disabled = true;
+  try {
+    if (setupStep === 0) {
+      setupStep = 1;
+      renderWizard();
+    } else if (setupStep === 1) {
+      const inputs = [...$("wizard-addons").querySelectorAll("input")];
+      if (!inputs.length || inputs.some((input) => !completeAddonURL(input))) {
+        $("wizard-error").textContent = "Enter an upstream HTTP(S) manifest URL ending in /manifest.json to continue.";
+        inputs.find((input) => !completeAddonURL(input))?.focus();
+        return;
+      }
+      await saveConfig({ ...settings, addons: readAddons($("wizard-addons")) });
+      setupStep = 2;
+      renderWizard();
+    } else if (setupStep === 2) {
+      const inputs = [...document.querySelectorAll(".wizard-fields input")];
+      if (!inputs.every((input) => input.reportValidity())) return;
+      await saveConfig({
+        ...settings,
+        maxItalianResults: Number($("wizard-max-results").value),
+        sourceCheckParallelism: Number($("wizard-parallelism").value),
+        sourceCheckTimeoutSeconds: Number($("wizard-timeout").value),
+        alignmentSamples: Number($("wizard-samples").value),
+      });
+      await finishWizard();
+    }
+  } catch (err) {
+    $("wizard-error").textContent = err.message;
+  } finally { button.disabled = false; }
+};
 $("preset").onchange = () => {
   if (!$("preset").value) return;
   const [type, id] = $("preset").value.split(":");
@@ -175,7 +393,6 @@ $("resolve-form").onsubmit = async (e) => {
         ? "Prepare a session to check its source."
         : "Prepare a session to inspect audio.";
     $("resolve-status").textContent = `${r.streams.length} streams found. ${hint}`;
-    await poll();
   } catch (err) {
     $("resolve-status").textContent = err.message;
   } finally {
@@ -199,7 +416,6 @@ function createCard(session) {
         }
         await api(`/api/sessions/${id}/${route}`, payload);
         toast(message);
-        await poll();
       } catch (err) {
         toast(err.message);
       } finally {
@@ -228,25 +444,34 @@ function createCard(session) {
     try {
       await api(`/api/sessions/${id}/offset`, { offset: Number(input.value) });
       toast("Offset updated. Seek to refresh buffered audio.");
-      await poll();
     } catch (err) {
       toast(err.message);
     }
   };
-  $("sessions").append(card);
+  $(inPlaybackSection(session) ? "playing-sessions" : "sessions").append(card);
   cards.set(id, card);
   return card;
+}
+function playbackBadge(v) {
+  if (v.passthrough) return "Original";
+  if (v.playing) return "▶ Playback detected";
+  if (v.preparationStarted) {
+    if (!v.preparationDone) return "Preparing playback";
+    return v.ready ? "Ready for playback" : "Preparation failed";
+  }
+  if (v.requestMethod === "HEAD") return "Player checked stream";
+  return v.sourceCheckDeferred ? "Source unchecked" : "Available";
 }
 function updateCard(v) {
   const card = cards.get(v.id) || createCard(v);
   card.dataset.url = v.url;
-  const set = (sel, text) => (card.querySelector(sel).textContent = text);
+  const set = (sel, value) => setText(card.querySelector(sel), value);
   set(".content", v.content);
   set(".content-name", v.contentName || v.title || v.content);
   set(".stream-title", v.title || "");
   set(".description", v.description || "");
   set(".file-details", v.filename || "");
-  set(".playback-badge", v.passthrough ? "Original" : v.playing ? "▶ Playback detected" : v.requestMethod === "HEAD" ? "Player checked stream" : v.sourceCheckDeferred ? "Source unchecked" : "Available");
+  set(".playback-badge", playbackBadge(v));
   card.classList.toggle("playing", !!v.playing);
   set(".sample-progress", v.aligning ? `Sample ${v.sampleIndex || 1} of ${v.sampleTotal || settings?.alignmentSamples || 3} · ${v.samplePhase || "Starting analysis"}` : v.samplePhase || "");
   set(".name", v.name || "Upstream stream");
@@ -315,7 +540,7 @@ function updateCard(v) {
     loaded?.canStopServer || direct.canStopServer
   );
   card.querySelector(".prepare").textContent = v.sourceCheckDeferred ? "Check & prepare" : "Prepare playback";
-  card.querySelector(".prepare").hidden = !!v.ready || !!v.passthrough;
+  card.querySelector(".prepare").hidden = !!v.preparationStarted || !!v.ready || !!v.passthrough;
   card.querySelector(".prepare").disabled = v.checked === false;
   card.querySelector(".session-metrics").hidden = !v.ready;
   card.querySelector(".confidence-bar").hidden = !v.ready;
@@ -347,29 +572,29 @@ function updateCard(v) {
       .join("\n"),
   );
   const errors = card.querySelector(".errors");
-  errors.replaceChildren();
-  for (const text of v.errors || []) {
-    const li = document.createElement("li");
-    li.textContent = text;
-    errors.append(li);
+  const errorKey = JSON.stringify(v.errors || []);
+  if (errors.dataset.value !== errorKey) {
+    errors.dataset.value = errorKey;
+    errors.replaceChildren();
+    for (const text of v.errors || []) {
+      const li = document.createElement("li");
+      li.textContent = text;
+      errors.append(li);
+    }
   }
 }
-async function poll() {
-  if (polling) return;
-  polling = true;
-  try {
-    const state = await api("/api/status");
-    $("connection").textContent = "Connected to local server";
+let lastEvents = "";
+function renderStatus(state) {
+    latestStatus = state;
+    setText($("connection"), "Connected to local server");
     $("connection-dot").classList.remove("offline");
-    $("manifest").value = state.manifestURL;
+    if ($("manifest").value !== state.manifestURL) $("manifest").value = state.manifestURL;
     $("install").href = state.manifestURL.replace(/^https?:\/\//, "stremio://");
-    $("engine-state").textContent =
-      state.ffmpeg && state.ffprobe ? "FFmpeg ready" : "Dependency missing";
-    $("session-count").textContent = `${state.sessions.filter(v => v.playing).length} / ${state.sessions.length}`;
-    $("lookup-status").textContent = state.lookupStatus || "Waiting for an addon request or a title lookup.";
-    $("cache-size").textContent = mb(state.cacheBytes);
-    $("origin-bytes").textContent = mb(state.originBytes);
-    $("empty").hidden = !!state.sessions.length;
+    setText($("session-count"), `${state.sessions.filter(v => v.playing).length} / ${state.sessions.length}`);
+    setText($("italian-count"), `${state.sessions.filter(v => v.checked !== false && !v.passthrough).length} / ${state.sessions.length}`);
+    setText($("lookup-status"), state.lookupStatus || "Waiting for an addon request or a title lookup.");
+    setText($("cache-size"), `${mb(state.cacheBytes)} / ${mb(state.cacheMaxBytes)}`);
+    setText($("origin-bytes"), mb(state.originBytes));
     const live = new Set(state.sessions.map((v) => v.id));
     for (const [id, card] of cards) {
       if (!live.has(id)) {
@@ -377,22 +602,43 @@ async function poll() {
         cards.delete(id);
       }
     }
-    state.sessions.forEach(updateCard);
-    $("events").replaceChildren();
-    for (const event of state.events.length
-      ? state.events
-      : ["No events yet."]) {
-      const li = document.createElement("li");
-      li.textContent = event;
-      $("events").append(li);
+    for (const session of state.sessions) {
+      updateCard(session);
+      const target = $(inPlaybackSection(session) ? "playing-sessions" : "sessions");
+      const card = cards.get(session.id);
+      if (card.parentElement !== target) target.append(card);
     }
-  } catch (err) {
-    $("connection").textContent = "Server unreachable";
-    $("connection-dot").classList.add("offline");
-  } finally {
-    polling = false;
-  }
+    $("playing-section").hidden = !state.sessions.some(inPlaybackSection);
+    applyStreamFilters(state.sessions);
+    const events = state.events.length ? state.events : ["No events yet."];
+    const key = JSON.stringify(events);
+    if (key !== lastEvents) {
+      lastEvents = key;
+      $("events").replaceChildren();
+      for (const event of events) {
+        const li = document.createElement("li");
+        li.textContent = event;
+        $("events").append(li);
+      }
+    }
+    if (setupStep === 0) {
+      if (manifestBaseline === null) manifestBaseline = state.manifestRequests;
+      else if (state.manifestRequests > manifestBaseline) {
+        $("manifest-wait").textContent = "Manifest request detected.";
+        setupStep = 1;
+        renderWizard();
+      }
+    }
 }
-loadSettings().catch((err) => toast(err.message));
-poll();
-setInterval(poll, 1000);
+loadSettings().then(() => {
+  if (!settings.setupCompleted) startWizard();
+}).catch((err) => toast(err.message));
+const statusStream = new EventSource("/api/events");
+statusStream.onmessage = (event) => {
+  try { renderStatus(JSON.parse(event.data)); }
+  catch (err) { toast(`Invalid status update: ${err.message}`); }
+};
+statusStream.onerror = () => {
+    setText($("connection"), "Server unreachable");
+    $("connection-dot").classList.add("offline");
+};

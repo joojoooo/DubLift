@@ -541,7 +541,7 @@ func TestStartupReleasesAtFirstSampleAndUpdatesOffset(t *testing.T) {
 
 func TestShortAlignmentSettingsAndSampleCoverage(t *testing.T) {
 	cfg := DefaultSettings()
-	if cfg.SearchRadius != 8 || cfg.AlignmentSamples != 3 || !cfg.StartImmediately {
+	if cfg.SearchRadius != 8 || cfg.AlignmentSamples != 1 || !cfg.StartImmediately {
 		t.Fatal("incorrect startup defaults")
 	}
 	for _, n := range []int{1, 2, 3, 12} {

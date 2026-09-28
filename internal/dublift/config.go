@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -39,11 +40,43 @@ type Settings struct {
 	VixBaseURL                string   `json:"vixBaseURL"`
 	TMDBToken                 string   `json:"tmdbToken"`
 	Addons                    []Addon  `json:"addons"`
+	SetupCompleted            bool     `json:"setupCompleted"`
 }
 
 func DefaultSettings() Settings {
 	tolerance := .125
-	return Settings{Listen: "0.0.0.0:7000", DirectPlayback: true, DirectTolerance: &tolerance, MinConfidence: .68, SearchRadius: 8, AlignmentSamples: 3, MaxItalianResults: 3, SourceCheckTimeoutSeconds: 25, SourceCheckParallelism: 1, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
+	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), DirectPlayback: true, DirectTolerance: &tolerance, MinConfidence: .68, SearchRadius: 8, AlignmentSamples: 1, MaxItalianResults: 3, SourceCheckTimeoutSeconds: 20, SourceCheckParallelism: 3, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
+}
+
+func defaultPublicURL() string {
+	// A UDP dial selects the interface used for the default route without sending a packet.
+	conn, err := net.Dial("udp4", "192.0.2.1:80")
+	if err == nil {
+		ip := conn.LocalAddr().(*net.UDPAddr).IP
+		conn.Close()
+		if ip.IsPrivate() {
+			return "http://" + ip.String() + ":7000"
+		}
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if network, ok := addr.(*net.IPNet); ok && network.IP.To4() != nil && network.IP.IsPrivate() {
+				return "http://" + network.IP.String() + ":7000"
+			}
+		}
+	}
+	return ""
 }
 
 func httpURL(raw string) (*url.URL, error) {

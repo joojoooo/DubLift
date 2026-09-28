@@ -264,7 +264,7 @@ func TestSourceCheckSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings := c.Get()
-	if settings.MaxItalianResults != 3 || settings.SourceCheckTimeoutSeconds != 25 || settings.SourceCheckParallelism != 1 || settings.BypassSourceChecks {
+	if settings.MaxItalianResults != 3 || settings.SourceCheckTimeoutSeconds != 20 || settings.SourceCheckParallelism != 3 || settings.BypassSourceChecks {
 		t.Fatalf("unexpected source check defaults: %d results, %d seconds, %d parallel", settings.MaxItalianResults, settings.SourceCheckTimeoutSeconds, settings.SourceCheckParallelism)
 	}
 	settings.MaxItalianResults = 7
