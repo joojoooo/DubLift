@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -489,9 +490,20 @@ func safeFFmpegError(s string) string {
 func ffInput(url string) []string {
 	args := []string{"-protocol_whitelist", "http,tcp,crypto", "-probesize", "4000000", "-analyzeduration", "4000000"}
 	if strings.HasSuffix(url, ".m3u8") {
-		args = append(args, "-allowed_extensions", "ALL")
+		args = append(args, hlsInputOptions()...)
 	}
 	return append(args, "-i", url)
+}
+
+func hlsInputOptions() []string {
+	args := []string{"-allowed_extensions", "ALL"}
+	if runtime.GOOS == "android" {
+		// The bundled FFmpeg 7.1.2 checks segment extensions separately.
+		// Our bounded HLS jobs serve approved resources at extensionless URLs.
+		// FFmpeg 6.1 on desktop does not recognize this option.
+		args = append(args, "-extension_picky", "0")
+	}
+	return args
 }
 func (e *Engine) Probe(ctx context.Context, a *Asset) (Probe, error) {
 	return e.ProbeAt(ctx, a, 0)
@@ -505,7 +517,7 @@ func (e *Engine) ProbeAt(ctx context.Context, a *Asset, at float64) (Probe, erro
 	defer cleanup()
 	args := []string{"-v", "error", "-protocol_whitelist", "http,tcp,crypto", "-probesize", "4000000", "-analyzeduration", "4000000", "-show_streams", "-show_format", "-of", "json"}
 	if a.HLS != nil {
-		args = append(args, "-allowed_extensions", "ALL")
+		args = append(args, hlsInputOptions()...)
 	} else {
 		// Indexed containers carry codec/track metadata in their headers.
 		// Avoid scanning seconds of high-bitrate video merely to enumerate tracks.
