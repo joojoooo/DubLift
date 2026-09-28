@@ -22,6 +22,7 @@ type Stream struct {
 	Title         string            `json:"title,omitempty"`
 	Description   string            `json:"description,omitempty"`
 	URL           string            `json:"url,omitempty"`
+	ExternalURL   string            `json:"externalUrl,omitempty"`
 	Headers       map[string]string `json:"headers,omitempty"`
 	BehaviorHints struct {
 		Filename     string `json:"filename,omitempty"`
@@ -92,61 +93,62 @@ func (s Stream) Origin() Origin {
 }
 
 type Session struct {
-	mu             sync.Mutex
-	ID             string `json:"id"`
-	Key            string `json:"-"`
-	lookupKey      string
-	ticket         string
-	Content        Content `json:"content"`
-	Name           string  `json:"name"`
-	ContentName    string
-	Order          int
-	Playing        bool
-	PlaybackAt     time.Time
-	RequestAt      time.Time
-	RequestMethod  string
-	SampleIndex    int
-	SampleTotal    int
-	SamplePhase    string
-	Passthrough    bool
-	FallbackReason string
-	Created        time.Time `json:"created"`
-	LastUsed       time.Time `json:"lastUsed"`
-	Status         string    `json:"status"`
-	Errors         []string  `json:"errors"`
-	Position       float64   `json:"position"`
-	PositionAt     time.Time `json:"positionAt"`
-	Duration       float64   `json:"duration"`
-	ProxyReason    string    `json:"proxyReason"`
-	Aligning       bool      `json:"aligning"`
-	Revision       int       `json:"revision"`
-	stream         Stream
-	prepare        sync.Once
-	ready          chan struct{}
-	prepareErr     error
-	video          *Asset
-	variant        *playlist.MultivariantVariant
-	clockBase      float64
-	tracks         []Track
-	sourceEnglish  *Track
-	vixEnglish     *Track
-	boundaries     []float64
-	resources      map[string]resource
-	directOnce     sync.Once
-	directReady    chan struct{}
-	directAccess   map[string]DirectAccess
-	delivery       *Delivery
-	alignDone      chan struct{}
-	firstAligned   chan struct{}
-	startupZero    bool
-	listedAsset    *Asset
-	listedMaster   *HLS
-	listedVariant  *playlist.MultivariantVariant
-	listedVix      []Track
-	listedEnglish  *Track
-	listedReady    chan struct{}
-	ctx            context.Context
-	cancel         context.CancelFunc
+	mu                  sync.Mutex
+	ID                  string `json:"id"`
+	Key                 string `json:"-"`
+	lookupKey           string
+	ticket              string
+	Content             Content `json:"content"`
+	Name                string  `json:"name"`
+	ContentName         string
+	Order               int
+	Playing             bool
+	PlaybackAt          time.Time
+	RequestAt           time.Time
+	RequestMethod       string
+	SampleIndex         int
+	SampleTotal         int
+	SamplePhase         string
+	Passthrough         bool
+	SourceCheckDeferred bool
+	FallbackReason      string
+	Created             time.Time `json:"created"`
+	LastUsed            time.Time `json:"lastUsed"`
+	Status              string    `json:"status"`
+	Errors              []string  `json:"errors"`
+	Position            float64   `json:"position"`
+	PositionAt          time.Time `json:"positionAt"`
+	Duration            float64   `json:"duration"`
+	ProxyReason         string    `json:"proxyReason"`
+	Aligning            bool      `json:"aligning"`
+	Revision            int       `json:"revision"`
+	stream              Stream
+	prepare             sync.Once
+	ready               chan struct{}
+	prepareErr          error
+	video               *Asset
+	variant             *playlist.MultivariantVariant
+	clockBase           float64
+	tracks              []Track
+	sourceEnglish       *Track
+	vixEnglish          *Track
+	boundaries          []float64
+	resources           map[string]resource
+	directOnce          sync.Once
+	directReady         chan struct{}
+	directAccess        map[string]DirectAccess
+	delivery            *Delivery
+	alignDone           chan struct{}
+	firstAligned        chan struct{}
+	startupZero         bool
+	listedAsset         *Asset
+	listedMaster        *HLS
+	listedVariant       *playlist.MultivariantVariant
+	listedVix           []Track
+	listedEnglish       *Track
+	listedReady         chan struct{}
+	ctx                 context.Context
+	cancel              context.CancelFunc
 }
 type resource struct {
 	Origin   Origin
@@ -221,9 +223,21 @@ func (s *Server) prepareSession(ctx context.Context, v *Session) error {
 			work, cancel := context.WithTimeout(v.ctx, 2*time.Minute)
 			defer cancel()
 			v.prepareErr = s.prepareMedia(work, v)
+			v.mu.Lock()
+			deferred := v.SourceCheckDeferred
+			v.SourceCheckDeferred = false
+			if deferred && v.prepareErr != nil {
+				v.Passthrough = true
+				v.FallbackReason = v.prepareErr.Error()
+			}
+			v.mu.Unlock()
 			if v.prepareErr != nil {
 				v.note(v.prepareErr)
-				v.state("Source unavailable")
+				if deferred {
+					v.state("Source unavailable · original stream")
+				} else {
+					v.state("Source unavailable")
+				}
 			} else {
 				go s.ensureDirectAccess(v.ctx, v)
 			}
@@ -276,7 +290,9 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 	a, originalMaster, variant := v.listedAsset, v.listedMaster, v.listedVariant
 	var err error
 	if a == nil {
-		a, originalMaster, variant, err = s.inspectSource(ctx, v.stream)
+		check, done := context.WithTimeout(ctx, time.Duration(s.Config.Get().SourceCheckTimeoutSeconds)*time.Second)
+		a, originalMaster, variant, err = s.inspectSource(check, v.stream)
+		done()
 		if err != nil {
 			return err
 		}

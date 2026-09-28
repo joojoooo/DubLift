@@ -193,7 +193,7 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		snapshots := []map[string]any{}
 		for _, v := range sessions {
 			v.mu.Lock()
-			view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "order": v.Order, "playing": v.Playing, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "url": s.playbackURL(r, v)}
+			view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "order": v.Order, "playing": v.Playing, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "sourceCheckDeferred": v.SourceCheckDeferred, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "url": s.playbackURL(r, v)}
 			if v.Passthrough {
 				view["url"] = v.stream.URL
 			}

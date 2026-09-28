@@ -143,9 +143,13 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	generation, lookup := s.beginLookup()
-	ctx, cancel := context.WithTimeout(lookup, 40*time.Second)
+	ctx, cancel := context.WithCancel(lookup)
 	stop := context.AfterFunc(r.Context(), cancel)
 	defer func() { stop(); cancel() }()
+	// Discovery has a bounded fetch phase. Each source check gets its own
+	// timeout, so later entries are not cut off by an earlier slow source.
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, 40*time.Second)
+	defer fetchCancel()
 	cfg := s.Config.Get()
 	type addonResult struct {
 		streams []Stream
@@ -162,7 +166,7 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 			}
 			u.Path = strings.TrimSuffix(u.Path, "/manifest.json") + "/stream/" + c.Type + "/" + id + ".json"
 			u.RawPath = ""
-			b, _, e := s.Net.Fetch(ctx, Origin{u.String(), http.Header{"User-Agent": {userAgent}}}, manifestLimit)
+			b, _, e := s.Net.Fetch(fetchCtx, Origin{u.String(), http.Header{"User-Agent": {userAgent}}}, manifestLimit)
 			var response struct {
 				Streams []Stream `json:"streams"`
 			}
@@ -174,7 +178,7 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	}
 	bundleReady := make(chan vixBundle, 1)
 	go func() {
-		work, done := context.WithTimeout(ctx, 15*time.Second)
+		work, done := context.WithTimeout(fetchCtx, 15*time.Second)
 		defer done()
 		bundleReady <- s.resolveVixBundle(work, c)
 	}()
@@ -184,9 +188,14 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		if result.err != nil {
 			s.event(cfg.Addons[i].Name + ": " + result.err.Error())
 		}
-		upstream = append(upstream, result.streams...)
+		for _, stream := range result.streams {
+			if stream.ExternalURL != "https://pengu.uk/donate" {
+				upstream = append(upstream, stream)
+			}
+		}
 	}
 	bundle := <-bundleReady
+	fetchCancel()
 	results := append([]Stream{}, upstream...)
 	s.mu.Lock()
 	if generation != s.generation {
@@ -194,7 +203,13 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, 200, map[string]any{"streams": []Stream{}, "cacheMaxAge": 0, "staleRevalidate": 0, "staleError": 0})
 		return
 	}
-	s.lookupStatus = fmt.Sprintf("Checking %d streams; unavailable transformations keep their original links…", len(upstream))
+	if bundle.err != nil {
+		s.lookupStatus = "Vixsrc Italian audio unavailable; returning original links…"
+	} else if cfg.BypassSourceChecks {
+		s.lookupStatus = "Vixsrc Italian audio confirmed; returning streams with source checks deferred…"
+	} else {
+		s.lookupStatus = fmt.Sprintf("Checking up to %d streams at once for up to %d Italian results…", cfg.SourceCheckParallelism, cfg.MaxItalianResults)
+	}
 	sessions := make([]*Session, len(upstream))
 	for i, stream := range upstream {
 		v := s.newSessionLocked(c, stream)
@@ -206,59 +221,92 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		sessions[i] = v
 	}
 	s.mu.Unlock()
-	// Only manifests, container indexes and range probes are read here. No
-	// alignment or source audio decoding starts while browsing a result list.
-	slots := make(chan struct{}, 8)
-	for i, stream := range upstream {
-		wg.Go(func() {
-			v := sessions[i]
-			defer close(v.listedReady)
-			reason := ""
-			if bundle.err != nil {
-				reason = bundle.err.Error()
-			}
-			if _, e := httpURL(stream.URL); e != nil {
-				reason = "Upstream torrent or external stream"
-			}
-			var asset *Asset
-			var master *HLS
-			var variant *playlist.MultivariantVariant
-			if reason == "" {
-				select {
-				case slots <- struct{}{}:
-				case <-ctx.Done():
-					reason = "Source check timed out"
-				}
-				if reason == "" {
-					work, done := context.WithTimeout(ctx, 8*time.Second)
-					var e error
-					asset, master, variant, e = s.inspectSource(work, stream)
-					done()
-					<-slots
-					if e != nil {
-						reason = e.Error()
-					}
-				}
-			}
-			v.mu.Lock()
-			if reason == "" {
-				v.listedAsset, v.listedMaster, v.listedVariant = asset, master, variant
-				v.listedVix, v.listedEnglish = bundle.tracks, bundle.english
-				v.Status = "Available · waiting for player"
-				results[i] = stream.dubbed(s.playbackURL(r, v))
-			} else {
-				v.Passthrough = true
-				v.FallbackReason = reason
-				v.Status = "Original stream · unchanged upstream link"
-			}
-			v.mu.Unlock()
-		})
+	// Normal listing reads only manifests, container indexes and range
+	// probes. Bypass listing reads no source media; neither path decodes it.
+	// Launch in upstream order, and commit results in that same order. Never
+	// leave more checks unresolved than the remaining Italian result slots.
+	type sourceCheckResult struct {
+		asset   *Asset
+		master  *HLS
+		variant *playlist.MultivariantVariant
+		reason  string
 	}
-	wg.Wait()
+	checked := make([]chan sourceCheckResult, len(upstream))
+	launch := func(i int) {
+		ready := make(chan sourceCheckResult, 1)
+		checked[i] = ready
+		go func(stream Stream) {
+			var result sourceCheckResult
+			if bundle.err != nil {
+				result.reason = bundle.err.Error()
+			} else if _, e := httpURL(stream.URL); e != nil {
+				result.reason = "Upstream torrent or external stream"
+			} else if !cfg.BypassSourceChecks {
+				work, done := context.WithTimeout(ctx, time.Duration(cfg.SourceCheckTimeoutSeconds)*time.Second)
+				var e error
+				result.asset, result.master, result.variant, e = s.inspectSource(work, stream)
+				done()
+				if e != nil {
+					result.reason = e.Error()
+				}
+			}
+			ready <- result
+		}(upstream[i])
+	}
+	maxResults := cfg.MaxItalianResults
+	if cfg.BypassSourceChecks {
+		maxResults = len(upstream)
+	}
+	italianResults, nextToStart := 0, 0
+	for i, stream := range upstream {
+		var check sourceCheckResult
+		if italianResults >= maxResults {
+			check.reason = "Italian result limit reached"
+		} else {
+			for nextToStart < len(upstream) && nextToStart-i < cfg.SourceCheckParallelism && italianResults+nextToStart-i < maxResults {
+				launch(nextToStart)
+				nextToStart++
+			}
+			if !cfg.BypassSourceChecks {
+				s.mu.Lock()
+				if generation == s.generation {
+					s.lookupStatus = fmt.Sprintf("Resolving stream %d of %d in upstream order · %d/%d Italian results…", i+1, len(upstream), italianResults, maxResults)
+				}
+				s.mu.Unlock()
+			}
+			check = <-checked[i]
+		}
+		v := sessions[i]
+		v.mu.Lock()
+		if check.reason == "" {
+			v.listedAsset, v.listedMaster, v.listedVariant = check.asset, check.master, check.variant
+			v.listedVix, v.listedEnglish = bundle.tracks, bundle.english
+			if cfg.BypassSourceChecks {
+				v.SourceCheckDeferred = true
+				v.Status = "Italian audio found · source check deferred until Prepare or playback"
+			} else {
+				v.Status = "Available · waiting for player"
+			}
+			results[i] = stream.dubbed(s.playbackURL(r, v))
+			italianResults++
+		} else {
+			v.Passthrough = true
+			v.FallbackReason = check.reason
+			v.Status = "Original stream · unchanged upstream link"
+		}
+		v.mu.Unlock()
+		close(v.listedReady)
+	}
 	s.mu.Lock()
 	current := generation == s.generation
 	if current {
-		s.lookupStatus = fmt.Sprintf("%d streams returned in upstream order", len(results))
+		if bundle.err != nil {
+			s.lookupStatus = fmt.Sprintf("Vixsrc Italian audio unavailable · %d original streams returned", len(results))
+		} else if cfg.BypassSourceChecks {
+			s.lookupStatus = fmt.Sprintf("%d Italian results returned · source checks deferred until Prepare or playback", italianResults)
+		} else {
+			s.lookupStatus = fmt.Sprintf("%d Italian results · %d streams returned in upstream order", italianResults, len(results))
+		}
 	}
 	s.mu.Unlock()
 	if !current {

@@ -24,22 +24,26 @@ type Settings struct {
 	PreferProxy    bool   `json:"preferProxy"`
 	DirectPlayback bool   `json:"directPlayback"`
 	// nil is infinite: prefer direct audio regardless of measured offset.
-	DirectTolerance  *float64 `json:"directTolerance"`
-	MinConfidence    float64  `json:"minConfidence"`
-	SearchRadius     float64  `json:"searchRadius"`
-	AlignmentSamples int      `json:"alignmentSamples"`
-	StartImmediately bool     `json:"startImmediately"`
-	CacheMB          int      `json:"cacheMB"`
-	FFmpeg           string   `json:"ffmpeg"`
-	FFprobe          string   `json:"ffprobe"`
-	VixBaseURL       string   `json:"vixBaseURL"`
-	TMDBToken        string   `json:"tmdbToken"`
-	Addons           []Addon  `json:"addons"`
+	DirectTolerance           *float64 `json:"directTolerance"`
+	MinConfidence             float64  `json:"minConfidence"`
+	SearchRadius              float64  `json:"searchRadius"`
+	AlignmentSamples          int      `json:"alignmentSamples"`
+	MaxItalianResults         int      `json:"maxItalianResults"`
+	SourceCheckTimeoutSeconds int      `json:"sourceCheckTimeoutSeconds"`
+	SourceCheckParallelism    int      `json:"sourceCheckParallelism"`
+	BypassSourceChecks        bool     `json:"bypassSourceChecks"`
+	StartImmediately          bool     `json:"startImmediately"`
+	CacheMB                   int      `json:"cacheMB"`
+	FFmpeg                    string   `json:"ffmpeg"`
+	FFprobe                   string   `json:"ffprobe"`
+	VixBaseURL                string   `json:"vixBaseURL"`
+	TMDBToken                 string   `json:"tmdbToken"`
+	Addons                    []Addon  `json:"addons"`
 }
 
 func DefaultSettings() Settings {
 	tolerance := .125
-	return Settings{Listen: "0.0.0.0:7000", DirectPlayback: true, DirectTolerance: &tolerance, MinConfidence: .68, SearchRadius: 8, AlignmentSamples: 3, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
+	return Settings{Listen: "0.0.0.0:7000", DirectPlayback: true, DirectTolerance: &tolerance, MinConfidence: .68, SearchRadius: 8, AlignmentSamples: 3, MaxItalianResults: 3, SourceCheckTimeoutSeconds: 25, SourceCheckParallelism: 1, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
 }
 
 func httpURL(raw string) (*url.URL, error) {
@@ -53,6 +57,15 @@ func httpURL(raw string) (*url.URL, error) {
 func (c Settings) Validate() error {
 	if c.AlignmentSamples < 1 || c.AlignmentSamples > 12 {
 		return errors.New("alignment samples must be between 1 and 12")
+	}
+	if c.MaxItalianResults < 1 || c.MaxItalianResults > 100 {
+		return errors.New("maximum Italian results must be between 1 and 100")
+	}
+	if c.SourceCheckTimeoutSeconds < 1 || c.SourceCheckTimeoutSeconds > 120 {
+		return errors.New("source check timeout must be between 1 and 120 seconds")
+	}
+	if c.SourceCheckParallelism < 1 || c.SourceCheckParallelism > 16 {
+		return errors.New("parallel source checks must be between 1 and 16")
 	}
 	if c.DirectTolerance != nil && (math.IsNaN(*c.DirectTolerance) || math.IsInf(*c.DirectTolerance, 0) || *c.DirectTolerance < 0) {
 		return errors.New("direct tolerance must be nonnegative, or null for infinite")

@@ -257,6 +257,43 @@ func TestCacheBoundAndSingleFlight(t *testing.T) {
 		t.Fatal("cache grew without bound")
 	}
 }
+func TestSourceCheckSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	c, err := OpenConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := c.Get()
+	if settings.MaxItalianResults != 3 || settings.SourceCheckTimeoutSeconds != 25 || settings.SourceCheckParallelism != 1 || settings.BypassSourceChecks {
+		t.Fatalf("unexpected source check defaults: %d results, %d seconds, %d parallel", settings.MaxItalianResults, settings.SourceCheckTimeoutSeconds, settings.SourceCheckParallelism)
+	}
+	settings.MaxItalianResults = 7
+	settings.SourceCheckTimeoutSeconds = 42
+	settings.SourceCheckParallelism = 4
+	settings.BypassSourceChecks = true
+	if err := c.Save(settings); err != nil {
+		t.Fatal(err)
+	}
+	c, err = OpenConfig(path)
+	if err != nil || c.Get().MaxItalianResults != 7 || c.Get().SourceCheckTimeoutSeconds != 42 || c.Get().SourceCheckParallelism != 4 || !c.Get().BypassSourceChecks {
+		t.Fatalf("source check settings did not persist: %v", err)
+	}
+	settings.MaxItalianResults = 0
+	if settings.Validate() == nil {
+		t.Fatal("accepted zero Italian results")
+	}
+	settings.MaxItalianResults = 7
+	settings.SourceCheckTimeoutSeconds = 121
+	if settings.Validate() == nil {
+		t.Fatal("accepted source check timeout over 120 seconds")
+	}
+	settings.SourceCheckTimeoutSeconds = 42
+	settings.SourceCheckParallelism = 17
+	if settings.Validate() == nil {
+		t.Fatal("accepted more than 16 parallel source checks")
+	}
+}
+
 func TestPrivateConfigAndIDs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "private", "config.json")
 	c, e := OpenConfig(path)

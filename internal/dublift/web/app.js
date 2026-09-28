@@ -79,6 +79,9 @@ const fields = {
   listen: "listen",
   searchRadius: "search-radius",
   alignmentSamples: "alignment-samples",
+  maxItalianResults: "max-italian-results",
+  sourceCheckTimeoutSeconds: "source-check-timeout",
+  sourceCheckParallelism: "source-check-parallelism",
   cacheMB: "cache-mb",
   ffmpeg: "ffmpeg",
   ffprobe: "ffprobe",
@@ -89,6 +92,7 @@ async function loadSettings() {
   settings = await api("/api/settings");
   for (const [key, id] of Object.entries(fields))
     $(id).value = settings[key] ?? "";
+  $("bypass-source-checks").checked = settings.bypassSourceChecks;
   $("prefer-proxy").checked = settings.preferProxy;
   $("start-immediately").checked = settings.startImmediately;
   $("direct-playback").checked = settings.directPlayback;
@@ -119,9 +123,10 @@ $("settings-form").onsubmit = async (e) => {
   e.preventDefault();
   const cfg = { ...settings };
   for (const [key, id] of Object.entries(fields))
-    cfg[key] = ["searchRadius", "alignmentSamples", "cacheMB"].includes(key)
+    cfg[key] = ["searchRadius", "alignmentSamples", "maxItalianResults", "sourceCheckTimeoutSeconds", "sourceCheckParallelism", "cacheMB"].includes(key)
       ? Number($(id).value)
       : $(id).value.trim();
+  cfg.bypassSourceChecks = $("bypass-source-checks").checked;
   cfg.preferProxy = $("prefer-proxy").checked;
   cfg.startImmediately = $("start-immediately").checked;
   cfg.directPlayback = $("direct-playback").checked;
@@ -164,8 +169,12 @@ $("resolve-form").onsubmit = async (e) => {
       type: $("content-type").value,
       id: $("content-id").value.trim(),
     });
-    $("resolve-status").textContent =
-      `${r.streams.length} streams found. ${r.streams.length ? "Prepare a session to inspect audio." : "Check the activity log for provider errors."}`;
+    const hint = !r.streams.length
+      ? "Check the activity log for provider errors."
+      : settings?.bypassSourceChecks
+        ? "Prepare a session to check its source."
+        : "Prepare a session to inspect audio.";
+    $("resolve-status").textContent = `${r.streams.length} streams found. ${hint}`;
     await poll();
   } catch (err) {
     $("resolve-status").textContent = err.message;
@@ -237,7 +246,7 @@ function updateCard(v) {
   set(".stream-title", v.title || "");
   set(".description", v.description || "");
   set(".file-details", v.filename || "");
-  set(".playback-badge", v.playing ? "▶ Playback detected" : v.requestMethod === "HEAD" ? "Player checked stream" : v.passthrough ? "Original" : "Available");
+  set(".playback-badge", v.passthrough ? "Original" : v.playing ? "▶ Playback detected" : v.requestMethod === "HEAD" ? "Player checked stream" : v.sourceCheckDeferred ? "Source unchecked" : "Available");
   card.classList.toggle("playing", !!v.playing);
   set(".sample-progress", v.aligning ? `Sample ${v.sampleIndex || 1} of ${v.sampleTotal || settings?.alignmentSamples || 3} · ${v.samplePhase || "Starting analysis"}` : v.samplePhase || "");
   set(".name", v.name || "Upstream stream");
@@ -305,6 +314,7 @@ function updateCard(v) {
   card.querySelector(".player-position-label").hidden = !(
     loaded?.canStopServer || direct.canStopServer
   );
+  card.querySelector(".prepare").textContent = v.sourceCheckDeferred ? "Check & prepare" : "Prepare playback";
   card.querySelector(".prepare").hidden = !!v.ready || !!v.passthrough;
   card.querySelector(".prepare").disabled = v.checked === false;
   card.querySelector(".session-metrics").hidden = !v.ready;

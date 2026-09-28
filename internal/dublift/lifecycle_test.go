@@ -10,7 +10,10 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -84,11 +87,13 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			defer origin.Close()
 			first = []json.RawMessage{
 				json.RawMessage(fmt.Sprintf(`{"name":"Zulu · 4K","title":"The Matrix\nFull title and size","description":"All provider details\nSecond line","url":%q,"behaviorHints":{"filename":"The.Matrix.1999.mkv","proxyHeaders":{"request":{"Referer":"https://required.test/"}},"videoSize":123456789},"subtitles":[{"id":"it","lang":"ita","url":"https://subs.test/1"}],"customField":{"keep":true}}`, origin.URL+"/video.m3u8")),
+				json.RawMessage(`{"name":"Donation","externalUrl":"https://pengu.uk/donate"}`),
 				json.RawMessage(`{"name":"Torrent","infoHash":"0123456789abcdef","fileIdx":3,"sources":["tracker:test"],"behaviorHints":{"videoSize":555}}`),
 			}
 			second = []json.RawMessage{
 				json.RawMessage(fmt.Sprintf(`{"name":"Alpha","description":"Nonseekable original","url":%q,"headers":{"X-Test":"keep"}}`, origin.URL+"/no-range.mkv")),
 				json.RawMessage(`{"name":"External","externalUrl":"https://player.test/","unknown":17}`),
+				json.RawMessage(`{"name":"Nearby","externalUrl":"https://pengu.uk/donate/"}`),
 			}
 			s := lifecycleServer(t)
 			cfg := s.Config.Get()
@@ -105,7 +110,7 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 				t.Fatal(err)
 			}
-			want := append(append([]json.RawMessage{}, first...), second...)
+			want := []json.RawMessage{first[0], first[2], second[0], second[1], second[2]}
 			if len(result.Streams) != len(want) {
 				t.Fatal(w.Body.String())
 			}
@@ -139,10 +144,10 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 				}
 			}
 			json.Unmarshal(w.Body.Bytes(), &state)
-			if len(state.Sessions) != 4 {
+			if len(state.Sessions) != 5 {
 				t.Fatal(w.Body.String())
 			}
-			for i, name := range []string{"Zulu · 4K", "Torrent", "Alpha", "External"} {
+			for i, name := range []string{"Zulu · 4K", "Torrent", "Alpha", "External", "Nearby"} {
 				if state.Sessions[i].Name != name || state.Sessions[i].Order != i {
 					t.Fatal(state)
 				}
@@ -151,6 +156,249 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 				t.Fatal(state)
 			}
 		})
+	}
+}
+
+func TestOrderedItalianResultLimitAndSourceTimeout(t *testing.T) {
+	for _, parallel := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("parallel=%d", parallel), func(t *testing.T) {
+			ffmpegAvailable(t)
+			var mu sync.Mutex
+			var checked []string
+			active, maxActive := 0, 0
+			var streams []Stream
+			var origin *httptest.Server
+			origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/stream/movie/tmdb:603.json":
+					jsonResponse(w, 200, map[string]any{"streams": streams})
+				case "/api/movie/603":
+					io.WriteString(w, `{"src":"/embed"}`)
+				case "/embed":
+					io.WriteString(w, `window.masterPlaylist={url:'/vix',params:{token:'fixture',expires:9999999999}}`)
+				case "/vix.m3u8":
+					io.WriteString(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italiano\",LANGUAGE=\"it\",URI=\"it.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo.m3u8\n")
+				case "/it.m3u8":
+					io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
+				case "/bad.m3u8", "/one.m3u8", "/two.m3u8", "/three.m3u8":
+					mu.Lock()
+					checked = append(checked, r.URL.Path)
+					active++
+					maxActive = max(maxActive, active)
+					mu.Unlock()
+					defer func() {
+						mu.Lock()
+						active--
+						mu.Unlock()
+					}()
+					if r.URL.Path == "/one.m3u8" {
+						time.Sleep(200 * time.Millisecond)
+					}
+					if r.URL.Path == "/bad.m3u8" && parallel == 3 {
+						time.Sleep(400 * time.Millisecond)
+						io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
+						return
+					}
+					if r.URL.Path == "/bad.m3u8" {
+						select {
+						case <-r.Context().Done():
+						case <-time.After(1500 * time.Millisecond):
+							http.Error(w, "slow source", http.StatusServiceUnavailable)
+						}
+						return
+					}
+					io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
+				case "/segment.ts":
+					w.Header().Set("Content-Type", "video/mp2t")
+					w.Write(make([]byte, 512))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer origin.Close()
+			for _, name := range []string{"bad", "one", "two", "three"} {
+				streams = append(streams, Stream{Name: name, URL: origin.URL + "/" + name + ".m3u8"})
+			}
+			s := lifecycleServer(t)
+			cfg := s.Config.Get()
+			cfg.VixBaseURL = origin.URL
+			cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
+			cfg.MaxItalianResults = 2
+			cfg.SourceCheckTimeoutSeconds = 1
+			cfg.SourceCheckParallelism = parallel
+			if err := s.Config.Save(cfg); err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest("GET", "/stream/movie/tmdb:603.json", nil))
+			var response struct {
+				Streams []Stream `json:"streams"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if len(response.Streams) != 4 {
+				t.Fatal(w.Body.String())
+			}
+			for i, stream := range response.Streams {
+				wantItalian := (parallel == 3 && i < 2) || (parallel != 3 && (i == 1 || i == 2))
+				if strings.HasPrefix(stream.Name, "🇮🇹 ") != wantItalian {
+					t.Fatalf("stream %d Italian=%t, want %t", i, strings.HasPrefix(stream.Name, "🇮🇹 "), wantItalian)
+				}
+				if (stream.URL != streams[i].URL) != wantItalian {
+					t.Fatalf("stream %d URL transformed unexpectedly", i)
+				}
+			}
+			mu.Lock()
+			order := append([]string(nil), checked...)
+			observedParallel := maxActive
+			mu.Unlock()
+			if parallel == 1 && !reflect.DeepEqual(order, []string{"/bad.m3u8", "/one.m3u8", "/two.m3u8"}) {
+				t.Fatalf("source checks = %v", order)
+			}
+			sort.Strings(order)
+			wantChecks := []string{"/bad.m3u8", "/one.m3u8", "/two.m3u8"}
+			if parallel == 3 {
+				wantChecks = wantChecks[:2]
+			}
+			if !reflect.DeepEqual(order, wantChecks) || observedParallel != min(parallel, cfg.MaxItalianResults) {
+				t.Fatalf("source checks = %v, max parallel = %d", order, observedParallel)
+			}
+			w = httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
+			var state struct {
+				Sessions []struct {
+					Passthrough    bool
+					FallbackReason string
+				}
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+				t.Fatal(err)
+			}
+			if len(state.Sessions) != 4 || !state.Sessions[3].Passthrough || state.Sessions[3].FallbackReason != "Italian result limit reached" {
+				t.Fatal(w.Body.String())
+			}
+			if parallel == 3 {
+				if state.Sessions[0].Passthrough || state.Sessions[2].FallbackReason != "Italian result limit reached" {
+					t.Fatal(w.Body.String())
+				}
+			} else if !strings.Contains(state.Sessions[0].FallbackReason, "timeout") {
+				t.Fatal(w.Body.String())
+			}
+		})
+	}
+}
+
+func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
+	ffmpegAvailable(t)
+	var italian atomic.Bool
+	italian.Store(true)
+	var sourceRequests atomic.Int64
+	var streams []Stream
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/stream/movie/tmdb:603.json":
+			jsonResponse(w, 200, map[string]any{"streams": streams})
+		case "/api/movie/603":
+			io.WriteString(w, `{"src":"/embed"}`)
+		case "/embed":
+			io.WriteString(w, `window.masterPlaylist={url:'/vix',params:{token:'fixture',expires:9999999999}}`)
+		case "/vix.m3u8":
+			lang := "it"
+			if !italian.Load() {
+				lang = "en"
+			}
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Audio\",LANGUAGE=\"%s\",URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo.m3u8\n", lang)
+		case "/audio.m3u8":
+			io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
+		case "/one.m3u8", "/two.m3u8":
+			sourceRequests.Add(1)
+			http.Error(w, "unavailable source", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer origin.Close()
+	streams = []Stream{
+		{Name: "one", URL: origin.URL + "/one.m3u8"},
+		{Name: "two", URL: origin.URL + "/two.m3u8"},
+		{Name: "torrent"},
+		{Name: "donation", ExternalURL: "https://pengu.uk/donate"},
+	}
+	s := lifecycleServer(t)
+	cfg := s.Config.Get()
+	cfg.VixBaseURL = origin.URL
+	cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
+	cfg.MaxItalianResults = 1
+	cfg.BypassSourceChecks = true
+	if err := s.Config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("GET", "/stream/movie/tmdb:603.json", nil))
+	var response struct {
+		Streams []Stream `json:"streams"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Streams) != 3 || sourceRequests.Load() != 0 {
+		t.Fatal(w.Body.String(), "source requests:", sourceRequests.Load())
+	}
+	for i, stream := range response.Streams {
+		if (i < 2) != strings.HasPrefix(stream.Name, "🇮🇹 ") {
+			t.Fatalf("stream %d: %s", i, stream.Name)
+		}
+	}
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
+	var state struct {
+		Sessions []struct {
+			ID                  string
+			SourceCheckDeferred bool
+			Passthrough         bool
+			FallbackReason      string
+		}
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 3 || !state.Sessions[0].SourceCheckDeferred || !state.Sessions[1].SourceCheckDeferred || state.Sessions[2].SourceCheckDeferred {
+		t.Fatal(w.Body.String())
+	}
+	prepare := httptest.NewRequest("POST", "/api/sessions/"+state.Sessions[0].ID+"/prepare", strings.NewReader(`{}`))
+	prepare.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, prepare)
+	if w.Code != http.StatusBadGateway || sourceRequests.Load() != 1 {
+		t.Fatal("Prepare must check its source:", w.Code, sourceRequests.Load())
+	}
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
+	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if !state.Sessions[0].Passthrough || state.Sessions[0].SourceCheckDeferred || state.Sessions[0].FallbackReason == "" {
+		t.Fatal(w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("GET", "/media/"+state.Sessions[1].ID+"/master.m3u8", nil))
+	if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != streams[1].URL || sourceRequests.Load() != 2 {
+		t.Fatal("playback must check and fall back to its source:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
+	}
+	italian.Store(false)
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("GET", "/stream/movie/tmdb:603.json", nil))
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Streams) != 3 || sourceRequests.Load() != 2 {
+		t.Fatal(w.Body.String(), "source requests:", sourceRequests.Load())
+	}
+	for i, stream := range response.Streams {
+		if stream.URL != streams[i].URL || strings.HasPrefix(stream.Name, "🇮🇹 ") {
+			t.Fatalf("stream %d became Italian without Vixsrc audio", i)
+		}
 	}
 }
 
