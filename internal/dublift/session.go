@@ -158,7 +158,9 @@ type resource struct {
 }
 
 func (s *Session) note(err error) {
-	if err == nil {
+	// Players cancel requests when they seek, retry, or give up waiting. Those
+	// cancellations are not source failures and should not fill the dashboard.
+	if err == nil || errors.Is(err, context.Canceled) {
 		return
 	}
 	s.mu.Lock()
@@ -585,6 +587,9 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 				return
 			}
 			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					err = errors.New("30-second analysis limit exceeded; source may be too slow")
+				}
 				v.note(fmt.Errorf("alignment sample at %.0fs: %w", at, err))
 				if i == 0 {
 					finishFirst()
