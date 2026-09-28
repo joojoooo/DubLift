@@ -48,6 +48,7 @@
           <p class="help">These can be changed any time in Settings.</p>
           <div class="wizard-fields">
             <label>Maximum Italian results<input id="wizard-max-results" type="number" min="1" max="100" required /></label>
+            <label>Max Italian Results per Stream Type<input id="wizard-max-per-type" type="number" min="1" max="100" required /></label>
             <label>Parallel source checks<input id="wizard-parallelism" type="number" min="1" max="16" required /></label>
             <label>Source check timeout (seconds)<input id="wizard-timeout" type="number" min="1" max="120" required /></label>
             <label>Alignment samples<input id="wizard-samples" type="number" min="1" max="12" required /></label>
@@ -100,9 +101,10 @@
           <p class="help">New lookups replace these results while keeping current playback. Selecting another stream replaces the current playback. Inactive sessions and their caches expire after one hour.</p>
           <div id="stream-filters" class="stream-filters" role="group" aria-label="Filter streams">
             <span class="small">FILTER STREAMS</span>
-            <button id="filter-italian" type="button" aria-pressed="false">Italian only</button>
+            <button id="filter-italian" type="button" aria-pressed="false">Italian</button>
             <button id="filter-hls" type="button" aria-pressed="false">HLS</button>
             <button id="filter-mkv" type="button" aria-pressed="false">MKV</button>
+            <button id="filter-mp4" type="button" aria-pressed="false">MP4</button>
             <span id="filter-count" class="help" role="status"></span>
           </div>
           <div id="sessions" class="session-list">
@@ -195,10 +197,12 @@
               + Add upstream addon
             </button>
             <label>Maximum Italian results<input id="max-italian-results" type="number" min="1" max="100" step="1" required /></label>
+            <label>Max Italian Results per Stream Type<input id="max-italian-results-per-stream-type" type="number" min="1" max="100" step="1" required /></label>
+            <p class="help">Stream type means whether DubLift remuxes the video: MKV and MP4 files share one type; HLS playlists, including those with MP4 fragments, share the other. With the defaults, two remuxed results leave room for one HLS result when available.</p>
             <label>Source check timeout (seconds per stream)<input id="source-check-timeout" type="number" min="1" max="120" step="1" required /></label>
             <label>Parallel source checks<input id="source-check-parallelism" type="number" min="1" max="16" step="1" required /></label>
             <label class="switch-row"><input id="bypass-source-checks" type="checkbox" /><span><strong>Bypass source checks when listing</strong><small>Return up to the configured number of HTTP streams with Italian audio as soon as Vixsrc Italian audio is confirmed. Check each source when you play it or click Check &amp; prepare. Parallel source checks apply only when this is off.</small></span></label>
-            <p class="help">Start checks in upstream order and apply results in that order. Up to the selected number run at once; the Italian result limit also caps checks in flight. Unchecked streams keep their original links.</p>
+            <p class="help">Check earlier streams of each type first, then use remaining slots when other types cannot fill them. Up to the selected number of checks run at once. Results keep upstream order, and unchecked streams keep their original links.</p>
             <hr />
             <h3>Playback delivery</h3>
             <label class="switch-row"

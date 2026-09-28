@@ -223,18 +223,18 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	// Normal listing reads only manifests, container indexes and range
 	// probes. Bypass listing reads no source media; neither path decodes it.
-	// Launch in upstream order, and commit results in that same order. Never
-	// leave more checks unresolved than the remaining Italian result slots.
+	// Reserve each type's first slots before trying further streams of that
+	// type. Keep the response in upstream order, regardless of check order.
 	type sourceCheckResult struct {
 		asset   *Asset
 		master  *HLS
 		variant *playlist.MultivariantVariant
 		reason  string
 	}
-	checked := make([]chan sourceCheckResult, len(upstream))
+	checks := make([]chan sourceCheckResult, len(upstream))
 	launch := func(i int) {
 		ready := make(chan sourceCheckResult, 1)
-		checked[i] = ready
+		checks[i] = ready
 		if bundle.err == nil && !cfg.BypassSourceChecks {
 			if _, err := httpURL(upstream[i].URL); err == nil {
 				sessions[i].mu.Lock()
@@ -260,29 +260,97 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 			ready <- result
 		}(upstream[i])
 	}
-	maxResults := cfg.MaxItalianResults
-	italianResults, nextToStart := 0, 0
+	maxResults, perType := cfg.MaxItalianResults, cfg.MaxItalianResultsPerStreamType
+	italianResults := 0
+	counts := make(map[string]int)
+	kinds := make([]string, len(upstream))
+	seen := make(map[string]int)
+	var balanced, overflow []int
 	for i, stream := range upstream {
-		var check sourceCheckResult
-		if italianResults >= maxResults {
-			check.reason = "Italian result limit reached"
+		kind := streamSelectionType(stream, nil)
+		kinds[i] = kind
+		if seen[kind] < perType {
+			balanced = append(balanced, i)
 		} else {
-			for nextToStart < len(upstream) && nextToStart-i < cfg.SourceCheckParallelism && italianResults+nextToStart-i < maxResults {
-				launch(nextToStart)
+			overflow = append(overflow, i)
+		}
+		seen[kind]++
+	}
+	outcomes := make([]sourceCheckResult, len(upstream))
+	inspected := make([]bool, len(upstream))
+	selected := make([]bool, len(upstream))
+	// Checks still run concurrently, but their results are applied in each
+	// pass's priority order. A failed alternative leaves room for overflow.
+	runPass := func(indices []int, enforceTypeLimit bool) {
+		nextToStart := 0
+		for pos, i := range indices {
+			if italianResults >= maxResults {
+				break
+			}
+			if selected[i] || inspected[i] && outcomes[i].reason != "" {
+				continue
+			}
+			for nextToStart < len(indices) && nextToStart-pos < cfg.SourceCheckParallelism && italianResults+nextToStart-pos < maxResults {
+				candidate := indices[nextToStart]
+				if checks[candidate] == nil && !inspected[candidate] && (!enforceTypeLimit || counts[kinds[candidate]] < perType) {
+					launch(candidate)
+				}
 				nextToStart++
 			}
-			if !cfg.BypassSourceChecks {
-				s.mu.Lock()
-				if generation == s.generation {
-					s.lookupStatus = fmt.Sprintf("Resolving stream %d of %d in upstream order · %d/%d Italian results…", i+1, len(upstream), italianResults, maxResults)
+			if checks[i] == nil && !inspected[i] {
+				if enforceTypeLimit && counts[kinds[i]] >= perType {
+					continue
 				}
-				s.mu.Unlock()
+				launch(i)
 			}
-			check = <-checked[i]
+			if !inspected[i] {
+				if !cfg.BypassSourceChecks {
+					s.mu.Lock()
+					if generation == s.generation {
+						s.lookupStatus = fmt.Sprintf("Resolving stream %d of %d · %d/%d Italian results…", i+1, len(upstream), italianResults, maxResults)
+					}
+					s.mu.Unlock()
+				}
+				outcomes[i] = <-checks[i]
+				inspected[i] = true
+			}
+			if outcomes[i].reason == "" {
+				kind := streamSelectionType(upstream[i], outcomes[i].asset)
+				if !enforceTypeLimit || counts[kind] < perType {
+					selected[i] = true
+					counts[kind]++
+					italianResults++
+				}
+			}
+		}
+	}
+	runPass(balanced, true)
+	if italianResults < maxResults {
+		var alternatives []int
+		for _, i := range overflow {
+			if counts[kinds[i]] < perType {
+				alternatives = append(alternatives, i)
+			}
+		}
+		runPass(alternatives, true)
+	}
+	if italianResults < maxResults {
+		var remaining []int
+		for i := range upstream {
+			if !selected[i] && (!inspected[i] || outcomes[i].reason == "") {
+				remaining = append(remaining, i)
+			}
+		}
+		runPass(remaining, false)
+	}
+	for i, stream := range upstream {
+		check := outcomes[i]
+		if !selected[i] && check.reason == "" {
+			check.reason = "Italian result limit reached"
 		}
 		v := sessions[i]
 		v.mu.Lock()
-		if check.reason == "" {
+		if selected[i] {
 			v.listedAsset, v.listedMaster, v.listedVariant = check.asset, check.master, check.variant
 			v.listedVix, v.listedEnglish = bundle.tracks, bundle.english
 			if cfg.BypassSourceChecks {
@@ -292,7 +360,6 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 				v.Status = "Available · waiting for player"
 			}
 			results[i] = stream.dubbed(s.playbackURL(r, v))
-			italianResults++
 		} else {
 			v.Passthrough = true
 			v.FallbackReason = check.reason
@@ -319,6 +386,21 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		go s.resolveContentName(c, cfg)
 	}
 	jsonResponse(w, 200, map[string]any{"streams": results, "cacheMaxAge": 0, "staleRevalidate": 0, "staleError": 0})
+}
+
+// The result limit groups sources by whether their video needs file remuxing.
+// HLS keeps its source segments even when those segments are fragmented MP4.
+func streamSelectionType(stream Stream, asset *Asset) string {
+	if asset != nil {
+		if asset.HLS != nil {
+			return "hls"
+		}
+		return "remuxed"
+	}
+	if isHLSURL(stream.URL, stream.BehaviorHints.Filename) {
+		return "hls"
+	}
+	return "remuxed"
 }
 
 func fallbackContentName(c Content, stream Stream) string {

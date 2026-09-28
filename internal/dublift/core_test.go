@@ -3,6 +3,7 @@ package dublift
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -264,10 +265,11 @@ func TestSourceCheckSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings := c.Get()
-	if settings.MaxItalianResults != 3 || settings.SourceCheckTimeoutSeconds != 20 || settings.SourceCheckParallelism != 3 || settings.BypassSourceChecks {
+	if settings.MaxItalianResults != 3 || settings.MaxItalianResultsPerStreamType != 2 || settings.SourceCheckTimeoutSeconds != 20 || settings.SourceCheckParallelism != 3 || settings.BypassSourceChecks {
 		t.Fatalf("unexpected source check defaults: %d results, %d seconds, %d parallel", settings.MaxItalianResults, settings.SourceCheckTimeoutSeconds, settings.SourceCheckParallelism)
 	}
 	settings.MaxItalianResults = 7
+	settings.MaxItalianResultsPerStreamType = 4
 	settings.SourceCheckTimeoutSeconds = 42
 	settings.SourceCheckParallelism = 4
 	settings.BypassSourceChecks = true
@@ -275,14 +277,39 @@ func TestSourceCheckSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err = OpenConfig(path)
-	if err != nil || c.Get().MaxItalianResults != 7 || c.Get().SourceCheckTimeoutSeconds != 42 || c.Get().SourceCheckParallelism != 4 || !c.Get().BypassSourceChecks {
+	if err != nil || c.Get().MaxItalianResults != 7 || c.Get().MaxItalianResultsPerStreamType != 4 || c.Get().SourceCheckTimeoutSeconds != 42 || c.Get().SourceCheckParallelism != 4 || !c.Get().BypassSourceChecks {
 		t.Fatalf("source check settings did not persist: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(b, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	delete(legacy, "maxItalianResultsPerStreamType")
+	b, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = OpenConfig(path)
+	if err != nil || c.Get().MaxItalianResultsPerStreamType != 2 {
+		t.Fatalf("existing config did not receive per-type default: %v", err)
 	}
 	settings.MaxItalianResults = 0
 	if settings.Validate() == nil {
 		t.Fatal("accepted zero Italian results")
 	}
 	settings.MaxItalianResults = 7
+	settings.MaxItalianResultsPerStreamType = 0
+	if settings.Validate() == nil {
+		t.Fatal("accepted zero Italian results per stream type")
+	}
+	settings.MaxItalianResultsPerStreamType = 4
 	settings.SourceCheckTimeoutSeconds = 121
 	if settings.Validate() == nil {
 		t.Fatal("accepted source check timeout over 120 seconds")

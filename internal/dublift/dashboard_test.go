@@ -115,6 +115,19 @@ func TestStreamSourceFormatUsesCheckedMedia(t *testing.T) {
 	if got := streamSourceFormat(Stream{URL: "https://origin.test/opaque"}, &Asset{Index: FileIndex{Container: "matroska"}}); got != "mkv" {
 		t.Fatalf("checked Matroska format not used: %s", got)
 	}
+	stream = Stream{URL: "https://origin.test/movie.MP4?token=redacted"}
+	stream.BehaviorHints.Filename = "movie.mkv"
+	if got := streamSourceFormat(stream, nil); got != "mp4" {
+		t.Fatalf("MP4 URL format lost to filename: %s", got)
+	}
+	stream.URL = "https://origin.test/opaque"
+	stream.BehaviorHints.Filename = "movie.m4v"
+	if got := streamSourceFormat(stream, nil); got != "mp4" {
+		t.Fatalf("MP4 filename format not used: %s", got)
+	}
+	if got := streamSourceFormat(Stream{URL: "https://origin.test/opaque"}, &Asset{Index: FileIndex{Container: "mp4"}}); got != "mp4" {
+		t.Fatalf("checked MP4 format not used: %s", got)
+	}
 }
 
 func TestStatusReportsPreparationBeforeMediaIsReady(t *testing.T) {

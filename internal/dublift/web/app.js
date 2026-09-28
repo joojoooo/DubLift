@@ -7,7 +7,7 @@ let settings,
   manifestBaseline = null;
 const cards = new Map();
 const addonDetailsCache = new Map();
-const streamFilters = { italian: false, hls: false, mkv: false };
+const streamFilters = { italian: false, hls: false, mkv: false, mp4: false };
 const streamFilterKey = "dublift.streamFilters.v1";
 async function api(path, data) {
   const response = await fetch(
@@ -180,7 +180,7 @@ function applyStreamFilters(sessions) {
     }
     resultCount++;
     const italian = session.checked !== false && !session.passthrough;
-    const format = !streamFilters.hls && !streamFilters.mkv || !!streamFilters[session.sourceFormat];
+    const format = !streamFilters.hls && !streamFilters.mkv && !streamFilters.mp4 || !!streamFilters[session.sourceFormat];
     const matches = (!streamFilters.italian || italian) && format;
     card.hidden = !matches;
     if (matches) shown++;
@@ -216,6 +216,7 @@ const fields = {
   searchRadius: "search-radius",
   alignmentSamples: "alignment-samples",
   maxItalianResults: "max-italian-results",
+  maxItalianResultsPerStreamType: "max-italian-results-per-stream-type",
   sourceCheckTimeoutSeconds: "source-check-timeout",
   sourceCheckParallelism: "source-check-parallelism",
   cacheMB: "cache-mb",
@@ -245,6 +246,7 @@ async function loadSettings() {
   settings.addons.forEach((addon) => addonRow(addon, $("wizard-addons")));
   if (!settings.addons.length) addonRow(undefined, $("wizard-addons"));
   $("wizard-max-results").value = settings.maxItalianResults;
+  $("wizard-max-per-type").value = settings.maxItalianResultsPerStreamType;
   $("wizard-parallelism").value = settings.sourceCheckParallelism;
   $("wizard-timeout").value = settings.sourceCheckTimeoutSeconds;
   $("wizard-samples").value = settings.alignmentSamples;
@@ -272,7 +274,7 @@ $("settings-form").onsubmit = async (e) => {
   e.preventDefault();
   const cfg = { ...settings };
   for (const [key, id] of Object.entries(fields))
-    cfg[key] = ["searchRadius", "alignmentSamples", "maxItalianResults", "sourceCheckTimeoutSeconds", "sourceCheckParallelism", "cacheMB"].includes(key)
+    cfg[key] = ["searchRadius", "alignmentSamples", "maxItalianResults", "maxItalianResultsPerStreamType", "sourceCheckTimeoutSeconds", "sourceCheckParallelism", "cacheMB"].includes(key)
       ? Number($(id).value)
       : $(id).value.trim();
   cfg.bypassSourceChecks = $("bypass-source-checks").checked;
@@ -361,6 +363,7 @@ $("wizard-next").onclick = async () => {
       await saveConfig({
         ...settings,
         maxItalianResults: Number($("wizard-max-results").value),
+        maxItalianResultsPerStreamType: Number($("wizard-max-per-type").value),
         sourceCheckParallelism: Number($("wizard-parallelism").value),
         sourceCheckTimeoutSeconds: Number($("wizard-timeout").value),
         alignmentSamples: Number($("wizard-samples").value),

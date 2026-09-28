@@ -329,6 +329,9 @@ func streamSourceFormat(stream Stream, asset *Asset) string {
 		if asset.Index.Container == "matroska" {
 			return "mkv"
 		}
+		if asset.Index.Container == "mp4" {
+			return "mp4"
+		}
 		return "other"
 	}
 	path := ""
@@ -341,10 +344,14 @@ func streamSourceFormat(stream Stream, asset *Asset) string {
 		return "hls"
 	case strings.HasSuffix(path, ".mkv"):
 		return "mkv"
+	case strings.HasSuffix(path, ".mp4"), strings.HasSuffix(path, ".m4v"):
+		return "mp4"
 	case strings.HasSuffix(filename, ".m3u8"):
 		return "hls"
 	case strings.HasSuffix(filename, ".mkv"):
 		return "mkv"
+	case strings.HasSuffix(filename, ".mp4"), strings.HasSuffix(filename, ".m4v"):
+		return "mp4"
 	default:
 		return "other"
 	}

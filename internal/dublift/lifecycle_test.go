@@ -289,6 +289,114 @@ func TestOrderedItalianResultLimitAndSourceTimeout(t *testing.T) {
 	}
 }
 
+func TestItalianResultsPreferOtherStreamTypesAndFillUnusedSlots(t *testing.T) {
+	ffmpegAvailable(t)
+	tests := []struct {
+		name, streams string
+		bypass        bool
+		failFirstTwo  bool
+		want          []bool
+	}{
+		{"mixed types", "mkv,mkv,mkv,hls", true, false, []bool{true, true, false, true}},
+		{"file formats share remuxed type", "mkv,mkv,mkv,mp4", true, false, []bool{true, true, true, false}},
+		{"HLS after MKV and MP4", "mkv,mkv,mp4,hls", true, false, []bool{true, true, false, true}},
+		{"HLS after MP4 and MKV", "mp4,mkv,mkv,hls", true, false, []bool{true, true, false, true}},
+		{"only one type", "mkv,mkv,mkv", true, false, []bool{true, true, true}},
+		{"unavailable alternative", "hls,hls,hls,bad-mkv", false, false, []bool{true, true, true, false}},
+		{"later viable HLS", "hls,hls,hls,hls,bad-mkv", false, true, []bool{false, false, true, true, false}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var streams []Stream
+			var checked sync.Map
+			var origin *httptest.Server
+			origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/stream/movie/tmdb:603.json":
+					jsonResponse(w, 200, map[string]any{"streams": streams})
+				case "/api/movie/603":
+					io.WriteString(w, `{"src":"/embed"}`)
+				case "/embed":
+					io.WriteString(w, `window.masterPlaylist={url:'/vix',params:{token:'fixture',expires:9999999999}}`)
+				case "/vix.m3u8":
+					io.WriteString(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italiano\",LANGUAGE=\"it\",URI=\"it.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo.m3u8\n")
+				case "/it.m3u8":
+					io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
+				case "/segment.ts":
+					w.Header().Set("Content-Type", "video/mp2t")
+					w.Write(make([]byte, 512))
+				default:
+					checked.Store(r.URL.Path, true)
+					if strings.HasSuffix(r.URL.Path, ".m3u8") && !(tt.failFirstTwo && (r.URL.Path == "/source-0.m3u8" || r.URL.Path == "/source-1.m3u8")) {
+						io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
+					} else {
+						http.Error(w, "unavailable", http.StatusServiceUnavailable)
+					}
+				}
+			}))
+			defer origin.Close()
+			for i, kind := range strings.Split(tt.streams, ",") {
+				ext := ".mkv"
+				if kind == "hls" {
+					ext = ".m3u8"
+				} else if kind == "mp4" {
+					ext = ".mp4"
+				}
+				streams = append(streams, Stream{Name: fmt.Sprintf("stream %d", i), URL: fmt.Sprintf("%s/source-%d%s", origin.URL, i, ext)})
+			}
+			s := lifecycleServer(t)
+			cfg := s.Config.Get()
+			cfg.VixBaseURL = origin.URL
+			cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
+			cfg.BypassSourceChecks = tt.bypass
+			if err := s.Config.Save(cfg); err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest("GET", "/stream/movie/tmdb:603.json", nil))
+			var result struct {
+				Streams []Stream `json:"streams"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || len(result.Streams) != len(tt.want) {
+				t.Fatal(w.Body.String(), err)
+			}
+			for i, want := range tt.want {
+				got := strings.HasPrefix(result.Streams[i].Name, "🇮🇹 ")
+				if got != want || (result.Streams[i].URL != streams[i].URL) != want {
+					t.Fatalf("stream %d: Italian=%t, want %t: %s", i, got, want, w.Body.String())
+				}
+			}
+			if tt.bypass {
+				for _, stream := range streams {
+					if _, ok := checked.Load(strings.TrimPrefix(stream.URL, origin.URL)); ok {
+						t.Fatal("bypass checked a source")
+					}
+				}
+			} else if _, ok := checked.Load(fmt.Sprintf("/source-%d.mkv", len(tt.want)-1)); !ok {
+				t.Fatal("unavailable alternative was not checked")
+			}
+		})
+	}
+}
+
+func TestItalianResultStreamTypeGroupsByRemuxing(t *testing.T) {
+	hls := Stream{URL: "https://origin.test/master.m3u8"}
+	hls.BehaviorHints.Filename = "fragment.mp4"
+	for _, stream := range []Stream{hls, {URL: "https://origin.test/master.m3u8?token=abc"}} {
+		if got := streamSelectionType(stream, nil); got != "hls" {
+			t.Fatalf("HLS with MP4 fragments classified as %s", got)
+		}
+	}
+	for _, url := range []string{"https://origin.test/video.mkv", "https://origin.test/video.mp4", "https://origin.test/opaque"} {
+		if got := streamSelectionType(Stream{URL: url}, nil); got != "remuxed" {
+			t.Fatalf("file source %s classified as %s", url, got)
+		}
+	}
+	if got := streamSelectionType(Stream{URL: "https://origin.test/opaque"}, &Asset{HLS: &HLS{}}); got != "hls" {
+		t.Fatalf("checked HLS source classified as %s", got)
+	}
+}
+
 func TestAvailabilityStatusOnlyMarksStartedSourceChecks(t *testing.T) {
 	ffmpegAvailable(t)
 	started := make(chan struct{})
