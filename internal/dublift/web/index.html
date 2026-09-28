@@ -270,7 +270,7 @@
             /></label>
             <label>Alignment samples<input id="alignment-samples" type="number" min="1" max="12" required /></label>
             <p class="help">Samples run from near the beginning through later playback. One sample is fastest; finite direct-audio mode needs at least two samples to check the runtime.</p>
-            <label class="switch-row"><input id="start-immediately" type="checkbox"><span><strong>Start immediately with offset 0</strong><small>Play as soon as essential source preparation finishes. Apply the calculated offset to new audio segments when analysis finishes. Off: wait only for the first near-start sample, then play while the remaining samples run.</small></span></label>
+            <label class="switch-row"><input id="start-immediately" type="checkbox"><span><strong>Start immediately with offset 0</strong><small>Play as soon as essential source preparation finishes. For MKV/MP4, align near the requested video position after enough video data has downloaded. Apply the calculated offset to new audio segments when analysis finishes. Off: wait for the first sample starting at 00:00, then play while remaining samples run.</small></span></label>
             <details>
               <summary>Advanced settings</summary>
               <label

@@ -127,6 +127,8 @@ func (e *Engine) waitForFileRead(ctx context.Context, id string) error {
 }
 
 type backgroundWorkKey struct{}
+type cacheOnlyFileKey struct{}
+type cacheMissKey struct{}
 type mediaJob struct {
 	asset     *Asset
 	playlist  string
@@ -344,19 +346,29 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 		if j.budget.Add(-size) < 0 {
 			return
 		}
-		// Wait before creating a shared cache flight. Otherwise a foreground
-		// reader of that same range could join a background flight waiting for it.
-		if err := e.waitForFileRead(j.ctx, j.asset.ID); err != nil {
-			return
+		miss, cacheOnly := j.ctx.Value(cacheMissKey{}).(*atomic.Bool)
+		// Cached analysis does not compete for origin bandwidth. Other
+		// background file work yields to playback before making a range read.
+		if !cacheOnly {
+			if err := e.waitForFileRead(j.ctx, j.asset.ID); err != nil {
+				return
+			}
 		}
 		// FFmpeg repeatedly asks for the container header and cue table when
 		// opening each short extraction. Share only requested finite ranges in
 		// the bounded session cache; never read ahead or keep a whole file.
-		buf, err := e.Cache.Get(j.ctx, fmt.Sprintf("range:%s:%d:%d", j.asset.ID, off, size), func() ([]byte, error) {
-			data := make([]byte, size)
-			n, err := f.ReadAtContext(j.ctx, data, off)
-			return data[:n], err
-		})
+		var fetch func(int64, int64) ([]byte, error)
+		if !cacheOnly {
+			fetch = func(start, length int64) ([]byte, error) {
+				data := make([]byte, length)
+				n, err := f.ReadAtContext(j.ctx, data, start)
+				return data[:n], err
+			}
+		}
+		buf, err := e.Cache.ReadRange(j.ctx, j.asset.ID, off, size, fetch)
+		if errors.Is(err, errRangeNotCached) {
+			miss.Store(true)
+		}
 		if len(buf) > 0 {
 			if _, we := w.Write(buf); we != nil {
 				return
@@ -537,7 +549,13 @@ func (e *Engine) PCM(ctx context.Context, t Track, start, duration float64) ([]i
 	}
 	key := fmt.Sprintf("pcm:%s:%s:%.3f:%.3f", t.Asset.ID, t.Selector, start, duration)
 	b, err := e.Cache.Get(ctx, key, func() ([]byte, error) {
-		u, skip, cleanup, err := e.job(ctx, t.Asset, start, duration+1)
+		fileCtx := ctx
+		var miss *atomic.Bool
+		if t.Asset.File != nil && ctx.Value(cacheOnlyFileKey{}) == true {
+			miss = &atomic.Bool{}
+			fileCtx = context.WithValue(ctx, cacheMissKey{}, miss)
+		}
+		u, skip, cleanup, err := e.job(fileCtx, t.Asset, start, duration+1)
 		if err != nil {
 			return nil, err
 		}
@@ -552,7 +570,11 @@ func (e *Engine) PCM(ctx context.Context, t Track, start, duration float64) ([]i
 			args = append(args, "-ss", decimal(skip))
 		}
 		args = append(args, "-t", decimal(duration), "-map", t.Selector, "-vn", "-sn", "-ac", "1", "-ar", strconv.Itoa(pcmRate), "-f", "s16le", "pipe:1")
-		return e.run(ctx, e.Config.Get().FFmpeg, args, int(math.Ceil(duration*pcmRate*2))+65536)
+		out, err := e.run(fileCtx, e.Config.Get().FFmpeg, args, int(math.Ceil(duration*pcmRate*2))+65536)
+		if miss != nil && miss.Load() {
+			return nil, errRangeNotCached
+		}
+		return out, err
 	})
 	if err != nil {
 		return nil, err

@@ -270,6 +270,13 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			}
 			id := strings.Split(strings.TrimPrefix(stream.URL, local.URL+"/media/"), "/")[0]
 			session := server.getSession(id)
+			// Immediate file alignment uses a complete playback window. Start
+			// with the segment this simulated player watches after seeking.
+			if session.video.File != nil {
+				for n := 7; n < 14; n++ {
+					getBytes(t, local.URL+"/media/"+id+"/video/"+strconv.Itoa(n)+"/segment.m4s")
+				}
+			}
 			deadline := time.Now().Add(25 * time.Second)
 			for time.Now().Before(deadline) {
 				session.mu.Lock()
@@ -400,6 +407,33 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			}
 		})
 	}
+	t.Run("MKV_first_sample_from_zero_before_playback", func(t *testing.T) {
+		gated := cfg.Get()
+		gated.StartImmediately = false
+		gated.AlignmentSamples = 2 // force a fresh run after the immediate-start case
+		if err := cfg.Save(gated); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := cfg.Save(settings); err != nil {
+				t.Error(err)
+			}
+		}()
+		var fresh struct {
+			Streams []Stream `json:"streams"`
+		}
+		getJSON(t, local.URL+"/stream/movie/tmdb:603.json", &fresh)
+		master := getBytes(t, fresh.Streams[0].URL)
+		if !bytes.Contains(master, []byte("Italiano · Vixsrc")) {
+			t.Fatal("Italian master missing")
+		}
+		id := strings.Split(strings.TrimPrefix(fresh.Streams[0].URL, local.URL+"/media/"), "/")[0]
+		session := server.getSession(id)
+		alignment := server.Alignments.Get(session.Key)
+		if len(alignment.AutoSamples) == 0 || math.Abs(alignment.AutoSamples[0].VixTime-13) > .01 {
+			t.Fatalf("first source sample did not start at 00:00: %+v", alignment)
+		}
+	})
 	var series struct {
 		Streams []Stream `json:"streams"`
 	}

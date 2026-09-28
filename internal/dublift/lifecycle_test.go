@@ -729,7 +729,7 @@ func TestShortAlignmentSettingsAndSampleCoverage(t *testing.T) {
 	for _, n := range []int{1, 2, 3, 12} {
 		for _, duration := range []float64{84, 3600, 12000} {
 			positions := alignmentPositions(duration, n)
-			if len(positions) != n || positions[0] > 20 {
+			if len(positions) != n || positions[0] != 5 || max(0, positions[0]-5) != 0 {
 				t.Fatal(positions)
 			}
 			for i, p := range positions {
@@ -758,6 +758,64 @@ func TestShortAlignmentSettingsAndSampleCoverage(t *testing.T) {
 		if cfg.Validate() == nil {
 			t.Fatal("invalid count accepted")
 		}
+	}
+}
+
+func TestImmediateFileAlignmentUsesSeekedPlaybackPosition(t *testing.T) {
+	v := &Session{videoBase: -1, videoReady: map[int]bool{}, videoChanged: make(chan struct{}), Duration: 3600}
+	for at := 0.0; at <= 3600; at += 6 {
+		v.boundaries = append(v.boundaries, at)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	type sample struct {
+		at       float64
+		end      int
+		sequence uint64
+	}
+	result := make(chan sample, 1)
+	go func() {
+		at, end, sequence, err := v.playbackSample(ctx, 0, 8, 3600, -1, 0)
+		if err == nil {
+			result <- sample{at, end, sequence}
+		}
+	}()
+	v.videoSegmentRequested(0)
+	v.videoSegmentCompleted(0)
+	select {
+	case got := <-result:
+		t.Fatalf("aligned from incomplete initial playback at %.1f", got.at)
+	default:
+	}
+	v.videoSegmentRequested(100) // seek to 600 seconds
+	for n := 100; n < 105; n++ {
+		v.videoSegmentRequested(n)
+		v.videoSegmentCompleted(n)
+	}
+	select {
+	case got := <-result:
+		t.Fatalf("aligned before the 32-second source window was downloaded at %.1f", got.at)
+	default:
+	}
+	v.videoSegmentRequested(105)
+	v.videoSegmentCompleted(105)
+	select {
+	case got := <-result:
+		if got.at != 608 {
+			t.Fatalf("aligned at initial probe rather than seeked playback: %.1f", got.at)
+		}
+		v.videoSegmentRequested(106)
+		v.videoSegmentCompleted(106)
+		retry, _, _, err := v.playbackSample(ctx, 0, 8, 3600, got.end, got.sequence)
+		if err != nil || retry != 618 {
+			t.Fatalf("cache retry did not follow new video: %.1f, %v", retry, err)
+		}
+		late := alignmentPositionsFrom(3600, 3, 3200)
+		if late[0] != 3200 || late[1] <= late[0] || late[2] <= late[1] {
+			t.Fatalf("later samples moved behind playback: %v", late)
+		}
+	case <-ctx.Done():
+		t.Fatal("playback position was not selected")
 	}
 }
 

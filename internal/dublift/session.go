@@ -141,6 +141,11 @@ type Session struct {
 	delivery            *Delivery
 	alignDone           chan struct{}
 	firstAligned        chan struct{}
+	videoBase           int
+	videoHighest        int
+	videoSequence       uint64
+	videoReady          map[int]bool
+	videoChanged        chan struct{}
 	startupZero         bool
 	listedAsset         *Asset
 	listedMaster        *HLS
@@ -203,7 +208,7 @@ func (s *Server) newSessionLocked(c Content, stream Stream) *Session {
 func (s *Server) newSessionIDLocked(c Content, stream Stream, id string) *Session {
 	key := identity(c.Type, c.ID, stream.URL, fmt.Sprint(stream.Origin().Headers))
 	ctx, cancel := context.WithCancel(context.WithValue(s.ctx, cacheOwnerKey{}, id))
-	v := &Session{ID: id, Key: key, lookupKey: key, Content: c, Name: stream.Name, Created: time.Now(), LastUsed: time.Now(), Status: "Available · waiting for player", Errors: []string{}, stream: stream, ready: make(chan struct{}), directReady: make(chan struct{}), resources: map[string]resource{}, ctx: ctx, cancel: cancel}
+	v := &Session{ID: id, Key: key, lookupKey: key, Content: c, Name: stream.Name, Created: time.Now(), LastUsed: time.Now(), Status: "Available · waiting for player", Errors: []string{}, stream: stream, ready: make(chan struct{}), directReady: make(chan struct{}), videoBase: -1, videoReady: map[int]bool{}, videoChanged: make(chan struct{}), resources: map[string]resource{}, ctx: ctx, cancel: cancel}
 	s.sessions[v.ID] = v
 	return v
 }
@@ -550,9 +555,15 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 		current := s.Alignments.Get(v.Key)
 		duration := min(v.video.Duration(), v.vixEnglish.Asset.Duration())
 		samples := alignmentPositions(duration, cfg.AlignmentSamples)
+		immediateFile := from == nil && cfg.StartImmediately && v.video.File != nil
 		if from != nil {
 			samples = []float64{max(0, *from-current.At(*from, cfg.MinConfidence)-10)}
-		} else {
+		} else if immediateFile {
+			v.mu.Lock()
+			v.SamplePhase = "Waiting for downloaded video playback data"
+			v.mu.Unlock()
+		}
+		if from == nil {
 			if err := s.Alignments.UpdateContext(v.ctx, v.Key, func(a *Alignment) {
 				a.AutoSamples = nil
 				a.AutoExpected = len(samples)
@@ -571,22 +582,56 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 		vix := func(ctx context.Context, t, d float64) ([]int16, error) {
 			return s.Engine.PCM(ctx, *v.vixEnglish, t, d)
 		}
+		previousAt := 0.0
+		previousSequence := uint64(0)
 		for i, at := range samples {
 			if v.ctx.Err() != nil {
 				return
 			}
-			v.mu.Lock()
-			v.SampleIndex = i + 1
-			v.SampleTotal = len(samples)
-			v.SamplePhase = fmt.Sprintf("Matching English audio near %.0fs", at)
-			v.mu.Unlock()
-			ctx, cancel := context.WithTimeout(context.WithValue(v.ctx, backgroundWorkKey{}, true), 30*time.Second)
-			radius := min(5, cfg.SearchRadius)
-			anchor, err := FindAnchor(ctx, source, vix, at, current.At(at, cfg.MinConfidence), radius, duration)
-			if (err != nil || anchor.Confidence < cfg.MinConfidence) && cfg.SearchRadius > radius && ctx.Err() == nil {
-				anchor, err = FindAnchor(ctx, source, vix, at, current.At(at, cfg.MinConfidence), cfg.SearchRadius, duration)
+			var anchor Anchor
+			var err error
+			lastEnd := -1
+			for {
+				if immediateFile {
+					minAt := 0.0
+					if i > 0 {
+						minAt = max(samples[i], previousAt+alignmentWindow)
+					}
+					at, lastEnd, previousSequence, err = v.playbackSample(v.ctx, minAt, cfg.SearchRadius, duration, lastEnd, previousSequence)
+					if err != nil {
+						break
+					}
+				}
+				v.mu.Lock()
+				v.SampleIndex = i + 1
+				v.SampleTotal = len(samples)
+				v.SamplePhase = fmt.Sprintf("Matching English audio near %.0fs", at)
+				v.mu.Unlock()
+				ctx, cancel := context.WithTimeout(context.WithValue(v.ctx, backgroundWorkKey{}, true), 30*time.Second)
+				radius := min(5, cfg.SearchRadius)
+				if immediateFile {
+					radius = cfg.SearchRadius
+					ctx = context.WithValue(ctx, cacheOnlyFileKey{}, true)
+				}
+				anchor, err = FindAnchor(ctx, source, vix, at, current.At(at, cfg.MinConfidence), radius, duration)
+				if !immediateFile && (err != nil || anchor.Confidence < cfg.MinConfidence) && cfg.SearchRadius > radius && ctx.Err() == nil {
+					anchor, err = FindAnchor(ctx, source, vix, at, current.At(at, cfg.MinConfidence), cfg.SearchRadius, duration)
+				}
+				cancel()
+				if immediateFile && errors.Is(err, errRangeNotCached) {
+					continue
+				}
+				if immediateFile {
+					v.mu.Lock()
+					seeked := v.videoSequence != previousSequence
+					v.mu.Unlock()
+					if seeked {
+						lastEnd = -1
+						continue
+					}
+				}
+				break
 			}
-			cancel()
 			if v.ctx.Err() != nil {
 				return
 			}
@@ -621,6 +666,7 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 				v.note(fmt.Errorf("persist alignment: %w", err))
 			}
 			current = s.Alignments.Get(v.Key)
+			previousAt = at
 			if i == 0 {
 				finishFirst()
 			}
@@ -652,8 +698,13 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 }
 
 func alignmentPositions(duration float64, count int) []float64 {
-	first := min(20, duration*.08)
-	last := max(first, min(duration*.8, duration-alignmentWindow-8))
+	// At five seconds, the initial source search starts at byte/time zero,
+	// while still allowing offsets in either direction.
+	return alignmentPositionsFrom(duration, count, 5)
+}
+func alignmentPositionsFrom(duration float64, count int, first float64) []float64 {
+	first = max(0, min(first, duration-alignmentWindow))
+	last := max(first, min(duration-alignmentWindow, max(min(duration*.8, duration-alignmentWindow-8), first+alignmentWindow*float64(count-1))))
 	out := make([]float64, count)
 	for i := range out {
 		out[i] = first
@@ -662,6 +713,87 @@ func alignmentPositions(duration float64, count int) []float64 {
 		}
 	}
 	return out
+}
+func (v *Session) signalVideoLocked() {
+	if v.videoChanged == nil {
+		v.videoChanged = make(chan struct{})
+	}
+	close(v.videoChanged)
+	v.videoChanged = make(chan struct{})
+}
+func (v *Session) videoSegmentRequested(index int) {
+	v.mu.Lock()
+	if v.videoBase < 0 || index < v.videoBase || index > v.videoHighest+1 {
+		v.videoBase, v.videoHighest = index, index
+		v.videoSequence++
+	} else if index > v.videoHighest {
+		v.videoHighest = index
+	}
+	v.signalVideoLocked()
+	v.mu.Unlock()
+}
+func (v *Session) videoSegmentCompleted(index int) {
+	v.mu.Lock()
+	if v.videoReady == nil {
+		v.videoReady = map[int]bool{}
+	}
+	v.videoReady[index] = true
+	v.signalVideoLocked()
+	v.mu.Unlock()
+}
+
+// A file sample uses only video segments that the player has actually
+// requested and that have finished remuxing into the shared byte cache.
+func (v *Session) playbackSample(ctx context.Context, minAt, radius, duration float64, afterEnd int, previousSequence uint64) (float64, int, uint64, error) {
+	for {
+		v.mu.Lock()
+		if v.videoChanged == nil {
+			v.videoChanged = make(chan struct{})
+		}
+		changed := v.videoChanged
+		base, sequence := v.videoBase, v.videoSequence
+		if sequence != previousSequence {
+			afterEnd = -1
+			minAt = 0
+		}
+		if base >= 0 && base < len(v.boundaries)-1 {
+			start := v.boundaries[base]
+			last := base - 1
+			for i := base; i < len(v.boundaries)-1 && v.videoReady[i]; i++ {
+				last = i
+			}
+			end := start
+			if last >= base {
+				end = v.boundaries[last+1]
+			}
+			at := max(start+radius, minAt)
+			if afterEnd >= 0 && last > afterEnd {
+				// A cache miss can mean older video bytes were evicted. Follow
+				// the newly completed part of playback on the next attempt.
+				at = max(at, end-alignmentWindow-radius)
+			}
+			limit := duration - alignmentWindow
+			if start > limit || at > limit {
+				v.mu.Unlock()
+				return 0, 0, sequence, errors.New("not enough video remains for an alignment window")
+			}
+			required := min(duration, at-radius+alignmentWindow+2*radius)
+			if last > afterEnd && end+0.001 >= required {
+				v.mu.Unlock()
+				return at, last, sequence, nil
+			}
+			if last == len(v.boundaries)-2 && afterEnd >= last {
+				v.mu.Unlock()
+				return 0, 0, sequence, errRangeNotCached
+			}
+		}
+		v.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return 0, 0, 0, ctx.Err()
+		}
+	}
 }
 func (s *Server) boundaryAt(v *Session, t float64) float64 {
 	for i := len(v.boundaries) - 1; i >= 0; i-- {

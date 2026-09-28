@@ -107,6 +107,9 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		start := v.boundaries[n]
 		duration := v.boundaries[n+1] - start
 		v.position(start)
+		if p[3] == "segment.m4s" {
+			v.videoSegmentRequested(n)
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 		data, err := s.Engine.Cache.Get(ctx, fmt.Sprintf("video:%s:%d", v.video.ID, n), func() ([]byte, error) { return s.Engine.Video(ctx, v.video, start, duration) })
@@ -130,6 +133,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			data = init
 		} else {
 			data = media
+			v.videoSegmentCompleted(n)
 		}
 		serveBytes(w, r, "video/mp4", data)
 	case p[1] == "track" && len(p) >= 3:
