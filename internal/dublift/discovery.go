@@ -206,7 +206,7 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	if bundle.err != nil {
 		s.lookupStatus = "Vixsrc Italian audio unavailable; returning original links…"
 	} else if cfg.BypassSourceChecks {
-		s.lookupStatus = "Vixsrc Italian audio confirmed; returning streams with source checks deferred…"
+		s.lookupStatus = fmt.Sprintf("Vixsrc Italian audio confirmed; returning up to %d Italian results with source checks deferred…", cfg.MaxItalianResults)
 	} else {
 		s.lookupStatus = fmt.Sprintf("Checking up to %d streams at once for up to %d Italian results…", cfg.SourceCheckParallelism, cfg.MaxItalianResults)
 	}
@@ -216,7 +216,7 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		v.listedReady = make(chan struct{})
 		v.Order = i
 		v.ticket = s.sealPlayback(v)
-		v.Status = "Checking DubLift availability"
+		v.Status = "Waiting in upstream order"
 		v.ContentName = fallbackContentName(c, stream)
 		sessions[i] = v
 	}
@@ -235,6 +235,13 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	launch := func(i int) {
 		ready := make(chan sourceCheckResult, 1)
 		checked[i] = ready
+		if bundle.err == nil && !cfg.BypassSourceChecks {
+			if _, err := httpURL(upstream[i].URL); err == nil {
+				sessions[i].mu.Lock()
+				sessions[i].Status = "Checking DubLift availability"
+				sessions[i].mu.Unlock()
+			}
+		}
 		go func(stream Stream) {
 			var result sourceCheckResult
 			if bundle.err != nil {
@@ -254,9 +261,6 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		}(upstream[i])
 	}
 	maxResults := cfg.MaxItalianResults
-	if cfg.BypassSourceChecks {
-		maxResults = len(upstream)
-	}
 	italianResults, nextToStart := 0, 0
 	for i, stream := range upstream {
 		var check sourceCheckResult

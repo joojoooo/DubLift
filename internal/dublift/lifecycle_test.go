@@ -289,6 +289,77 @@ func TestOrderedItalianResultLimitAndSourceTimeout(t *testing.T) {
 	}
 }
 
+func TestAvailabilityStatusOnlyMarksStartedSourceChecks(t *testing.T) {
+	ffmpegAvailable(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var origin *httptest.Server
+	origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/stream/movie/tmdb:603.json":
+			jsonResponse(w, 200, map[string]any{"streams": []Stream{
+				{Name: "one", URL: origin.URL + "/one.m3u8"},
+				{Name: "two", URL: origin.URL + "/two.m3u8"},
+			}})
+		case "/api/movie/603":
+			io.WriteString(w, `{"src":"/embed"}`)
+		case "/embed":
+			io.WriteString(w, `window.masterPlaylist={url:'/vix',params:{token:'fixture',expires:9999999999}}`)
+		case "/vix.m3u8":
+			io.WriteString(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italiano\",LANGUAGE=\"it\",URI=\"it.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo.m3u8\n")
+		case "/it.m3u8":
+			io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
+		case "/one.m3u8":
+			close(started)
+			<-release
+			io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
+		case "/segment.ts":
+			w.Header().Set("Content-Type", "video/mp2t")
+			w.Write(make([]byte, 512))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer origin.Close()
+	defer close(release)
+	s := lifecycleServer(t)
+	cfg := s.Config.Get()
+	cfg.VixBaseURL = origin.URL
+	cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
+	cfg.MaxItalianResults = 1
+	cfg.SourceCheckParallelism = 1
+	if err := s.Config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/stream/movie/tmdb:603.json", nil))
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first source check did not start")
+	}
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
+	var state struct {
+		Sessions []struct{ Status string }
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 2 || state.Sessions[0].Status != "Checking DubLift availability" || state.Sessions[1].Status != "Waiting in upstream order" {
+		t.Fatal(w.Body.String())
+	}
+	release <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream lookup did not finish")
+	}
+}
+
 func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	ffmpegAvailable(t)
 	var italian atomic.Bool
@@ -346,8 +417,11 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 		t.Fatal(w.Body.String(), "source requests:", sourceRequests.Load())
 	}
 	for i, stream := range response.Streams {
-		if (i < 2) != strings.HasPrefix(stream.Name, "🇮🇹 ") {
+		if (i == 0) != strings.HasPrefix(stream.Name, "🇮🇹 ") {
 			t.Fatalf("stream %d: %s", i, stream.Name)
+		}
+		if i > 0 && stream.URL != streams[i].URL {
+			t.Fatalf("stream %d should retain its original URL: %s", i, stream.URL)
 		}
 	}
 	w = httptest.NewRecorder()
@@ -363,7 +437,7 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if len(state.Sessions) != 3 || !state.Sessions[0].SourceCheckDeferred || !state.Sessions[1].SourceCheckDeferred || state.Sessions[2].SourceCheckDeferred {
+	if len(state.Sessions) != 3 || !state.Sessions[0].SourceCheckDeferred || state.Sessions[1].SourceCheckDeferred || state.Sessions[2].SourceCheckDeferred || !state.Sessions[1].Passthrough || state.Sessions[1].FallbackReason != "Italian result limit reached" {
 		t.Fatal(w.Body.String())
 	}
 	prepare := httptest.NewRequest("POST", "/api/sessions/"+state.Sessions[0].ID+"/prepare", strings.NewReader(`{}`))
@@ -383,8 +457,8 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	}
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "/media/"+state.Sessions[1].ID+"/master.m3u8", nil))
-	if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != streams[1].URL || sourceRequests.Load() != 2 {
-		t.Fatal("playback must check and fall back to its source:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
+	if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != streams[1].URL || sourceRequests.Load() != 1 {
+		t.Fatal("result beyond the limit must keep its original source:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
 	}
 	italian.Store(false)
 	w = httptest.NewRecorder()
@@ -392,7 +466,7 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Streams) != 3 || sourceRequests.Load() != 2 {
+	if len(response.Streams) != 3 || sourceRequests.Load() != 1 {
 		t.Fatal(w.Body.String(), "source requests:", sourceRequests.Load())
 	}
 	for i, stream := range response.Streams {

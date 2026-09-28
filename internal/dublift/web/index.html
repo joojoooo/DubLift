@@ -197,7 +197,7 @@
             <label>Maximum Italian results<input id="max-italian-results" type="number" min="1" max="100" step="1" required /></label>
             <label>Source check timeout (seconds per stream)<input id="source-check-timeout" type="number" min="1" max="120" step="1" required /></label>
             <label>Parallel source checks<input id="source-check-parallelism" type="number" min="1" max="16" step="1" required /></label>
-            <label class="switch-row"><input id="bypass-source-checks" type="checkbox" /><span><strong>Bypass source checks when listing</strong><small>Return HTTP streams with Italian audio as soon as Vixsrc Italian audio is confirmed. Check each source when you play it or click Check &amp; prepare. The result limit and parallel setting apply only when this is off.</small></span></label>
+            <label class="switch-row"><input id="bypass-source-checks" type="checkbox" /><span><strong>Bypass source checks when listing</strong><small>Return up to the configured number of HTTP streams with Italian audio as soon as Vixsrc Italian audio is confirmed. Check each source when you play it or click Check &amp; prepare. Parallel source checks apply only when this is off.</small></span></label>
             <p class="help">Start checks in upstream order and apply results in that order. Up to the selected number run at once; the Italian result limit also caps checks in flight. Unchecked streams keep their original links.</p>
             <hr />
             <h3>Playback delivery</h3>
