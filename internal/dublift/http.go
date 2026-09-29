@@ -94,6 +94,26 @@ func (n *Network) request(ctx context.Context, o Origin, method, byteRange strin
 	return resp, nil
 }
 
+func (n *Network) requestFileRange(ctx context.Context, o Origin, byteRange string) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		resp, err := n.request(ctx, o, "GET", byteRange)
+		if err != nil {
+			return nil, err
+		}
+		// A redirector can send consecutive ranges to different workers. A
+		// single bad worker must not fail a seek; close its response without
+		// reading a whole-file body before trying the entry URL once more.
+		if attempt > 0 || !retryableRangeStatus(resp.StatusCode) {
+			return resp, nil
+		}
+		resp.Body.Close()
+	}
+}
+
+func retryableRangeStatus(status int) bool {
+	return status == 200 || status == 403 || status == 429 || status >= 500
+}
+
 // Do not expose signed URLs or headers in logs / dashboard errors.
 func networkError(e error) string {
 	if errors.Is(e, context.DeadlineExceeded) {
@@ -159,30 +179,46 @@ type RemoteFile struct {
 	Origin Origin
 	Size   int64
 	ETag   string
+	prefix []byte
 }
 
 func (n *Network) OpenFile(ctx context.Context, o Origin) (*RemoteFile, error) {
-	resp, e := n.request(ctx, o, "GET", "bytes=0-0")
+	resp, e := n.requestFileRange(ctx, o, "bytes=0-0")
 	if e != nil {
 		return nil, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 206 {
+		return n.fileFromProbe(o, resp, nil, 1)
+	}
+	data, e := readBounded(resp.Body, 1)
+	if e != nil {
+		return nil, errors.New("file rejected: invalid range probe body")
+	}
+	return n.fileFromProbe(o, resp, data, 1)
+}
+
+func (n *Network) fileFromProbe(o Origin, resp *http.Response, data []byte, requested int64) (*RemoteFile, error) {
+	if resp.StatusCode != 206 {
+		if resp.StatusCode != 200 {
+			return nil, &HTTPError{resp.StatusCode}
+		}
 		return nil, errors.New("file rejected: origin must honor Range with 206 Partial Content")
 	}
 	a, b, size, e := parseContentRange(resp.Header.Get("Content-Range"))
-	if e != nil || a != 0 || b != 0 {
+	if e != nil || a != 0 || b != min(requested, size)-1 {
 		return nil, errors.New("file rejected: invalid range probe response")
 	}
-	if resp.ContentLength > 1 {
+	if resp.ContentLength >= 0 && resp.ContentLength != b+1 {
 		return nil, errors.New("file rejected: invalid range probe length")
 	}
-	data, e := readBounded(resp.Body, 1)
-	if e != nil || len(data) != 1 {
+	if int64(len(data)) != b+1 {
 		return nil, errors.New("file rejected: invalid range probe body")
 	}
-	n.Bytes.Add(1)
-	return &RemoteFile{n, Origin{resp.Request.URL.String(), o.Headers}, size, resp.Header.Get("ETag")}, nil
+	n.Bytes.Add(int64(len(data)))
+	// Keep the entry URL: a redirector may select a different healthy CDN
+	// worker for each range. Pinning its first target breaks later seeks.
+	return &RemoteFile{Net: n, Origin: o, Size: size, ETag: resp.Header.Get("ETag"), prefix: data}, nil
 }
 func (f *RemoteFile) ReadAtContext(ctx context.Context, p []byte, off int64) (int, error) {
 	if off < 0 || off >= f.Size {
@@ -196,12 +232,15 @@ func (f *RemoteFile) ReadAtContext(ctx context.Context, p []byte, off int64) (in
 		return 0, nil
 	}
 	defer beginVideoDownload(ctx)()
-	resp, e := f.Net.request(ctx, f.Origin, "GET", fmt.Sprintf("bytes=%d-%d", off, off+want-1))
+	resp, e := f.Net.requestFileRange(ctx, f.Origin, fmt.Sprintf("bytes=%d-%d", off, off+want-1))
 	if e != nil {
 		return 0, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 206 {
+		if resp.StatusCode != 200 {
+			return 0, &HTTPError{resp.StatusCode}
+		}
 		return 0, errors.New("origin stopped honoring Range; full download prevented")
 	}
 	a, b, total, e := parseContentRange(resp.Header.Get("Content-Range"))

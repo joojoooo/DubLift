@@ -74,8 +74,8 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 					w.Header().Set("Content-Type", "video/mp2t")
 					w.Write(make([]byte, 512))
 				case "/no-range.mkv":
-					if r.Header.Get("Range") != "bytes=0-0" && r.Header.Get("Range") != "bytes=0-511" {
-						t.Error("expected small range probe")
+					if r.Header.Get("Range") != "bytes=0-65535" {
+						t.Error("expected bounded file probe")
 					}
 					io.WriteString(w, "origin ignores ranges")
 				default:

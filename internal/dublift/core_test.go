@@ -77,6 +77,69 @@ func TestRangeEveryReadAndHeaders(t *testing.T) {
 		t.Fatal("allowed a full-body response after the initial probe")
 	}
 }
+
+func TestRedirectedFileUsesEntryURLForLaterRanges(t *testing.T) {
+	data := bytes.Repeat([]byte("0123456789"), 100)
+	entryRequests := 0
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/entry":
+			entryRequests++
+			if entryRequests == 1 {
+				http.Redirect(w, r, "/first-worker", http.StatusTemporaryRedirect)
+			} else if entryRequests == 2 {
+				http.Redirect(w, r, "/bad-worker", http.StatusTemporaryRedirect)
+			} else {
+				http.Redirect(w, r, "/next-worker", http.StatusTemporaryRedirect)
+			}
+		case "/first-worker":
+			if entryRequests != 1 {
+				t.Error("later range was pinned to the first worker")
+			}
+			http.ServeContent(w, r, "movie.mkv", time.Time{}, bytes.NewReader(data))
+		case "/bad-worker":
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+		case "/next-worker":
+			http.ServeContent(w, r, "movie.mkv", time.Time{}, bytes.NewReader(data))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	f, err := NewNetwork().OpenFile(context.Background(), Origin{URL: srv.URL + "/entry"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 10)
+	if _, err := f.ReadAtContext(context.Background(), buf, 500); err != nil || !bytes.Equal(buf, data[500:510]) {
+		t.Fatalf("later range: %q, %v", buf, err)
+	}
+	if entryRequests != 3 {
+		t.Fatalf("entry requests: %d, want 3", entryRequests)
+	}
+}
+
+func TestOpenAssetUsesOneBoundedInitialRequest(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 128<<10)
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if got := r.Header.Get("Range"); got != "bytes=0-65535" {
+			t.Errorf("initial range: %q", got)
+		}
+		http.ServeContent(w, r, "movie.mkv", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+	engine := testEngine(t)
+	if _, err := engine.OpenAsset(context.Background(), Origin{URL: srv.URL + "/movie.mkv"}, false); err == nil {
+		t.Fatal("accepted an invalid container")
+	}
+	if requests != 1 {
+		t.Fatalf("initial requests: %d, want 1", requests)
+	}
+}
 func TestVixPort(t *testing.T) {
 	html := `window.masterPlaylist = {url: '/playlist/test?b=1&token=old', params: {token:'ab\x2bcd', expires:12345, empty:'', nested:{}}}; window.canPlayFHD=true;`
 	got, err := ExtractVixPlaylist(html, "https://vix.example")

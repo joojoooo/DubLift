@@ -16,22 +16,35 @@ type FileIndex struct {
 	VideoStart float64
 }
 type metadataReader struct {
-	ctx  context.Context
-	f    *RemoteFile
-	used int64
+	ctx      context.Context
+	f        *RemoteFile
+	used     int64
+	cacheOff int64
+	cache    []byte
 }
 
 func (r *metadataReader) read(off, n int64) ([]byte, error) {
-	if n < 0 || n > 32<<20 || r.used+n > 40<<20 || off < 0 || off > r.f.Size-n {
+	if n < 0 || n > 32<<20 || off < 0 || off > r.f.Size-n {
 		return nil, errors.New("container metadata exceeds bounded read budget")
 	}
-	r.used += n
-	b := make([]byte, n)
-	_, e := r.f.ReadAtContext(r.ctx, b, off)
-	return b, e
+	if off >= r.cacheOff && off+n <= r.cacheOff+int64(len(r.cache)) {
+		return r.cache[off-r.cacheOff : off-r.cacheOff+n], nil
+	}
+	length := min(r.f.Size-off, max(n, 64<<10))
+	if r.used+length > 40<<20 {
+		length = n
+	}
+	if r.used+length > 40<<20 {
+		return nil, errors.New("container metadata exceeds bounded read budget")
+	}
+	r.used += length
+	r.cacheOff = off
+	r.cache = make([]byte, length)
+	_, e := r.f.ReadAtContext(r.ctx, r.cache, off)
+	return r.cache[:n], e
 }
 func BuildFileIndex(ctx context.Context, f *RemoteFile) (FileIndex, error) {
-	r := &metadataReader{ctx: ctx, f: f}
+	r := &metadataReader{ctx: ctx, f: f, used: int64(len(f.prefix)), cache: f.prefix}
 	b, e := r.read(0, min(16, f.Size))
 	if e != nil {
 		return FileIndex{}, e

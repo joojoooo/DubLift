@@ -153,47 +153,60 @@ func (e *Engine) Close() error { return e.srv.Close() }
 func (e *Engine) OpenAsset(ctx context.Context, o Origin, hls bool) (*Asset, error) {
 	a := &Asset{ID: identity(o.URL, fmt.Sprint(o.Headers)), Origin: o}
 	if !hls {
-		// Extensionless redirect links are common. Sniff at most 512 bytes; this
-		// never turns an ignored range into a file download.
-		resp, err := e.Net.request(ctx, o, "GET", "bytes=0-511")
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode != 200 && resp.StatusCode != 206 {
-			resp.Body.Close()
-			return nil, &HTTPError{resp.StatusCode}
-		}
-		b, err := io.ReadAll(io.LimitReader(resp.Body, 512))
-		resp.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		hls = strings.HasPrefix(strings.TrimSpace(string(b)), "#EXTM3U")
-		if hls {
-			o.URL = resp.Request.URL.String()
-			a.Origin = o
-		}
-	}
-	if hls {
-		h, err := e.Net.LoadHLS(ctx, o)
-		if err != nil {
-			return nil, err
-		}
-		a.HLS = h
-		for _, segment := range h.Segments {
-			if segment.Duration > 300 {
-				return nil, errors.New("media segments longer than five minutes are unsupported; refusing an unbounded video read")
+		// One bounded request both identifies extensionless HLS links and
+		// validates file ranges. Its prefix is reused while indexing the file.
+		const probeSize = 64 << 10
+		for attempt := 0; attempt < 2; attempt++ {
+			resp, err := e.Net.request(ctx, o, "GET", fmt.Sprintf("bytes=0-%d", probeSize-1))
+			if err != nil {
+				return nil, err
 			}
+			if resp.StatusCode != 200 && resp.StatusCode != 206 {
+				resp.Body.Close()
+				if attempt == 0 && retryableRangeStatus(resp.StatusCode) {
+					continue
+				}
+				return nil, &HTTPError{resp.StatusCode}
+			}
+			var b []byte
+			if resp.StatusCode == 206 {
+				b, err = readBounded(resp.Body, probeSize)
+			} else {
+				b, err = io.ReadAll(io.LimitReader(resp.Body, probeSize))
+			}
+			resp.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			hls = strings.HasPrefix(strings.TrimSpace(string(b)), "#EXTM3U")
+			if hls {
+				o.URL = resp.Request.URL.String()
+				a.Origin = o
+				break
+			}
+			if resp.StatusCode == 200 && attempt == 0 {
+				continue
+			}
+			f, err := e.Net.fileFromProbe(o, resp, b, probeSize)
+			if err != nil {
+				return nil, err
+			}
+			a.File = f
+			a.Index, err = BuildFileIndex(ctx, f)
+			return a, err
 		}
-		return a, nil
 	}
-	f, err := e.Net.OpenFile(ctx, o)
+	h, err := e.Net.LoadHLS(ctx, o)
 	if err != nil {
 		return nil, err
 	}
-	a.File = f
-	a.Index, err = BuildFileIndex(ctx, f)
-	return a, err
+	a.HLS = h
+	for _, segment := range h.Segments {
+		if segment.Duration > 300 {
+			return nil, errors.New("media segments longer than five minutes are unsupported; refusing an unbounded video read")
+		}
+	}
+	return a, nil
 }
 func (e *Engine) job(ctx context.Context, a *Asset, start, duration float64) (string, float64, func(), error) {
 	j := &mediaJob{asset: a, resources: map[string]Origin{}, keys: map[string]bool{}, ctx: ctx}
