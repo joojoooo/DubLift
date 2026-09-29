@@ -68,71 +68,76 @@ func TestFileRangeCacheReusesOverlappingPlaybackAndAnalysisBytes(t *testing.T) {
 	}
 }
 
-func TestVideoFileRangeStreamsBeforeBoundedOriginReadFinishes(t *testing.T) {
-	engine := testEngine(t)
-	const total = 33 << 20
-	firstChunk := make(chan struct{})
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	defer releaseOnce.Do(func() { close(release) })
-	var requests atomic.Int32
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start, end, err := requestRange(r.Header.Get("Range"), total)
-		if err != nil {
-			t.Error(err)
-			w.WriteHeader(416)
-			return
-		}
-		requests.Add(1)
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
-		w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
-		w.WriteHeader(206)
-		if start == 0 {
-			w.Write(make([]byte, 1<<20))
-			w.(http.Flusher).Flush()
-			close(firstChunk)
-			<-release
-			w.Write(make([]byte, end-start+1-(1<<20)))
-		} else {
-			w.Write(make([]byte, end-start+1))
-		}
-	}))
-	defer origin.Close()
-	asset := &Asset{ID: "streaming-file", File: &RemoteFile{Net: engine.Net, Origin: Origin{URL: origin.URL}, Size: total}}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	u, _, cleanup, err := engine.job(ctx, asset, 0, 2, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
-	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", total-1))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	<-firstChunk
-	firstRead := make(chan error, 1)
-	go func() {
-		_, err := io.ReadFull(resp.Body, make([]byte, 1<<20))
-		firstRead <- err
-	}()
-	select {
-	case err := <-firstRead:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("video proxy waited for the full origin range before delivering its first MiB")
-	}
-	releaseOnce.Do(func() { close(release) })
-	if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != total-(1<<20) {
-		t.Fatalf("remaining video range: %d bytes, %v", n, err)
-	}
-	if got := requests.Load(); got != 2 {
-		t.Fatalf("video proxy opened %d origin ranges, want 2", got)
+func TestFileRangeStreamsBeforeBoundedOriginReadFinishes(t *testing.T) {
+	for _, video := range []bool{true, false} {
+		t.Run(fmt.Sprintf("video=%t", video), func(t *testing.T) {
+			engine := testEngine(t)
+			const total = 33 << 20
+			firstChunk := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(release) })
+			var requests atomic.Int32
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				start, end, err := requestRange(r.Header.Get("Range"), total)
+				if err != nil {
+					t.Error(err)
+					w.WriteHeader(416)
+					return
+				}
+				requests.Add(1)
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+				w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+				w.WriteHeader(206)
+				if start == 0 {
+					w.Write(make([]byte, 1<<20))
+					w.(http.Flusher).Flush()
+					close(firstChunk)
+					<-release
+					w.Write(make([]byte, end-start+1-(1<<20)))
+				} else {
+					w.Write(make([]byte, end-start+1))
+				}
+			}))
+			defer origin.Close()
+			asset := &Asset{ID: "streaming-file", File: &RemoteFile{Net: engine.Net, Origin: Origin{URL: origin.URL}, Size: total}}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			u, _, cleanup, err := engine.job(ctx, asset, 0, 2, video)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+			req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+			req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", total-1))
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			<-firstChunk
+			firstRead := make(chan error, 1)
+			go func() {
+				_, err := io.ReadFull(resp.Body, make([]byte, 1<<20))
+				firstRead <- err
+			}()
+			select {
+			case err := <-firstRead:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("video proxy waited for the full origin range before delivering its first MiB")
+			}
+			releaseOnce.Do(func() { close(release) })
+			if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != total-(1<<20) {
+				t.Fatalf("remaining video range: %d bytes, %v", n, err)
+			}
+			if got := requests.Load(); got != 2 {
+				t.Fatalf("video proxy opened %d origin ranges, want 2", got)
+			}
+
+		})
 	}
 }
 
@@ -174,6 +179,56 @@ func TestClosingDemuxerRequestCancelsOriginRead(t *testing.T) {
 	}
 	if ctx.Err() != nil {
 		t.Fatal("origin only stopped after the whole extraction was canceled")
+	}
+}
+
+func TestFileRangeResumesStalledBodyWithoutTruncatingDemuxerInput(t *testing.T) {
+	engine := testEngine(t)
+	engine.rangeReadTimeout = 100 * time.Millisecond
+	payload := bytes.Repeat([]byte("recover-the-missing-bytes"), 100000)
+	const partial = (1 << 20) + 12345
+	var requests atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, err := requestRange(r.Header.Get("Range"), int64(len(payload)))
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(416)
+			return
+		}
+		attempt := requests.Add(1)
+		if attempt == 2 && start != partial {
+			t.Errorf("resumed at %d, want first unread byte %d", start, partial)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+		w.WriteHeader(206)
+		if attempt == 1 {
+			w.Write(payload[:partial])
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+		w.Write(payload[start : end+1])
+	}))
+	defer origin.Close()
+	asset := &Asset{ID: "stalled-file", File: &RemoteFile{Net: engine.Net, Origin: Origin{URL: origin.URL}, Size: int64(len(payload))}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	u, _, cleanup, err := engine.job(ctx, asset, 0, 6, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Range", "bytes=0-")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Equal(got, payload) || requests.Load() != 2 {
+		t.Fatalf("resumed input: %d bytes, %d origin requests, %v", len(got), requests.Load(), err)
 	}
 }
 

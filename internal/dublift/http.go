@@ -22,8 +22,9 @@ type Origin struct {
 	Headers http.Header
 }
 type Network struct {
-	Client *http.Client
-	Bytes  atomic.Int64
+	Client             *http.Client
+	Bytes              atomic.Int64
+	rangeHeaderTimeout time.Duration
 }
 
 // Video bytes are counted on each origin read, including while a range
@@ -99,10 +100,31 @@ func (n *Network) request(ctx context.Context, o Origin, method, byteRange strin
 
 func (n *Network) requestFileRange(ctx context.Context, o Origin, byteRange string) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
-		resp, err := n.request(ctx, o, "GET", byteRange)
+		requestCtx, cancel := context.WithCancel(ctx)
+		var timer *time.Timer
+		if attempt == 0 {
+			timeout := n.rangeHeaderTimeout
+			if timeout <= 0 {
+				timeout = 3 * time.Second
+			}
+			// A redirector can select a stalled worker. Retry before it drains
+			// the player's buffer; the second attempt retains the normal limit.
+			// Stop this timer at the headers, not at the end of a large body.
+			timer = time.AfterFunc(timeout, cancel)
+		}
+		resp, err := n.request(requestCtx, o, "GET", byteRange)
+		if timer != nil && !timer.Stop() && err == nil {
+			resp.Body.Close()
+			err = context.DeadlineExceeded
+		}
 		if err != nil {
+			cancel()
+			if attempt == 0 && ctx.Err() == nil {
+				continue
+			}
 			return nil, err
 		}
+		resp.Body = &cancelReadCloser{ReadCloser: resp.Body, cancel: cancel}
 		// A redirector can send consecutive ranges to different workers. A
 		// single bad worker must not fail a seek; close its response without
 		// reading a whole-file body before trying the entry URL once more.
@@ -111,6 +133,16 @@ func (n *Network) requestFileRange(ctx context.Context, o Origin, byteRange stri
 		}
 		resp.Body.Close()
 	}
+}
+
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelReadCloser) Close() error {
+	defer b.cancel()
+	return b.ReadCloser.Close()
 }
 
 func retryableRangeStatus(status int) bool {

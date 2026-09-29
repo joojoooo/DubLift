@@ -121,6 +121,51 @@ func TestRedirectedFileUsesEntryURLForLaterRanges(t *testing.T) {
 	}
 }
 
+func TestFileRangeRetriesStalledHeadersWithoutTimingOutBody(t *testing.T) {
+	var calls atomic.Int32
+	stalledCanceled := make(chan struct{})
+	const headerWait = 50 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			<-r.Context().Done()
+			close(stalledCanceled)
+			return
+		}
+		if r.Header.Get("Range") != "bytes=0-1" {
+			t.Error("retry lost the bounded range")
+		}
+		w.Header().Set("Content-Range", "bytes 0-1/2")
+		w.Header().Set("Content-Length", "2")
+		w.WriteHeader(206)
+		w.Write([]byte{1})
+		w.(http.Flusher).Flush()
+		time.Sleep(3 * headerWait)
+		w.Write([]byte{2})
+	}))
+	defer srv.Close()
+	n := NewNetwork()
+	n.rangeHeaderTimeout = headerWait
+	f := &RemoteFile{Net: n, Origin: Origin{URL: srv.URL}, Size: 2}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// The first read retries a stalled worker. The next one's body outlives
+	// the header timer even on its first attempt.
+	for range 2 {
+		data := make([]byte, 2)
+		if _, err := f.ReadAtContext(ctx, data, 0); err != nil || !bytes.Equal(data, []byte{1, 2}) {
+			t.Fatalf("file body was interrupted: %v, %v", data, err)
+		}
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("origin requests = %d, want one retry plus two successful reads", calls.Load())
+	}
+	select {
+	case <-stalledCanceled:
+	default:
+		t.Fatal("stalled worker was left running")
+	}
+}
+
 func TestOpenAssetUsesOneBoundedInitialRequest(t *testing.T) {
 	data := bytes.Repeat([]byte("x"), 128<<10)
 	requests := 0

@@ -756,6 +756,24 @@ func (v *Session) signalVideoLocked() {
 	close(v.videoChanged)
 	v.videoChanged = make(chan struct{})
 }
+
+func (v *Session) fileAudioSegmentRequested(index int) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.video == nil || v.video.File == nil || v.videoBase < 0 {
+		return
+	}
+	// VLC can probe the audio renditions at a seek target before requesting
+	// its video. Release the old area's bandwidth immediately. Use the start
+	// of the video run for backward seeks: normal audio may lag video fetches.
+	if index > v.videoHighest+3 || index+1 < v.videoBase {
+		v.videoPrefetch.stop()
+		if w := v.videoWindow; w != nil && (index < w.first || index >= w.end) {
+			w.cancel()
+		}
+	}
+}
+
 func (v *Session) videoSegmentRequested(index int) {
 	v.mu.Lock()
 	seeked := v.videoBase >= 0 && (index > v.videoHighest+3 || index+1 < v.videoHighest)

@@ -186,6 +186,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		duration := v.boundaries[n+1] - start
 		if !track.Subtitle {
 			v.audioPosition(start)
+			v.fileAudioSegmentRequested(n)
 		}
 		offset := 0.0
 		if !track.Original {

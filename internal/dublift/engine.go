@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,16 +70,17 @@ type Probe struct {
 	} `json:"format"`
 }
 type Engine struct {
-	Config          *Config
-	Net             *Network
-	Cache           *ByteCache
-	mu              sync.Mutex
-	jobs            map[string]*mediaJob
-	base            string
-	srv             *http.Server
-	slots           chan struct{}
-	backgroundSlots chan struct{}
-	foregroundFiles map[string]*fileActivity
+	Config           *Config
+	Net              *Network
+	Cache            *ByteCache
+	mu               sync.Mutex
+	jobs             map[string]*mediaJob
+	base             string
+	srv              *http.Server
+	slots            chan struct{}
+	backgroundSlots  chan struct{}
+	foregroundFiles  map[string]*fileActivity
+	rangeReadTimeout time.Duration
 }
 type fileActivity struct {
 	count int
@@ -362,36 +364,63 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 	var streamed *http.Response
 	var next, streamedEnd int64
 	var stopMeter func()
+	var cancelStream context.CancelFunc
 	closeStream := func() {
 		if streamed != nil {
+			cancelStream()
 			streamed.Body.Close()
 			streamed = nil
 			stopMeter()
 		}
 	}
 	defer closeStream()
-	streamVideo := func(start, length int64) ([]byte, error) {
-		if streamed == nil || start != next || start+length-1 > streamedEnd {
-			closeStream()
-			// FFmpeg often asks for an open-ended virtual file range. Keep
-			// each real origin request finite, but reuse its connection while
-			// delivering and caching successive 1 MiB chunks.
-			span := min(int64(32<<20), b-start+1)
-			resp, err := f.openRange(ctx, start, span)
-			if err != nil {
-				return nil, err
-			}
-			streamed, next, streamedEnd = resp, start, start+span-1
-			stopMeter = beginVideoDownload(ctx)
-		}
+	streamFile := func(start, length int64) ([]byte, error) {
 		data := make([]byte, length)
-		n, err := io.ReadFull(io.TeeReader(streamed.Body, videoByteWriter{ctx}), data)
-		f.Net.Bytes.Add(int64(n))
-		next += int64(n)
-		if err != nil || next > streamedEnd {
-			closeStream()
+		read := 0
+		var readErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			offset := start + int64(read)
+			if streamed == nil || offset != next || start+length-1 > streamedEnd {
+				closeStream()
+				// FFmpeg often asks for an open-ended virtual file range. Keep
+				// each real origin request finite, but reuse its connection while
+				// delivering and caching successive 1 MiB chunks.
+				span := min(int64(32<<20), b-offset+1)
+				streamCtx, streamCancel := context.WithCancel(ctx)
+				resp, err := f.openRange(streamCtx, offset, span)
+				if err != nil {
+					streamCancel()
+					return data[:read], err
+				}
+				streamed, next, streamedEnd = resp, offset, offset+span-1
+				cancelStream = streamCancel
+				stopMeter = beginVideoDownload(ctx)
+			}
+			// Bound each missing cache chunk, not the full large response. If a
+			// CDN worker stalls mid-body, resume only the remaining bytes through
+			// the entry URL instead of feeding FFmpeg a truncated virtual file.
+			timeout := e.rangeReadTimeout
+			if timeout <= 0 {
+				timeout = 5 * time.Second
+			}
+			timer := time.AfterFunc(timeout, cancelStream)
+			n, err := io.ReadFull(io.TeeReader(streamed.Body, videoByteWriter{ctx}), data[read:])
+			timedOut := !timer.Stop()
+			f.Net.Bytes.Add(int64(n))
+			next += int64(n)
+			read += n
+			if err != nil || timedOut || next > streamedEnd {
+				closeStream()
+			}
+			if err == nil {
+				return data, nil
+			}
+			if ctx.Err() != nil {
+				return data[:read], ctx.Err()
+			}
+			readErr = err
 		}
-		return data[:n], err
+		return data[:read], readErr
 	}
 	for off := a; off <= b; {
 		if r.Context().Err() != nil || j.ctx.Err() != nil {
@@ -414,8 +443,11 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 		// the bounded session cache; never read ahead or keep a whole file.
 		var fetch func(int64, int64) ([]byte, error)
 		if !cacheOnly {
-			if j.video {
-				fetch = streamVideo
+			if j.video || j.ctx.Value(backgroundWorkKey{}) != true {
+				// Players also probe original file audio when seeking, before
+				// requesting video. Reopening the redirector for every MiB of
+				// that interleaved file can hold up the entire seek.
+				fetch = streamFile
 			} else {
 				fetch = func(start, length int64) ([]byte, error) {
 					data := make([]byte, length)
@@ -733,29 +765,37 @@ func (e *Engine) videoAttempt(ctx context.Context, a *Asset, start, duration flo
 	// still exits successfully. Do not cache that fragment as a complete HLS
 	// segment: the next segment would jump over the missing video frames.
 	completeEnd := start+duration < a.Duration()-.01
-	return placeFragments(raw, start+clock.first+1, start+1, start+duration+1, completeEnd)
+	return placeFragments(raw, start+clock.first+1, start+1, start+duration+1, completeEnd, videoSequence(a, start))
+}
+
+func videoSequence(a *Asset, start float64) uint32 {
+	return uint32(sort.SearchFloat64s(a.Index.Boundaries, start) + 1)
 }
 
 func videoArgs(u string, skip, start, duration float64) []string {
 	// Matroska cue times are rounded to the container's tick. Seek just after
-	// the cue so libavformat cannot round down to the previous GOP.
-	// Indexed files already describe their streams. Repeating stream-info
-	// analysis for every segment adds reads and delays before the actual seek.
-	args := []string{"-nostdin", "-v", "error", "-threads", "1", "-copyts", "-ss", decimal(skip + .01), "-itsoffset", decimal(-start), "-discard:a", "all", "-discard:s", "all", "-discard:d", "all", "-nofind_stream_info"}
+	// the cue; placeFragments discards any preroll using its actual clock.
+	// Keep the bounded stream analysis in ffInput: Matroska headers do not
+	// supply decode timestamps or HEVC's frame reorder delay. Skipping it
+	// makes FFmpeg substitute PTS for DTS and clamp reordered B-frames to
+	// near-identical timestamps, even though all compressed bytes survive.
+	args := []string{"-nostdin", "-v", "error", "-threads", "1", "-copyts", "-ss", decimal(skip + .01), "-itsoffset", decimal(-start), "-discard:a", "all", "-discard:s", "all", "-discard:d", "all"}
 	args = append(args, ffInput(u)...)
 	// -dn does not disable the MP4 muxer's synthesized chapter text track.
 	// Explicitly exclude chapters so each fragment has exactly the video track.
 	// The MP4 muxer rebases timestamps. The framecrc side output records the
 	// first compressed packet's real PTS before rebasing; it is not decoded or
 	// re-encoded. This distinguishes actual preroll from the requested GOP.
-	args = append(args, "-t", decimal(duration+.25), "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-avoid_negative_ts", "disabled", "-f", "tee", "[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof:avoid_negative_ts=disabled]pipe:1|[f=framecrc]pipe:3")
+	// tee otherwise chooses the decoder timebase, which can round distinct
+	// DTS to the same tick and make FFmpeg clamp the corresponding PTS too.
+	args = append(args, "-t", decimal(duration+.25), "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-copytb", "1", "-avoid_negative_ts", "disabled", "-f", "tee", "[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof:avoid_negative_ts=disabled]pipe:1|[f=framecrc]pipe:3")
 	return args
 }
 
 // FFmpeg's standalone MP4 muxer resets each extraction's decode clock.
 // Rebase fragment metadata, keep only complete GOPs before the next indexed
 // boundary, and preserve every compressed video sample byte-for-byte.
-func placeFragments(raw []byte, first, start, end float64, completeEnd bool) ([]byte, error) {
+func placeFragments(raw []byte, first, start, end float64, completeEnd bool, sequence uint32) ([]byte, error) {
 	init, media, err := splitFMP4(raw)
 	if err != nil {
 		return nil, err
@@ -788,7 +828,8 @@ func placeFragments(raw []byte, first, start, end float64, completeEnd bool) ([]
 	delta := int64(math.Round(first*float64(scale))) - int64(t.BaseTime) - int64(t.Samples[0].PTSOffset)
 	var out seekablebuffer.Buffer
 	out.Write(init)
-	kept := 0
+	var combined *fmp4.PartTrack
+	var decodeEnd int64
 	firstPTS, lastEnd := math.Inf(1), math.Inf(-1)
 	for _, p := range parts {
 		if len(p.Tracks) != 1 || len(p.Tracks[0].Samples) == 0 {
@@ -806,6 +847,11 @@ func placeFragments(raw []byte, first, start, end float64, completeEnd bool) ([]
 		if base < 0 {
 			return nil, errors.New("negative video decode clock")
 		}
+		if combined == nil {
+			combined = &fmp4.PartTrack{ID: track.ID, BaseTime: uint64(base)}
+		} else if base != decodeEnd {
+			return nil, errors.New("non-contiguous video decode clock")
+		}
 		decode := base
 		for _, sample := range track.Samples {
 			presentation := float64(decode+int64(sample.PTSOffset)) / float64(scale)
@@ -813,18 +859,21 @@ func placeFragments(raw []byte, first, start, end float64, completeEnd bool) ([]
 			lastEnd = max(lastEnd, presentation+float64(sample.Duration)/float64(scale))
 			decode += int64(sample.Duration)
 		}
-		track.BaseTime = uint64(base)
-		p.SequenceNumber = uint32(kept + 1)
-		if err = p.Marshal(&out); err != nil {
-			return nil, err
-		}
-		kept++
+		decodeEnd = decode
+		combined.Samples = append(combined.Samples, track.Samples...)
 	}
-	if kept == 0 {
+	if combined == nil {
 		return nil, errors.New("no video samples at requested seek position")
 	}
 	if firstPTS > start+.5 || (completeEnd && lastEnd < end-.5) {
 		return nil, fmt.Errorf("incomplete video segment at %.1fs (packets cover %.1f–%.1fs of %.1f–%.1fs)", start-1, firstPTS-1, lastEnd-1, start-1, end-1)
+	}
+	// Emit one fragment per HLS segment, with an absolute sequence number.
+	// Resetting mfhd to 1 for every extraction makes VLC detect a lost
+	// fragment and reset its clock even when the sample timestamps match.
+	part := fmp4.Part{SequenceNumber: sequence, Tracks: []*fmp4.PartTrack{combined}}
+	if err = part.Marshal(&out); err != nil {
+		return nil, err
 	}
 	return out.Bytes(), nil
 }

@@ -18,6 +18,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4/seekablebuffer"
 )
 
 func ffmpegAvailable(t *testing.T) {
@@ -181,24 +184,17 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 				if ext == "mkv" && n == 7 {
 					// A range that ends early may still make FFmpeg exit with a
 					// valid but incomplete MP4. It must never enter the VOD cache.
-					cut, seenMedia := 0, false
-					for off := 0; off+8 <= len(b); {
-						size := int(binary.BigEndian.Uint32(b[off:]))
-						if size < 8 || off+size > len(b) {
-							t.Fatal("invalid fixture fragment")
-						}
-						kind := string(b[off+4 : off+8])
-						if kind == "moof" && seenMedia {
-							cut = off
-							break
-						}
-						seenMedia = seenMedia || kind == "mdat"
-						off += size
+					var parts fmp4.Parts
+					if err := parts.Unmarshal(media); err != nil {
+						t.Fatal(err)
 					}
-					if cut == 0 {
-						t.Fatal("fixture has no second video fragment")
+					parts[0].Tracks[0].Samples = parts[0].Tracks[0].Samples[:len(parts[0].Tracks[0].Samples)/2]
+					var partial seekablebuffer.Buffer
+					partial.Write(init)
+					if err := parts[0].Marshal(&partial); err != nil {
+						t.Fatal(err)
 					}
-					if _, err := placeFragments(b[:cut], lo, start+1, end+1, true); err == nil || !strings.Contains(err.Error(), "incomplete video segment") {
+					if _, err := placeFragments(partial.Bytes(), lo, start+1, end+1, true, uint32(n+1)); err == nil || !strings.Contains(err.Error(), "incomplete video segment") {
 						t.Fatalf("short remux accepted: %v", err)
 					}
 				}
@@ -243,7 +239,13 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 func checkProgressiveVideoWindow(t *testing.T, engine *Engine, ctx context.Context, a *Asset) {
 	t.Helper()
 	bounds := a.Index.Boundaries[:5]
-	raw, err := engine.Video(ctx, a, bounds[0], bounds[len(bounds)-1])
+	u, skip, cleanup, err := engine.job(ctx, a, bounds[0], bounds[len(bounds)-1]+1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	clock := &packetClock{}
+	raw, err := engine.run(ctx, "ffmpeg", videoArgs(u, skip, bounds[0], bounds[len(bounds)-1]), segmentLimit, clock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,9 +253,8 @@ func checkProgressiveVideoWindow(t *testing.T, engine *Engine, ctx context.Conte
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	first, _ := packetTimes(t, path, "v:0")
 	published := 0
-	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), clock: &windowClock{packetClock: packetClock{known: true, first: first - 1}}, publish: func(n int, data []byte) error {
+	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), clock: &windowClock{packetClock: packetClock{known: true, first: clock.first}}, publish: func(n int, data []byte) error {
 		if n != published {
 			t.Errorf("out-of-order segment: %d", n)
 		}

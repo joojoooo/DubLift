@@ -27,6 +27,7 @@ type videoWindowWriter struct {
 	parsed, complete, next int
 	bounds                 []float64
 	duration               float64
+	sequence               uint32
 	clock                  *windowClock
 	publish                func(int, []byte) error
 }
@@ -76,7 +77,7 @@ func (w *videoWindowWriter) flush(final bool) error {
 	for w.next < len(w.bounds)-1 {
 		start, end := w.bounds[w.next], w.bounds[w.next+1]
 		completeEnd := !final || end < w.duration-.01
-		data, err := placeFragments(w.raw[:w.complete], w.bounds[0]+first+1, start+1, end+1, completeEnd)
+		data, err := placeFragments(w.raw[:w.complete], w.bounds[0]+first+1, start+1, end+1, completeEnd, w.sequence+uint32(w.next))
 		if err != nil {
 			if final {
 				return err
@@ -100,7 +101,7 @@ func (e *Engine) VideoWindow(ctx context.Context, a *Asset, bounds []float64, pu
 		return err
 	}
 	defer cleanup()
-	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), clock: &windowClock{}, publish: publish}
+	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), sequence: videoSequence(a, start), clock: &windowClock{}, publish: publish}
 	if err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgs(u, skip, start, end-start), w, w.clock); err != nil {
 		return err
 	}

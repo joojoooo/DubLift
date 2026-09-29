@@ -97,3 +97,22 @@ func TestRequestedAreaFollowsVideoAcrossAudioRequestsAndSeeks(t *testing.T) {
 		t.Fatal("backward video seek did not update position")
 	}
 }
+
+func TestAudioSeekReleasesObsoleteVideoReads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	v := &Session{video: &Asset{File: &RemoteFile{}}, videoBase: 10, videoHighest: 20}
+	v.videoWindow = &fileVideoWindow{first: 20, end: 23, ctx: ctx, cancel: cancel}
+	// Audio often trails video downloads; this is not a backward seek.
+	v.fileAudioSegmentRequested(15)
+	if ctx.Err() != nil {
+		t.Fatal("normal audio buffering canceled video")
+	}
+	v.fileAudioSegmentRequested(35)
+	if ctx.Err() == nil {
+		t.Fatal("audio seek left the old video download running")
+	}
+	if v.videoBase != 10 || v.videoHighest != 20 {
+		t.Fatal("audio probe claimed video had already reached the seek target")
+	}
+}
