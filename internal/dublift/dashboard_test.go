@@ -133,7 +133,8 @@ func TestStreamSourceFormatUsesCheckedMedia(t *testing.T) {
 
 func TestStatusReportsPreparationBeforeMediaIsReady(t *testing.T) {
 	s := lifecycleServer(t)
-	v := s.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{URL: "https://origin.test/movie.m3u8"})
+	originalURL := "https://origin.test/movie.m3u8?token=signed%2Fvalue&quality=high"
+	v := s.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{URL: originalURL})
 	v.listedReady = make(chan struct{})
 	request := httptest.NewRequest(http.MethodGet, "/api/status", nil)
 	snapshot := func() map[string]any {
@@ -142,6 +143,12 @@ func TestStatusReportsPreparationBeforeMediaIsReady(t *testing.T) {
 	}
 	if snapshot()["preparationStarted"] != false {
 		t.Fatal("unprepared stream was marked as preparing")
+	}
+	if snapshot()["originalUrl"] != originalURL {
+		t.Fatal("status lost the upstream stream URL")
+	}
+	if snapshot()["url"] == originalURL {
+		t.Fatal("DubLift and upstream URLs were not distinguished")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

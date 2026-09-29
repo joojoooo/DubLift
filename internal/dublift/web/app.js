@@ -410,6 +410,7 @@ function createCard(session) {
   const id = session.id;
   card.dataset.id = id;
   card.querySelector(".copy").onclick = () => copy(card.dataset.url);
+  card.querySelector(".copy-original").onclick = () => copy(card.dataset.originalUrl);
   const action = (selector, route, body = {}, message = "Request accepted") =>
     (card.querySelector(selector).onclick = async () => {
       const btn = card.querySelector(selector);
@@ -471,6 +472,7 @@ function playbackBadge(v) {
 function updateCard(v) {
   const card = cards.get(v.id) || createCard(v);
   card.dataset.url = v.url;
+  card.dataset.originalUrl = v.originalUrl || "";
   const set = (sel, value) => setText(card.querySelector(sel), value);
   set(".content", v.content);
   set(".content-name", v.contentName || v.title || v.content);
@@ -553,7 +555,8 @@ function updateCard(v) {
   card.querySelector(".delivery-info").hidden = !v.ready;
   card.querySelector("details").hidden = !v.ready;
   card.querySelector(".realign").hidden = !v.ready;
-  card.querySelector(".copy").textContent = v.passthrough ? "Copy original URL" : "Copy HLS URL";
+  card.querySelector(".copy").textContent = v.passthrough ? "Copy original upstream URL" : "Copy DubLift URL";
+  card.querySelector(".copy-original").hidden = v.passthrough || !v.originalUrl;
   if (v.passthrough) set(".sample-progress", `${v.fallbackReason || "DubLift unavailable"}. Sent unchanged to Stremio. Direct upstream playback does not report activity to DubLift.`);
   card.querySelector(".realign").disabled = v.aligning || !v.ready;
   card.querySelector(".analyze").disabled = v.aligning || !v.ready;
