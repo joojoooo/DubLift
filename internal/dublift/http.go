@@ -26,6 +26,36 @@ type Network struct {
 	Bytes  atomic.Int64
 }
 
+// Video bytes are counted on each origin read, including while a range
+// request is still in progress. The context selects the playback session.
+type videoBytesKey struct{}
+
+type videoDownload struct {
+	bytes  atomic.Int64
+	active atomic.Int64
+}
+
+func beginVideoDownload(ctx context.Context) func() {
+	if meter, ok := ctx.Value(videoBytesKey{}).(*videoDownload); ok {
+		meter.active.Add(1)
+		return func() { meter.active.Add(-1) }
+	}
+	return func() {}
+}
+
+func recordVideoBytes(ctx context.Context, size int) {
+	if meter, ok := ctx.Value(videoBytesKey{}).(*videoDownload); ok {
+		meter.bytes.Add(int64(size))
+	}
+}
+
+type videoByteWriter struct{ ctx context.Context }
+
+func (w videoByteWriter) Write(p []byte) (int, error) {
+	recordVideoBytes(w.ctx, len(p))
+	return len(p), nil
+}
+
 func NewNetwork() *Network {
 	jar, _ := cookiejar.New(nil)
 	return &Network{Client: &http.Client{Jar: jar, Timeout: 45 * time.Second, Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 12 * time.Second, KeepAlive: 30 * time.Second, Resolver: platformResolver()}).DialContext, ResponseHeaderTimeout: 20 * time.Second, IdleConnTimeout: 60 * time.Second, MaxIdleConns: 64, MaxConnsPerHost: 12, DisableCompression: true}, CheckRedirect: func(r *http.Request, via []*http.Request) error {
@@ -165,6 +195,7 @@ func (f *RemoteFile) ReadAtContext(ctx context.Context, p []byte, off int64) (in
 	if want == 0 {
 		return 0, nil
 	}
+	defer beginVideoDownload(ctx)()
 	resp, e := f.Net.request(ctx, f.Origin, "GET", fmt.Sprintf("bytes=%d-%d", off, off+want-1))
 	if e != nil {
 		return 0, e
@@ -183,7 +214,7 @@ func (f *RemoteFile) ReadAtContext(ctx context.Context, p []byte, off int64) (in
 	if resp.ContentLength >= 0 && resp.ContentLength != want {
 		return 0, errors.New("origin returned an inconsistent range length")
 	}
-	n, e := io.ReadFull(resp.Body, p[:want])
+	n, e := io.ReadFull(io.TeeReader(resp.Body, videoByteWriter{ctx}), p[:want])
 	f.Net.Bytes.Add(int64(n))
 	if e == nil && int64(len(p)) > want {
 		e = io.EOF

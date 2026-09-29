@@ -112,6 +112,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
+		ctx = context.WithValue(ctx, videoBytesKey{}, &v.videoDownload)
 		data, err := s.Engine.Cache.Get(ctx, fmt.Sprintf("video:%s:%d", v.video.ID, n), func() ([]byte, error) { return s.Engine.Video(ctx, v.video, start, duration) })
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -336,7 +337,9 @@ func (s *Server) generatedPlaylist(v *Session, t *Track) string {
 func (s *Server) proxyPlaylist(v *Session, a *Asset, track bool) string {
 	var b strings.Builder
 	idx := 0
-	rewrite := func(raw string) string { return s.baseResource(v, Origin{raw, a.Origin.Headers}, 0, false, false) }
+	rewrite := func(raw string) string {
+		return s.baseResource(v, Origin{raw, a.Origin.Headers}, 0, false, false, false)
+	}
 	for _, line := range strings.Split(a.HLS.Raw, "\n") {
 		l := strings.TrimSpace(line)
 		if l != "" && !strings.HasPrefix(l, "#") {
@@ -350,7 +353,7 @@ func (s *Server) proxyPlaylist(v *Session, a *Asset, track bool) string {
 			if err != nil {
 				continue
 			}
-			b.WriteString(s.baseResource(v, Origin{u, a.Origin.Headers}, position, track, force))
+			b.WriteString(s.baseResource(v, Origin{u, a.Origin.Headers}, position, track, force, a == v.video))
 			idx++
 		} else {
 			b.WriteString(rewriteURI(line, a.HLS.Origin.URL, rewrite))
@@ -391,8 +394,8 @@ func (s *Server) sectionClock(ctx context.Context, v *Session, n int) (float64, 
 	}
 	return strconv.ParseFloat(string(b), 64)
 }
-func (s *Server) baseResource(v *Session, o Origin, at float64, track, force bool) string {
-	return v.addResource(o, at, track, force)
+func (s *Server) baseResource(v *Session, o Origin, at float64, track, force, video bool) string {
+	return v.addResource(o, at, track, force, video)
 }
 func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id string) {
 	v.mu.Lock()
@@ -409,10 +412,16 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 	if u, err := httpURL(res.Origin.URL); err == nil && s.Net.Client.Jar != nil && len(s.Net.Client.Jar.Cookies(u)) > 0 {
 		force = true
 	}
+	if res.Video {
+		v.videoRedirected.Store(!force)
+	}
 	if !force {
 		w.Header().Set("Cache-Control", "no-store")
 		http.Redirect(w, r, res.Origin.URL, http.StatusTemporaryRedirect)
 		return
+	}
+	if res.Video {
+		defer beginVideoDownload(context.WithValue(r.Context(), videoBytesKey{}, &v.videoDownload))()
 	}
 	resp, err := s.Net.request(r.Context(), res.Origin, r.Method, r.Header.Get("Range"))
 	if err != nil {
@@ -441,6 +450,10 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 	if r.Method == "HEAD" {
 		return
 	}
-	n, _ := io.Copy(w, io.LimitReader(resp.Body, segmentLimit))
+	body := io.Reader(resp.Body)
+	if res.Video {
+		body = io.TeeReader(body, videoByteWriter{context.WithValue(r.Context(), videoBytesKey{}, &v.videoDownload)})
+	}
+	n, _ := io.Copy(w, io.LimitReader(body, segmentLimit))
 	s.Net.Bytes.Add(n)
 }

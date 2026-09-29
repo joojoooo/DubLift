@@ -54,6 +54,8 @@ Stream discovery always confirms that Vixsrc has Italian audio. By default it th
 
 The dashboard preserves the exact response order: configured-addon order, then each addon's original stream order. It displays full stream text and resolves the movie/series name through addon metadata, Cinemeta for IMDb IDs, or an optional TMDB token. When metadata is unavailable, the upstream title/description remains visible.
 
+The **Video download** stat shows the selected stream's upstream video receive rate in Mbps, updated about once a second during MKV/MP4 range reads and proxied HLS video reads. **0.00 Mbps** means a video request is active but no bytes arrived in the last second. **Idle** means no video request is active; **Direct** means the player downloads video from the origin without passing through DubLift, so its speed cannot be observed here. The rate reflects bytes requested for playback, which may pause while cached data is used.
+
 - Every new stream lookup cancels the previous lookup and discards unselected results and their media caches. Current playback survives result refreshes and next-episode lookups until another stream is selected.
 - A player's first master-playlist GET immediately marks **Playback detected**, before probing or alignment, and discards other candidates. HEAD checks are visible separately and do not consume the list.
 - Playback links carry an encrypted, one-hour resume ticket. Stremio back-navigation and VLC handoff can recreate a discarded session without retaining its old media cache. The private `playback.key` beside the config also allows these links to survive a server restart. It is ignored by Git and saved with mode `0600`.

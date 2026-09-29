@@ -590,6 +590,33 @@ function updateCard(v) {
   }
 }
 let lastEvents = "";
+let videoSample = null;
+function updateVideoDownload() {
+    const playingVideo = latestStatus?.sessions.find((v) => v.playing);
+    const videoStat = $("video-download");
+    if (!playingVideo || $("connection-dot").classList.contains("offline")) {
+      videoSample = null;
+      setText(videoStat, "—");
+    } else if (playingVideo.passthrough || playingVideo.loadedDelivery?.videoDirect || playingVideo.videoRedirected) {
+      videoSample = null;
+      setText(videoStat, "Direct");
+    } else {
+      const now = performance.now();
+      const bytes = playingVideo.videoBytes || 0;
+      if (videoSample?.id === playingVideo.id && bytes >= videoSample.bytes) {
+        const seconds = (now - videoSample.at) / 1000;
+        if (seconds >= 0.5) {
+          const mbps = (bytes - videoSample.bytes) * 8 / seconds / 1000000;
+          setText(videoStat, mbps > 0 ? `${mbps.toFixed(mbps < 10 ? 2 : 1)} Mbps` : playingVideo.videoActive ? "0.00 Mbps" : "Idle");
+          videoSample = { id: playingVideo.id, bytes, at: now };
+        }
+      } else {
+        setText(videoStat, "Waiting");
+        videoSample = { id: playingVideo.id, bytes, at: now };
+      }
+    }
+}
+setInterval(updateVideoDownload, 1000);
 function renderStatus(state) {
     latestStatus = state;
     setText($("connection"), "Connected to local server");
@@ -597,7 +624,6 @@ function renderStatus(state) {
     if ($("manifest").value !== state.manifestURL) $("manifest").value = state.manifestURL;
     $("install").href = state.manifestURL.replace(/^https?:\/\//, "stremio://");
     setText($("session-count"), `${state.sessions.filter(v => v.playing).length} / ${state.sessions.length}`);
-    setText($("italian-count"), `${state.sessions.filter(v => v.checked !== false && !v.passthrough).length} / ${state.sessions.length}`);
     setText($("lookup-status"), state.lookupStatus || "Waiting for an addon request or a title lookup.");
     setText($("cache-size"), `${mb(state.cacheBytes)} / ${mb(state.cacheMaxBytes)}`);
     setText($("origin-bytes"), mb(state.originBytes));
@@ -647,4 +673,5 @@ statusStream.onmessage = (event) => {
 statusStream.onerror = () => {
     setText($("connection"), "Server unreachable");
     $("connection-dot").classList.add("offline");
+    updateVideoDownload();
 };

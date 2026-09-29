@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluenviron/gohlslib/v2/pkg/playlist"
@@ -120,8 +121,10 @@ type Session struct {
 	PositionAt          time.Time `json:"positionAt"`
 	Duration            float64   `json:"duration"`
 	ProxyReason         string    `json:"proxyReason"`
-	Aligning            bool      `json:"aligning"`
-	Revision            int       `json:"revision"`
+	videoDownload       videoDownload
+	videoRedirected     atomic.Bool
+	Aligning            bool `json:"aligning"`
+	Revision            int  `json:"revision"`
 	stream              Stream
 	prepare             sync.Once
 	preparationStarted  bool
@@ -161,6 +164,7 @@ type resource struct {
 	Position float64
 	Track    bool
 	Force    bool
+	Video    bool
 }
 
 func (s *Session) note(err error) {
@@ -190,10 +194,10 @@ func (s *Session) position(t float64) {
 	s.mu.Unlock()
 }
 func (s *Session) state(status string) { s.mu.Lock(); s.Status = status; s.mu.Unlock() }
-func (s *Session) addResource(o Origin, position float64, track, force bool) string {
-	key := identity(o.URL, fmt.Sprint(o.Headers), strconv.FormatBool(force), decimal(position))[:32]
+func (s *Session) addResource(o Origin, position float64, track, force, video bool) string {
+	key := identity(o.URL, fmt.Sprint(o.Headers), strconv.FormatBool(force), strconv.FormatBool(video), decimal(position))[:32]
 	s.mu.Lock()
-	s.resources[key] = resource{o, position, track, force}
+	s.resources[key] = resource{o, position, track, force, video}
 	s.mu.Unlock()
 	return "/media/" + s.ID + "/resource/" + key
 }

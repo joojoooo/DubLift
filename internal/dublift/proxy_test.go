@@ -29,7 +29,7 @@ func TestProxyPreferenceHeadersAndRange(t *testing.T) {
 	}
 	defer server.Close()
 	v := server.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{URL: origin.URL})
-	direct := v.addResource(Origin{URL: origin.URL}, 42, true, false)
+	direct := v.addResource(Origin{URL: origin.URL}, 42, true, false, true)
 	request := httptest.NewRequest("GET", direct, nil)
 	w := httptest.NewRecorder()
 	server.ServeHTTP(w, request)
@@ -38,6 +38,9 @@ func TestProxyPreferenceHeadersAndRange(t *testing.T) {
 	}
 	if v.Position != 42 {
 		t.Fatal("redirect playback position not tracked")
+	}
+	if !v.videoRedirected.Load() || v.videoDownload.bytes.Load() != 0 {
+		t.Fatal("redirected video was counted as a local download")
 	}
 	cfgValue := cfg.Get()
 	cfgValue.PreferProxy = true
@@ -51,14 +54,20 @@ func TestProxyPreferenceHeadersAndRange(t *testing.T) {
 	if w.Code != 206 || w.Header().Get("Content-Range") != "bytes 3-7/16" || w.Body.String() != "34567" {
 		t.Fatalf("range changed: %d %v %s", w.Code, w.Header(), w.Body.String())
 	}
+	if v.videoRedirected.Load() || v.videoDownload.bytes.Load() != 5 {
+		t.Fatalf("proxied video bytes = %d, redirected = %t", v.videoDownload.bytes.Load(), v.videoRedirected.Load())
+	}
 	cfgValue.PreferProxy = false
 	cfg.Save(cfgValue)
-	forced := v.addResource(Origin{origin.URL, http.Header{"X-Required": {"forward-me"}}}, 50, true, false)
+	forced := v.addResource(Origin{origin.URL, http.Header{"X-Required": {"forward-me"}}}, 50, true, false, false)
 	request = httptest.NewRequest("GET", forced, nil)
 	w = httptest.NewRecorder()
 	server.ServeHTTP(w, request)
 	if w.Code != 200 || header != "forward-me" {
 		t.Fatal("required header was not transparently proxied")
+	}
+	if v.videoDownload.bytes.Load() != 5 {
+		t.Fatal("non-video resource changed video download count")
 	}
 }
 func TestSubtitleShift(t *testing.T) {

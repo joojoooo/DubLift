@@ -281,6 +281,7 @@ func (e *Engine) serveJob(w http.ResponseWriter, r *http.Request) {
 		serveBytes(w, r, "application/octet-stream", b)
 		return
 	}
+	defer beginVideoDownload(j.ctx)()
 	resp, err := e.Net.request(r.Context(), o, "GET", r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), 502)
@@ -309,6 +310,7 @@ func (e *Engine) copyBudget(w io.Writer, r io.Reader, j *mediaJob, limit int64) 
 				return
 			}
 			e.Net.Bytes.Add(int64(n))
+			recordVideoBytes(j.ctx, n)
 			if _, we := w.Write(buf[:n]); we != nil {
 				return
 			}
