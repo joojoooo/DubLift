@@ -119,8 +119,9 @@ type Session struct {
 	Errors              []string  `json:"errors"`
 	Position            float64   `json:"position"`
 	PositionAt          time.Time `json:"positionAt"`
-	Duration            float64   `json:"duration"`
-	ProxyReason         string    `json:"proxyReason"`
+	positionFromVideo   bool
+	Duration            float64 `json:"duration"`
+	ProxyReason         string  `json:"proxyReason"`
 	videoDownload       videoDownload
 	videoRedirected     atomic.Bool
 	Aligning            bool `json:"aligning"`
@@ -148,6 +149,11 @@ type Session struct {
 	videoHighest        int
 	videoSequence       uint64
 	videoReady          map[int]bool
+	videoPrefetch       segmentLookahead
+	videoWindow         *fileVideoWindow
+	videoInit           []byte
+	audioPrefetch       segmentLookahead
+	audioPrefetchID     string
 	videoChanged        chan struct{}
 	startupZero         bool
 	listedAsset         *Asset
@@ -188,10 +194,22 @@ func (s *Session) note(err error) {
 }
 func (s *Session) position(t float64) {
 	s.mu.Lock()
+	s.positionFromVideo = true
 	s.Position = t
 	s.PositionAt = time.Now()
 	s.LastUsed = time.Now()
 	s.mu.Unlock()
+}
+func (s *Session) audioPosition(t float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Direct video never reaches DubLift, so audio remains the best available
+	// position there. Otherwise the video request is the authoritative area.
+	if !s.positionFromVideo {
+		s.Position = t
+		s.PositionAt = time.Now()
+	}
+	s.LastUsed = time.Now()
 }
 func (s *Session) state(status string) { s.mu.Lock(); s.Status = status; s.mu.Unlock() }
 func (s *Session) addResource(o Origin, position float64, track, force, video bool) string {
@@ -740,7 +758,17 @@ func (v *Session) signalVideoLocked() {
 }
 func (v *Session) videoSegmentRequested(index int) {
 	v.mu.Lock()
-	if v.videoBase < 0 || index < v.videoBase || index > v.videoHighest+1 {
+	seeked := v.videoBase >= 0 && (index > v.videoHighest+3 || index+1 < v.videoHighest)
+	if seeked {
+		// A distant seek makes the old lookahead irrelevant. Stop its origin
+		// read so the one prefetch worker can follow the new playback area.
+		v.videoPrefetch.stop()
+		v.audioPrefetch.stop()
+		if v.videoWindow != nil {
+			v.videoWindow.cancel()
+		}
+	}
+	if v.videoBase < 0 || seeked || index < v.videoBase || index > v.videoHighest+1 {
 		v.videoBase, v.videoHighest = index, index
 		v.videoSequence++
 	} else if index > v.videoHighest {

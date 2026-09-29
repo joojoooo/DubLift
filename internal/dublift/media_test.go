@@ -154,7 +154,7 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 			if len(p.Streams) < 2 {
 				t.Fatal(p)
 			}
-			for _, n := range []int{0, 7, 8} {
+			for _, n := range []int{0, 1, 7, 8} {
 				start, end := a.Index.Boundaries[n], a.Index.Boundaries[n+1]
 				b, e := engine.Video(ctx, a, start, end-start)
 				if e != nil {
@@ -178,7 +178,56 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 				if math.Abs(lo-(start+1)) > .13 || math.Abs(hi-(end+1)) > .15 {
 					t.Errorf("fragment timestamp mismatch: %.3f..%.3f vs %.3f..%.3f", lo, hi, start, end)
 				}
+				if ext == "mkv" && n == 7 {
+					// A range that ends early may still make FFmpeg exit with a
+					// valid but incomplete MP4. It must never enter the VOD cache.
+					cut, seenMedia := 0, false
+					for off := 0; off+8 <= len(b); {
+						size := int(binary.BigEndian.Uint32(b[off:]))
+						if size < 8 || off+size > len(b) {
+							t.Fatal("invalid fixture fragment")
+						}
+						kind := string(b[off+4 : off+8])
+						if kind == "moof" && seenMedia {
+							cut = off
+							break
+						}
+						seenMedia = seenMedia || kind == "mdat"
+						off += size
+					}
+					if cut == 0 {
+						t.Fatal("fixture has no second video fragment")
+					}
+					if _, err := placeFragments(b[:cut], lo, start+1, end+1, true); err == nil || !strings.Contains(err.Error(), "incomplete video segment") {
+						t.Fatalf("short remux accepted: %v", err)
+					}
+				}
 				command(t, "ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-f", "null", "-")
+			}
+			var segments [][]byte
+			bounds := a.Index.Boundaries[1:5]
+			if err := engine.VideoWindow(ctx, a, bounds, func(n int, data []byte) error {
+				segments = append(segments, data)
+				return nil
+			}); err != nil {
+				t.Fatal("sequential video window", err)
+			}
+			if len(segments) != len(bounds)-1 {
+				t.Fatal("video window omitted segments")
+			}
+			for n, data := range segments {
+				path := filepath.Join(dir, fmt.Sprintf("window-%s-%d.mp4", ext, n))
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				lo, hi := packetTimes(t, path, "v:0")
+				if math.Abs(lo-bounds[n]-1) > .13 || math.Abs(hi-bounds[n+1]-1) > .15 {
+					t.Fatalf("window segment %d has wrong packet clock: %.3f..%.3f", n, lo, hi)
+				}
+				command(t, "ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-f", "null", "-")
+			}
+			if ext == "mkv" {
+				checkProgressiveVideoWindow(t, engine, ctx, a)
 			}
 		})
 	}
@@ -188,6 +237,51 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 		if r == "" {
 			t.Fatal("unranged file read")
 		}
+	}
+}
+
+func checkProgressiveVideoWindow(t *testing.T, engine *Engine, ctx context.Context, a *Asset) {
+	t.Helper()
+	bounds := a.Index.Boundaries[:5]
+	raw, err := engine.Video(ctx, a, bounds[0], bounds[len(bounds)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "window.mp4")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := packetTimes(t, path, "v:0")
+	published := 0
+	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), clock: &windowClock{packetClock: packetClock{known: true, first: first - 1}}, publish: func(n int, data []byte) error {
+		if n != published {
+			t.Errorf("out-of-order segment: %d", n)
+		}
+		published++
+		return nil
+	}}
+	checkedPartial := false
+	for off := 0; off < len(raw); {
+		end := min(off+997, len(raw)) // Deliberately split MP4 box headers/bodies.
+		if _, err := w.Write(raw[off:end]); err != nil {
+			t.Fatal(err)
+		}
+		off = end
+		if published == 1 && !checkedPartial {
+			if off == len(raw) {
+				t.Fatal("first segment waited for the entire window")
+			}
+			if err := w.flush(true); err == nil {
+				t.Fatal("truncated window was accepted as complete")
+			}
+			checkedPartial = true
+		}
+	}
+	if err := w.flush(true); err != nil {
+		t.Fatal(err)
+	}
+	if !checkedPartial || published != len(bounds)-1 {
+		t.Fatal("segments were not published progressively")
 	}
 }
 
@@ -315,6 +409,9 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 				t.Fatal("not seekable VOD")
 			}
 			if session.video.File != nil {
+				if strings.Count(string(playlist), "#EXT-X-MAP:") != 1 || !strings.Contains(string(playlist), `#EXT-X-MAP:URI="video/0/init.mp4"`) {
+					t.Fatal("file video should use one initialization map")
+				}
 				getBytes(t, local.URL+"/media/"+id+"/video/7/init.mp4")
 				getBytes(t, local.URL+"/media/"+id+"/video/7/segment.m4s")
 			}
@@ -380,7 +477,7 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			}
 			postJSON(t, local.URL+"/api/sessions/"+id+"/offset", `{"offset":null}`, 200)
 			if session.video.File != nil {
-				getBytes(t, audioURL) // infer the current area from a requested segment
+				getBytes(t, local.URL+"/media/"+id+"/video/7/segment.m4s") // video controls the requested area
 				postJSON(t, local.URL+"/api/sessions/"+id+"/realign", `{}`, 202)
 				until := time.Now().Add(15 * time.Second)
 				for time.Now().Before(until) {

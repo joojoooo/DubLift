@@ -89,6 +89,9 @@ func (n *Network) request(ctx context.Context, o Origin, method, byteRange strin
 	}
 	resp, e := n.Client.Do(r)
 	if e != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("origin request failed: %s: %w", networkError(ctx.Err()), ctx.Err())
+		}
 		return nil, fmt.Errorf("origin request failed: %s", networkError(e))
 	}
 	return resp, nil
@@ -232,33 +235,48 @@ func (f *RemoteFile) ReadAtContext(ctx context.Context, p []byte, off int64) (in
 		return 0, nil
 	}
 	defer beginVideoDownload(ctx)()
-	resp, e := f.Net.requestFileRange(ctx, f.Origin, fmt.Sprintf("bytes=%d-%d", off, off+want-1))
+	resp, e := f.openRange(ctx, off, want)
 	if e != nil {
 		return 0, e
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 206 {
-		if resp.StatusCode != 200 {
-			return 0, &HTTPError{resp.StatusCode}
-		}
-		return 0, errors.New("origin stopped honoring Range; full download prevented")
-	}
-	a, b, total, e := parseContentRange(resp.Header.Get("Content-Range"))
-	if e != nil || a != off || b != off+want-1 || total != f.Size {
-		return 0, errors.New("origin returned an inconsistent Content-Range")
-	}
-	if f.ETag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != f.ETag {
-		return 0, errors.New("source file changed during playback")
-	}
-	if resp.ContentLength >= 0 && resp.ContentLength != want {
-		return 0, errors.New("origin returned an inconsistent range length")
-	}
 	n, e := io.ReadFull(io.TeeReader(resp.Body, videoByteWriter{ctx}), p[:want])
 	f.Net.Bytes.Add(int64(n))
 	if e == nil && int64(len(p)) > want {
 		e = io.EOF
 	}
 	return n, e
+}
+
+func (f *RemoteFile) openRange(ctx context.Context, off, want int64) (*http.Response, error) {
+	if off < 0 || want <= 0 || off > f.Size-want {
+		return nil, errors.New("invalid file range")
+	}
+	resp, e := f.Net.requestFileRange(ctx, f.Origin, fmt.Sprintf("bytes=%d-%d", off, off+want-1))
+	if e != nil {
+		return nil, e
+	}
+	if resp.StatusCode != 206 {
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return nil, &HTTPError{resp.StatusCode}
+		}
+		return nil, errors.New("origin stopped honoring Range; full download prevented")
+	}
+	a, b, total, e := parseContentRange(resp.Header.Get("Content-Range"))
+	if e != nil || a != off || b != off+want-1 || total != f.Size {
+		resp.Body.Close()
+		return nil, errors.New("origin returned an inconsistent Content-Range")
+	}
+	if f.ETag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != f.ETag {
+		resp.Body.Close()
+		return nil, errors.New("source file changed during playback")
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != want {
+		resp.Body.Close()
+		return nil, errors.New("origin returned an inconsistent range length")
+	}
+	return resp, nil
 }
 func requestRange(raw string, size int64) (int64, int64, error) {
 	if !strings.HasPrefix(raw, "bytes=") || strings.Contains(raw, ",") {
