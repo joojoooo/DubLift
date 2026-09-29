@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -723,40 +722,50 @@ func TestStartupReleasesAtFirstSampleAndUpdatesOffset(t *testing.T) {
 
 func TestShortAlignmentSettingsAndSampleCoverage(t *testing.T) {
 	cfg := DefaultSettings()
-	if cfg.SearchRadius != 8 || cfg.AlignmentSamples != 1 || !cfg.StartImmediately {
+	if cfg.SearchRadius != 10 || cfg.AlignmentSampleSeconds != 5 || cfg.AlignmentSamples != 1 || !cfg.StartImmediately {
 		t.Fatal("incorrect startup defaults")
 	}
-	for _, n := range []int{1, 2, 3, 12} {
-		for _, duration := range []float64{84, 3600, 12000} {
-			positions := alignmentPositions(duration, n)
-			if len(positions) != n || positions[0] != 5 || max(0, positions[0]-5) != 0 {
-				t.Fatal(positions)
-			}
-			for i, p := range positions {
-				if p < 0 || p+alignmentWindow > duration || (i > 0 && p <= positions[i-1]) {
+	for _, window := range []float64{5, 8, 16, 40} {
+		for _, n := range []int{1, 2, 3, 12} {
+			for _, duration := range []float64{84, 3600, 12000} {
+				positions := alignmentPositions(duration, n, window, 10)
+				if len(positions) != n || positions[0] != 10 || max(0, positions[0]-10) != 0 {
 					t.Fatal(positions)
 				}
-			}
-			if n > 1 && math.Abs(positions[n-1]-duration*.8) > alignmentWindow {
-				t.Fatal("late sample missing", positions)
+				for i, p := range positions {
+					if p < 0 || p+window > duration || (i > 0 && p <= positions[i-1]) {
+						t.Fatal(positions)
+					}
+				}
+				if n > 1 && positions[n-1]+.001 < min(duration*.8, duration-window)-window {
+					t.Fatal("late sample missing", positions)
+				}
 			}
 		}
 	}
 	s := lifecycleServer(t)
 	cfg = s.Config.Get()
 	cfg.AlignmentSamples = 5
+	cfg.AlignmentSampleSeconds = 24
 	cfg.StartImmediately = false
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err := OpenConfig(s.Config.path)
-	if err != nil || fresh.Get().AlignmentSamples != 5 || fresh.Get().StartImmediately {
+	if err != nil || fresh.Get().AlignmentSamples != 5 || fresh.Get().AlignmentSampleSeconds != 24 || fresh.Get().StartImmediately {
 		t.Fatal("settings did not persist", err)
 	}
 	for _, invalid := range []int{0, 13} {
 		cfg.AlignmentSamples = invalid
 		if cfg.Validate() == nil {
 			t.Fatal("invalid count accepted")
+		}
+	}
+	cfg.AlignmentSamples = 5
+	for _, invalid := range []int{4, 41} {
+		cfg.AlignmentSampleSeconds = invalid
+		if cfg.Validate() == nil {
+			t.Fatal("invalid sample length accepted", invalid)
 		}
 	}
 }
@@ -775,7 +784,7 @@ func TestImmediateFileAlignmentUsesSeekedPlaybackPosition(t *testing.T) {
 	}
 	result := make(chan sample, 1)
 	go func() {
-		at, end, sequence, err := v.playbackSample(ctx, 0, 8, 3600, -1, 0)
+		at, end, sequence, err := v.playbackSample(ctx, 0, 10, 3600, 5, 0, -1, 0)
 		if err == nil {
 			result <- sample{at, end, sequence}
 		}
@@ -788,29 +797,29 @@ func TestImmediateFileAlignmentUsesSeekedPlaybackPosition(t *testing.T) {
 	default:
 	}
 	v.videoSegmentRequested(100) // seek to 600 seconds
-	for n := 100; n < 105; n++ {
+	for n := 100; n < 102; n++ {
 		v.videoSegmentRequested(n)
 		v.videoSegmentCompleted(n)
 	}
 	select {
 	case got := <-result:
-		t.Fatalf("aligned before the 32-second source window was downloaded at %.1f", got.at)
+		t.Fatalf("aligned before the five-second source clip was downloaded at %.1f", got.at)
 	default:
 	}
-	v.videoSegmentRequested(105)
-	v.videoSegmentCompleted(105)
+	v.videoSegmentRequested(102)
+	v.videoSegmentCompleted(102)
 	select {
 	case got := <-result:
-		if got.at != 608 {
+		if got.at != 610 {
 			t.Fatalf("aligned at initial probe rather than seeked playback: %.1f", got.at)
 		}
-		v.videoSegmentRequested(106)
-		v.videoSegmentCompleted(106)
-		retry, _, _, err := v.playbackSample(ctx, 0, 8, 3600, got.end, got.sequence)
-		if err != nil || retry != 618 {
+		v.videoSegmentRequested(103)
+		v.videoSegmentCompleted(103)
+		retry, _, _, err := v.playbackSample(ctx, 0, 10, 3600, 5, 0, got.end, got.sequence)
+		if err != nil || retry != 619 {
 			t.Fatalf("cache retry did not follow new video: %.1f, %v", retry, err)
 		}
-		late := alignmentPositionsFrom(3600, 3, 3200)
+		late := alignmentPositionsFrom(3600, 3, 3200, 16)
 		if late[0] != 3200 || late[1] <= late[0] || late[2] <= late[1] {
 			t.Fatalf("later samples moved behind playback: %v", late)
 		}

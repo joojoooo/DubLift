@@ -52,7 +52,9 @@
             <label>Parallel source checks<input id="wizard-parallelism" type="number" min="1" max="16" required /></label>
             <label>Source check timeout (seconds)<input id="wizard-timeout" type="number" min="1" max="120" required /></label>
             <label>Alignment samples<input id="wizard-samples" type="number" min="1" max="12" required /></label>
+            <label>Sample length (seconds)<input id="wizard-sample-seconds" type="number" min="5" max="40" required /></label>
           </div>
+          <p class="help">One check is fastest. More checks compare audio at different points in the movie. A longer sample may match more reliably but takes more data.</p>
         </div>
         <div class="wizard-actions">
           <button id="wizard-back" class="button secondary" type="button" hidden>Back</button>
@@ -261,6 +263,15 @@
                 /><output id="confidence-value">68%</output>
               </div></label
             ><label
+              >Sample length (seconds)<input
+                id="alignment-sample-seconds"
+                type="number"
+                min="5"
+                max="40"
+                required
+            /></label>
+            <p class="help">Length of the short English clip taken from the upstream video. DubLift looks for that clip in a longer Vixsrc audio section. A longer clip can improve matching but needs more upstream video data. Default: 5 seconds.</p>
+            <label
               >Search radius (seconds)<input
                 id="search-radius"
                 type="number"
@@ -268,8 +279,9 @@
                 max="180"
                 required
             /></label>
+            <p class="help">How far earlier or later the matching Vixsrc audio may be. With a 5-second sample and radius 10, DubLift searches about 25 seconds of Vixsrc audio for a 5-second upstream clip. A larger radius uses more Vixsrc audio; it does not lengthen the upstream clip. With immediate MKV/MP4 playback, DubLift waits until the player has downloaded the part containing that clip, about 15 seconds from the chosen playback position by default.</p>
             <label>Alignment samples<input id="alignment-samples" type="number" min="1" max="12" required /></label>
-            <p class="help">Samples run from near the beginning through later playback. One sample is fastest; finite direct-audio mode needs at least two samples to check the runtime.</p>
+            <p class="help">How many places in the movie DubLift checks. One finishes sooner. Two or more also check later in the movie, helping catch audio that goes out of sync. DubLift needs at least two matching checks before it can send Italian audio to the player unchanged.</p>
             <label class="switch-row"><input id="start-immediately" type="checkbox"><span><strong>Start immediately with offset 0</strong><small>Play as soon as essential source preparation finishes. For MKV/MP4, align near the requested video position after enough video data has downloaded. Apply the calculated offset to new audio segments when analysis finishes. Off: wait for the first sample starting at 00:00, then play while remaining samples run.</small></span></label>
             <details>
               <summary>Advanced settings</summary>

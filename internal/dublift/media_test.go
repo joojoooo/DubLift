@@ -226,7 +226,6 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	settings.PublicURL = "" // Test clients use the httptest listener, not the host LAN address.
 	settings.VixBaseURL = origin.URL
 	settings.Addons = []Addon{{"Fixture", origin.URL + "/manifest.json"}}
-	settings.SearchRadius = 8
 	if e = cfg.Save(settings); e != nil {
 		t.Fatal(e)
 	}
@@ -410,7 +409,7 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	t.Run("MKV_first_sample_from_zero_before_playback", func(t *testing.T) {
 		gated := cfg.Get()
 		gated.StartImmediately = false
-		gated.AlignmentSamples = 2 // force a fresh run after the immediate-start case
+		gated.AlignmentSampleSeconds = 8 // changing length must start a fresh run
 		if err := cfg.Save(gated); err != nil {
 			t.Fatal(err)
 		}
@@ -430,8 +429,8 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 		id := strings.Split(strings.TrimPrefix(fresh.Streams[0].URL, local.URL+"/media/"), "/")[0]
 		session := server.getSession(id)
 		alignment := server.Alignments.Get(session.Key)
-		if len(alignment.AutoSamples) == 0 || math.Abs(alignment.AutoSamples[0].VixTime-13) > .01 {
-			t.Fatalf("first source sample did not start at 00:00: %+v", alignment)
+		if len(alignment.AutoSamples) == 0 || alignment.AutoWindow != 8 || math.Abs(alignment.AutoSamples[0].SourceTime-14) > .15 {
+			t.Fatalf("first source sample did not start at 00:00: %+v; errors: %+v", alignment, session.Errors)
 		}
 	})
 	var series struct {

@@ -544,10 +544,16 @@ func (e *Engine) ProbeAt(ctx context.Context, a *Asset, at float64) (Probe, erro
 	return p, err
 }
 func (e *Engine) PCM(ctx context.Context, t Track, start, duration float64) ([]int16, error) {
+	return e.pcm(ctx, t, start, duration, false)
+}
+func (e *Engine) PCMFromZero(ctx context.Context, t Track, start, duration float64) ([]int16, error) {
+	return e.pcm(ctx, t, start, duration, true)
+}
+func (e *Engine) pcm(ctx context.Context, t Track, start, duration float64, fromZero bool) ([]int16, error) {
 	if duration <= 0 || duration > 400 {
 		return nil, errors.New("invalid analysis window")
 	}
-	key := fmt.Sprintf("pcm:%s:%s:%.3f:%.3f", t.Asset.ID, t.Selector, start, duration)
+	key := fmt.Sprintf("pcm:%s:%s:%.3f:%.3f:%t", t.Asset.ID, t.Selector, start, duration, fromZero)
 	b, err := e.Cache.Get(ctx, key, func() ([]byte, error) {
 		fileCtx := ctx
 		var miss *atomic.Bool
@@ -555,19 +561,27 @@ func (e *Engine) PCM(ctx context.Context, t Track, start, duration float64) ([]i
 			miss = &atomic.Bool{}
 			fileCtx = context.WithValue(ctx, cacheMissKey{}, miss)
 		}
-		u, skip, cleanup, err := e.job(fileCtx, t.Asset, start, duration+1)
+		inputStart, inputDuration := start, duration+1
+		if fromZero {
+			inputStart, inputDuration = 0, start+duration+1
+		}
+		u, skip, cleanup, err := e.job(fileCtx, t.Asset, inputStart, inputDuration)
 		if err != nil {
 			return nil, err
 		}
 		defer cleanup()
 		args := []string{"-nostdin", "-v", "error", "-threads", "1"}
-		if t.Asset.File != nil {
+		if t.Asset.File != nil && !fromZero {
 			args = append(args, "-ss", decimal(skip))
 		}
 		args = append(args, "-discard:v", "all")
 		args = append(args, ffInput(u)...)
-		if t.Asset.HLS != nil {
-			args = append(args, "-ss", decimal(skip))
+		if t.Asset.HLS != nil || fromZero {
+			seek := skip
+			if fromZero {
+				seek = start
+			}
+			args = append(args, "-ss", decimal(seek))
 		}
 		args = append(args, "-t", decimal(duration), "-map", t.Selector, "-vn", "-sn", "-ac", "1", "-ar", strconv.Itoa(pcmRate), "-f", "s16le", "pipe:1")
 		out, err := e.run(fileCtx, e.Config.Get().FFmpeg, args, int(math.Ceil(duration*pcmRate*2))+65536)

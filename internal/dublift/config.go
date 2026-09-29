@@ -28,6 +28,7 @@ type Settings struct {
 	DirectTolerance                *float64 `json:"directTolerance"`
 	MinConfidence                  float64  `json:"minConfidence"`
 	SearchRadius                   float64  `json:"searchRadius"`
+	AlignmentSampleSeconds         int      `json:"alignmentSampleSeconds"`
 	AlignmentSamples               int      `json:"alignmentSamples"`
 	MaxItalianResults              int      `json:"maxItalianResults"`
 	MaxItalianResultsPerStreamType int      `json:"maxItalianResultsPerStreamType"`
@@ -46,7 +47,7 @@ type Settings struct {
 
 func DefaultSettings() Settings {
 	tolerance := .125
-	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), DirectPlayback: true, DirectTolerance: &tolerance, MinConfidence: .68, SearchRadius: 8, AlignmentSamples: 1, MaxItalianResults: 3, MaxItalianResultsPerStreamType: 2, SourceCheckTimeoutSeconds: 20, SourceCheckParallelism: 3, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
+	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), DirectPlayback: true, DirectTolerance: &tolerance, MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, MaxItalianResults: 3, MaxItalianResultsPerStreamType: 2, SourceCheckTimeoutSeconds: 20, SourceCheckParallelism: 3, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
 }
 
 func defaultPublicURL() string {
@@ -89,6 +90,9 @@ func httpURL(raw string) (*url.URL, error) {
 }
 
 func (c Settings) Validate() error {
+	if c.AlignmentSampleSeconds < 5 || c.AlignmentSampleSeconds > 40 {
+		return errors.New("alignment sample length must be 5–40 seconds")
+	}
 	if c.AlignmentSamples < 1 || c.AlignmentSamples > 12 {
 		return errors.New("alignment samples must be between 1 and 12")
 	}

@@ -222,19 +222,53 @@ func signalPCM(seconds int) []int16 {
 func TestChromaprintSpectralAlignment(t *testing.T) {
 	hay := signalPCM(60)
 	start := int(math.Round(11.375 * pcmRate))
-	needle := append([]int16{}, hay[start:start+24*pcmRate]...)
-	for i := range needle {
-		needle[i] = int16(float64(needle[i]) * .67)
+	for _, seconds := range []int{5, 24} {
+		needle := append([]int16{}, hay[start:start+seconds*pcmRate]...)
+		for i := range needle {
+			needle[i] = int16(float64(needle[i]) * .67)
+		}
+		lag, confidence, e := MatchPCM(context.Background(), needle, hay)
+		if e != nil {
+			t.Fatal(seconds, e)
+		}
+		if math.Abs(lag-11.375) > .035 || confidence < .68 {
+			t.Fatalf("%ds: lag=%.6f confidence=%.3f", seconds, lag, confidence)
+		}
 	}
-	lag, confidence, e := MatchPCM(context.Background(), needle, hay)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if math.Abs(lag-11.375) > .035 || confidence < .68 {
-		t.Fatalf("lag=%.6f confidence=%.3f", lag, confidence)
-	}
-	if _, _, e = MatchPCM(context.Background(), make([]int16, 24*pcmRate), hay); e == nil {
+	if _, _, e := MatchPCM(context.Background(), make([]int16, 5*pcmRate), hay); e == nil {
 		t.Fatal("silence matched")
+	}
+}
+func TestFindAnchorSearchesLongVixClipAgainstShortSourceClip(t *testing.T) {
+	vixPCM := signalPCM(60)
+	shift := int(2.4 * pcmRate)
+	for _, offset := range []float64{2.4, -2.4} {
+		sourcePCM := make([]int16, len(vixPCM))
+		if offset > 0 {
+			copy(sourcePCM[shift:], vixPCM)
+		} else {
+			copy(sourcePCM, vixPCM[shift:])
+		}
+		var sourceAt, sourceLength, vixAt, vixLength float64
+		extract := func(pcm []int16, at, length float64) []int16 {
+			start, end := int(math.Round(at*pcmRate)), int(math.Round((at+length)*pcmRate))
+			return pcm[start:end]
+		}
+		source := func(_ context.Context, at, length float64) ([]int16, error) {
+			sourceAt, sourceLength = at, length
+			return extract(sourcePCM, at, length), nil
+		}
+		vix := func(_ context.Context, at, length float64) ([]int16, error) {
+			vixAt, vixLength = at, length
+			return extract(vixPCM, at, length), nil
+		}
+		anchor, err := FindAnchor(context.Background(), source, vix, 10, 0, 10, 60, 5)
+		if err != nil || math.Abs(anchor.Offset-offset) > .05 || anchor.Confidence < .68 {
+			t.Fatalf("offset %.1f: anchor %+v, error %v", offset, anchor, err)
+		}
+		if sourceAt != 10 || sourceLength != 5 || vixAt != 0 || vixLength != 25 {
+			t.Fatalf("wrong extraction windows: source %.1f+%.1f, Vixsrc %.1f+%.1f", sourceAt, sourceLength, vixAt, vixLength)
+		}
 	}
 }
 func TestCacheBoundAndSingleFlight(t *testing.T) {
@@ -289,6 +323,7 @@ func TestSourceCheckSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	delete(legacy, "maxItalianResultsPerStreamType")
+	delete(legacy, "alignmentSampleSeconds")
 	b, err = json.Marshal(legacy)
 	if err != nil {
 		t.Fatal(err)
@@ -297,8 +332,8 @@ func TestSourceCheckSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err = OpenConfig(path)
-	if err != nil || c.Get().MaxItalianResultsPerStreamType != 2 {
-		t.Fatalf("existing config did not receive per-type default: %v", err)
+	if err != nil || c.Get().MaxItalianResultsPerStreamType != 2 || c.Get().AlignmentSampleSeconds != 5 {
+		t.Fatalf("existing config did not receive new defaults: %v", err)
 	}
 	settings.MaxItalianResults = 0
 	if settings.Validate() == nil {

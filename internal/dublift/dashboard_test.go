@@ -86,10 +86,11 @@ func TestDashboardSetupAndAddonName(t *testing.T) {
 
 	cfg := c.Get()
 	cfg.Addons = []Addon{{Name: "User supplied name", ManifestURL: url}}
+	cfg.AlignmentSampleSeconds = 24
 	response = post("/api/settings", cfg)
 	response.Body.Close()
-	if c.Get().Addons[0].Name != "Fixture Addon" {
-		t.Fatal("settings did not use the upstream name")
+	if c.Get().Addons[0].Name != "Fixture Addon" || c.Get().AlignmentSampleSeconds != 24 {
+		t.Fatal("settings did not save the upstream name and sample length")
 	}
 	response = post("/api/setup-complete", struct{}{})
 	response.Body.Close()

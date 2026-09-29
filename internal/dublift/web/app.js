@@ -214,6 +214,7 @@ const fields = {
   publicURL: "public-url",
   listen: "listen",
   searchRadius: "search-radius",
+  alignmentSampleSeconds: "alignment-sample-seconds",
   alignmentSamples: "alignment-samples",
   maxItalianResults: "max-italian-results",
   maxItalianResultsPerStreamType: "max-italian-results-per-stream-type",
@@ -250,6 +251,7 @@ async function loadSettings() {
   $("wizard-parallelism").value = settings.sourceCheckParallelism;
   $("wizard-timeout").value = settings.sourceCheckTimeoutSeconds;
   $("wizard-samples").value = settings.alignmentSamples;
+  $("wizard-sample-seconds").value = settings.alignmentSampleSeconds;
 }
 function confidenceLabel() {
   $("confidence-value").textContent =
@@ -274,7 +276,7 @@ $("settings-form").onsubmit = async (e) => {
   e.preventDefault();
   const cfg = { ...settings };
   for (const [key, id] of Object.entries(fields))
-    cfg[key] = ["searchRadius", "alignmentSamples", "maxItalianResults", "maxItalianResultsPerStreamType", "sourceCheckTimeoutSeconds", "sourceCheckParallelism", "cacheMB"].includes(key)
+    cfg[key] = ["searchRadius", "alignmentSampleSeconds", "alignmentSamples", "maxItalianResults", "maxItalianResultsPerStreamType", "sourceCheckTimeoutSeconds", "sourceCheckParallelism", "cacheMB"].includes(key)
       ? Number($(id).value)
       : $(id).value.trim();
   cfg.bypassSourceChecks = $("bypass-source-checks").checked;
@@ -367,6 +369,7 @@ $("wizard-next").onclick = async () => {
         sourceCheckParallelism: Number($("wizard-parallelism").value),
         sourceCheckTimeoutSeconds: Number($("wizard-timeout").value),
         alignmentSamples: Number($("wizard-samples").value),
+        alignmentSampleSeconds: Number($("wizard-sample-seconds").value),
       });
       await finishWizard();
     }

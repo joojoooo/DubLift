@@ -17,7 +17,6 @@ import (
 )
 
 const pcmRate = 11025
-const alignmentWindow = 16.0
 
 type Anchor struct {
 	VixTime    float64 `json:"vixTime"`
@@ -34,6 +33,8 @@ type Boundary struct {
 type Alignment struct {
 	AutoSamples   []Anchor   `json:"automaticSamples"`
 	AutoExpected  int        `json:"automaticExpected"`
+	AutoWindow    int        `json:"automaticSampleSeconds"`
+	AutoRadius    float64    `json:"automaticSearchRadius"`
 	AutoComplete  bool       `json:"automaticComplete"`
 	Anchors       []Anchor   `json:"anchors"`
 	Boundaries    []Boundary `json:"boundaries"`
@@ -199,7 +200,7 @@ type candidate struct {
 }
 
 func fingerprints(needle, hay []uint32) []candidate {
-	if len(needle) < 30 || len(hay) < len(needle) {
+	if len(needle) < 8 || len(hay) < len(needle) {
 		return nil
 	}
 	varied := 0
@@ -386,19 +387,20 @@ func MatchPCM(ctx context.Context, needle, hay []int16) (lag, confidence float64
 
 type PCMExtractor func(context.Context, float64, float64) ([]int16, error)
 
-func FindAnchor(ctx context.Context, source, vix PCMExtractor, vixAt, expectedOffset, radius, duration float64) (Anchor, error) {
-	const window = alignmentWindow
-	vixAt = max(0, min(vixAt, duration-window))
-	sourceAt := max(0, vixAt+expectedOffset-radius)
-	sourceDuration := min(window+2*radius, duration-sourceAt)
-	if sourceDuration < window {
+func FindAnchor(ctx context.Context, source, vix PCMExtractor, vixAt, expectedOffset, radius, duration, window float64) (Anchor, error) {
+	// The source file is expensive because its audio is interleaved with video.
+	// Match its short clip inside a longer Vixsrc-only audio search window.
+	sourceAt := max(0, min(vixAt+expectedOffset, duration-window))
+	vixSearchAt := max(0, sourceAt-expectedOffset-radius)
+	vixDuration := min(window+2*radius, duration-vixSearchAt)
+	if vixDuration < window {
 		return Anchor{}, errors.New("not enough English audio at this position")
 	}
-	needle, e := vix(ctx, vixAt, window)
+	hay, e := vix(ctx, vixSearchAt, vixDuration)
 	if e != nil {
 		return Anchor{}, e
 	}
-	hay, e := source(ctx, sourceAt, sourceDuration)
+	needle, e := source(ctx, sourceAt, window)
 	if e != nil {
 		return Anchor{}, e
 	}
@@ -406,5 +408,6 @@ func FindAnchor(ctx context.Context, source, vix PCMExtractor, vixAt, expectedOf
 	if e != nil {
 		return Anchor{}, e
 	}
-	return Anchor{VixTime: vixAt + window/2, SourceTime: sourceAt + lag + window/2, Offset: sourceAt + lag - vixAt, Confidence: confidence}, nil
+	vixMatchAt := vixSearchAt + lag
+	return Anchor{VixTime: vixMatchAt + window/2, SourceTime: sourceAt + window/2, Offset: sourceAt - vixMatchAt, Confidence: confidence}, nil
 }
