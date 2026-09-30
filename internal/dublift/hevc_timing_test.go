@@ -87,8 +87,16 @@ func TestHEVCPacketTiming(t *testing.T) {
 		if len(segments) != len(bounds)-1 {
 			t.Fatal("remux omitted a video segment")
 		}
+		windowPackets := map[string]bool{}
 		for i, data := range segments {
 			check(data)
+			path := filepath.Join(dir, "window-packets.mp4")
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range packets(path) {
+				windowPackets[p.Hash] = true
+			}
 			_, media, err := splitFMP4(data)
 			if err != nil {
 				t.Fatal(err)
@@ -99,6 +107,11 @@ func TestHEVCPacketTiming(t *testing.T) {
 			}
 			if len(parts) != 1 || parts[0].SequenceNumber != uint32(n+i+1) {
 				t.Fatalf("segment %d lost its absolute fragment sequence", n+i)
+			}
+		}
+		for hash, pts := range original {
+			if pts >= bounds[0]+.5 && pts < bounds[len(bounds)-1]-.5 && !windowPackets[hash] {
+				t.Fatalf("remux omitted source frame at %.3fs inside %.3f–%.3fs", pts, bounds[0], bounds[len(bounds)-1])
 			}
 		}
 	}

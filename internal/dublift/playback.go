@@ -217,6 +217,9 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			kind = "text/vtt"
 		} else {
 			s.prefetchAudio(v, *track, n)
+			if r.Method == http.MethodGet && r.Header.Get("Range") == "" {
+				data = v.continuousAudioTS(track.ID, n, data)
+			}
 		}
 		serveBytes(w, r, kind, data)
 	default:

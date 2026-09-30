@@ -523,7 +523,19 @@ func (e *Engine) run(ctx context.Context, binary string, args []string, limit in
 	return out.Bytes(), nil
 }
 
+func (e *Engine) runInput(ctx context.Context, binary string, args []string, input []byte, limit int) ([]byte, error) {
+	out := &limitedBuffer{limit: limit}
+	if err := e.runOutputInput(ctx, binary, args, bytes.NewReader(input), out); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
 func (e *Engine) runOutput(ctx context.Context, binary string, args []string, out io.Writer, packetInfo ...io.Writer) error {
+	return e.runOutputInput(ctx, binary, args, nil, out, packetInfo...)
+}
+
+func (e *Engine) runOutputInput(ctx context.Context, binary string, args []string, input io.Reader, out io.Writer, packetInfo ...io.Writer) error {
 	if background, _ := ctx.Value(backgroundWorkKey{}).(bool); background {
 		select {
 		case e.backgroundSlots <- struct{}{}:
@@ -539,6 +551,7 @@ func (e *Engine) runOutput(ctx context.Context, binary string, args []string, ou
 		return ctx.Err()
 	}
 	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Stdin = input
 	cmd.WaitDelay = 2 * time.Second
 	stderr := &limitedBuffer{limit: 64 << 10}
 	cmd.Stdout = out
@@ -730,7 +743,24 @@ func (e *Engine) Audio(ctx context.Context, t Track, start, duration, offset, cl
 	}
 	defer cleanup()
 	args = append(args, "-t", decimal(duration), "-vn", "-sn", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000", "-output_ts_offset", decimal(start+clockBase), "-mpegts_copyts", "1", "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", "pipe:1")
-	return e.run(ctx, e.Config.Get().FFmpeg, args, 4<<20)
+	encoded, err := e.run(ctx, e.Config.Get().FFmpeg, args, 4<<20)
+	if err != nil {
+		return nil, err
+	}
+	// Each fresh AAC encoder emits one priming frame before the requested
+	// start and flushes padding after its end. If those frames are carried into
+	// the next HLS segment, packet timestamps run backwards by about 40 ms at
+	// every boundary. Copy only complete encoded frames inside this window;
+	// this keeps the AAC data without another lossy encode.
+	const frame = 1024.0 / 48000
+	if duration <= 2*frame {
+		return encoded, nil
+	}
+	clockStart := start + clockBase
+	// A standalone seek starts with a signaled counter reset. The HTTP handler
+	// clears that mark and carries counters forward for adjacent segments.
+	trim := []string{"-nostdin", "-v", "error", "-i", "pipe:0", "-ss", decimal(clockStart), "-t", decimal(duration - frame), "-map", "0:a:0", "-c", "copy", "-copyts", "-mpegts_copyts", "1", "-output_ts_offset", decimal(clockStart), "-mpegts_flags", "+initial_discontinuity", "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", "pipe:1"}
+	return e.runInput(ctx, e.Config.Get().FFmpeg, trim, encoded, 4<<20)
 }
 func (e *Engine) Video(ctx context.Context, a *Asset, start, duration float64) ([]byte, error) {
 	finish := e.foregroundFile(a)

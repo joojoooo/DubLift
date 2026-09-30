@@ -31,6 +31,41 @@ func ffmpegAvailable(t *testing.T) {
 		}
 	}
 }
+
+func assertContinuousTransport(t *testing.T, segments ...[]byte) {
+	t.Helper()
+	last := make(map[uint16]byte)
+	for segmentIndex, data := range segments {
+		if len(data)%188 != 0 {
+			t.Fatalf("audio segment %d is not packet aligned", segmentIndex)
+		}
+		for i := 0; i < len(data); i += 188 {
+			packet := data[i : i+188]
+			if packet[0] != 0x47 {
+				t.Fatalf("audio segment %d has bad transport sync", segmentIndex)
+			}
+			pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+			control := packet[3] >> 4 & 3
+			if pid == 0x1fff || control == 0 {
+				continue
+			}
+			counter := packet[3] & 15
+			if prior, ok := last[pid]; ok {
+				expected := prior
+				if control&1 != 0 {
+					expected++
+				}
+				if counter != expected&15 {
+					t.Fatalf("audio PID %d counter broke at segment %d packet %d: got %d, want %d", pid, segmentIndex, i/188, counter, expected&15)
+				}
+				if segmentIndex > 0 && control&2 != 0 && packet[4] > 0 && packet[5]&0x80 != 0 {
+					t.Fatalf("audio PID %d signaled a discontinuity in segment %d", pid, segmentIndex)
+				}
+			}
+			last[pid] = counter
+		}
+	}
+}
 func command(t *testing.T, name string, args ...string) []byte {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -395,11 +430,25 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 					break
 				}
 			}
+			if zero := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/0.ts"); len(zero) == 0 {
+				t.Fatal("empty startup audio")
+			}
 			audioURL := local.URL + "/media/" + id + "/track/" + it.ID + "/" + strconv.Itoa(n) + ".ts"
 			audio := getBytes(t, audioURL)
+			nextAudio := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+1)+".ts")
+			assertContinuousTransport(t, audio, nextAudio)
+			seekAudio := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+4)+".ts")
+			assertInitialTransportReset(t, seekAudio)
+			assertContinuousTransport(t, seekAudio, getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+5)+".ts"))
 			path := filepath.Join(dir, "audio-"+id+".ts")
 			os.WriteFile(path, audio, 0600)
 			lo, hi := packetTimes(t, path, "a:0")
+			nextPath := filepath.Join(dir, "audio-next-"+id+".ts")
+			os.WriteFile(nextPath, nextAudio, 0600)
+			nextLo, _ := packetTimes(t, nextPath, "a:0")
+			if gap := nextLo - hi; gap < -.002 || gap > .05 {
+				t.Errorf("adjacent AAC segments have a %.3f second gap/overlap", gap)
+			}
 			want := session.boundaries[n] + session.clockBase
 			t.Logf("audio clock %.3f..%.3f expected %.3f", lo, hi, want)
 			if math.Abs(lo-want) > .04 {
@@ -455,6 +504,24 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 				content, e := server.Engine.Audio(context.Background(), it, 42, 24, 2.4, 1)
 				if e != nil {
 					t.Fatal(e)
+				}
+				seenPID := map[uint16]bool{}
+				for off := 0; off+188 <= len(content); off += 188 {
+					packet := content[off : off+188]
+					if packet[0] != 0x47 {
+						t.Fatal("generated audio lost MPEG-TS packet alignment")
+					}
+					pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+					if seenPID[pid] {
+						continue
+					}
+					seenPID[pid] = true
+					if packet[3]&0x20 == 0 || packet[4] == 0 || packet[5]&0x80 == 0 {
+						t.Fatalf("first MPEG-TS packet for PID %d does not mark its counter reset", pid)
+					}
+				}
+				if len(seenPID) < 3 {
+					t.Fatalf("incomplete generated audio transport: %d PIDs", len(seenPID))
 				}
 				encoded := filepath.Join(dir, "content.ts")
 				os.WriteFile(encoded, content, 0600)
@@ -554,6 +621,25 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 403 {
 		t.Fatal("private settings exposed cross-origin")
+	}
+}
+
+func assertInitialTransportReset(t *testing.T, data []byte) {
+	t.Helper()
+	seen := make(map[uint16]bool)
+	for i := 0; i+188 <= len(data); i += 188 {
+		packet := data[i : i+188]
+		pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+		if pid == 0x1fff || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		if packet[3]&0x20 == 0 || packet[4] == 0 || packet[5]&0x80 == 0 {
+			t.Fatalf("audio PID %d did not mark a seek discontinuity", pid)
+		}
+	}
+	if len(seen) < 3 {
+		t.Fatalf("incomplete transport after seek: %d PIDs", len(seen))
 	}
 }
 func getJSON(t *testing.T, url string, v any) {
