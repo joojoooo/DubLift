@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluenviron/gohlslib/v2/pkg/playlist"
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4/seekablebuffer"
 )
@@ -478,8 +479,24 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			if resp.StatusCode != 200 {
 				t.Fatalf("master: %s", master)
 			}
-			if !strings.Contains(string(master), `NAME="Italiano · Vixsrc",AUTOSELECT=YES,DEFAULT=YES`) {
+			if !strings.Contains(string(master), `NAME="Italian · Vixsrc",AUTOSELECT=YES,DEFAULT=YES`) {
 				t.Fatalf("Italian not preferred:\n%s", master)
+			}
+			var parsed playlist.Multivariant
+			if err := parsed.Unmarshal(master); err != nil {
+				t.Fatal(err)
+			}
+			if len(parsed.Renditions) == 0 {
+				t.Fatalf("master has no renditions:\n%s", master)
+			}
+			last := parsed.Renditions[len(parsed.Renditions)-1]
+			if last.Language != "it" || !last.Default || last.Type != playlist.MultivariantRenditionTypeAudio {
+				t.Fatalf("Italian audio is not the last and default rendition:\n%s", master)
+			}
+			for _, rendition := range parsed.Renditions[:len(parsed.Renditions)-1] {
+				if rendition.Type == playlist.MultivariantRenditionTypeAudio && (rendition.Default || rendition.Autoselect) {
+					t.Fatalf("another audio rendition can be chosen automatically:\n%s", master)
+				}
 			}
 			id := strings.Split(strings.TrimPrefix(stream.URL, local.URL+"/media/"), "/")[0]
 			session := server.getSession(id)
@@ -672,7 +689,7 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 		}
 		getJSON(t, local.URL+"/stream/movie/tmdb:603.json", &fresh)
 		master := getBytes(t, fresh.Streams[0].URL)
-		if !bytes.Contains(master, []byte("Italiano · Vixsrc")) {
+		if !bytes.Contains(master, []byte("Italian · Vixsrc")) {
 			t.Fatal("Italian master missing")
 		}
 		id := strings.Split(strings.TrimPrefix(fresh.Streams[0].URL, local.URL+"/media/"), "/")[0]

@@ -341,8 +341,22 @@ func (s *Server) master(v *Session) ([]byte, error) {
 			}
 		}
 	}
-	names := map[string]int{}
+	// VLC 3 chooses the last audio rendition even when another is marked
+	// DEFAULT. Keep the selected Italian rendition last for VLC while retaining
+	// the HLS default flag for players that honor it.
+	ordered := make([]Track, 0, len(v.tracks))
 	for _, t := range v.tracks {
+		if t.ID != defaultID {
+			ordered = append(ordered, t)
+		}
+	}
+	for _, t := range v.tracks {
+		if t.ID == defaultID {
+			ordered = append(ordered, t)
+		}
+	}
+	names := map[string]int{}
+	for _, t := range ordered {
 		uri := "track/" + t.ID + ".m3u8"
 		if delivery.Tracks[t.ID] {
 			uri = v.directURI(t.Asset)
@@ -363,7 +377,7 @@ func (s *Server) master(v *Session) ([]byte, error) {
 		if n := names[group+name]; n > 1 {
 			name += fmt.Sprintf(" (%d)", n)
 		}
-		m.Renditions = append(m.Renditions, &playlist.MultivariantRendition{Type: typ, GroupID: group, Name: name, Language: t.Lang, Autoselect: true, Default: t.ID == defaultID, URI: uriPointer})
+		m.Renditions = append(m.Renditions, &playlist.MultivariantRendition{Type: typ, GroupID: group, Name: name, Language: t.Lang, Autoselect: t.Subtitle || t.ID == defaultID, Default: t.ID == defaultID, URI: uriPointer})
 	}
 	if defaultID == "" {
 		variant.Audio = ""

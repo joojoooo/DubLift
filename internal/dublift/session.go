@@ -488,12 +488,10 @@ func (s *Server) vixTracks(ctx context.Context, v *Session, master *HLS) error {
 			if lang != "en" && lang != "it" {
 				continue
 			}
-			name := "Vixsrc English"
 			if lang == "it" {
-				name = "Italiano · Vixsrc"
 				italian = true
 			}
-			t := Track{ID: fmt.Sprintf("vix-%s-%d", lang, r.Index), Name: name, Lang: lang, Asset: asset, Selector: fmt.Sprintf("0:%d", r.Index)}
+			t := Track{ID: fmt.Sprintf("vix-%s-%d", lang, r.Index), Name: vixTrackName(lang), Lang: lang, Asset: asset, Selector: fmt.Sprintf("0:%d", r.Index)}
 			v.tracks = append(v.tracks, t)
 			if lang == "en" {
 				cp := t
@@ -540,11 +538,7 @@ func (s *Server) vixTracks(ctx context.Context, v *Session, master *HLS) error {
 			v.note(fmt.Errorf("Vixsrc %s rendition: %w", lang, e))
 			continue
 		}
-		name := "Vixsrc English"
-		if lang == "it" {
-			name = "Italiano · Vixsrc"
-		}
-		t := Track{ID: fmt.Sprintf("vix-%s-%d", lang, i), Name: name, Lang: lang, Asset: a, Selector: "0:a:0", Subtitle: sub}
+		t := Track{ID: fmt.Sprintf("vix-%s-%d", lang, i), Name: vixTrackName(lang), Lang: lang, Asset: a, Selector: "0:a:0", Subtitle: sub}
 		v.tracks = append(v.tracks, t)
 		have[key] = true
 		if lang == "en" && !sub {
@@ -556,6 +550,12 @@ func (s *Server) vixTracks(ctx context.Context, v *Session, master *HLS) error {
 		return errors.New("Vixsrc has no Italian audio rendition")
 	}
 	return nil
+}
+func vixTrackName(lang string) string {
+	if lang == "it" {
+		return "Italian · Vixsrc"
+	}
+	return "English · Vixsrc"
 }
 func (s *Server) startAlignment(v *Session, from *float64) bool {
 	v.mu.Lock()
