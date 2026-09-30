@@ -66,6 +66,12 @@ func NewNetwork() *Network {
 		if _, e := httpURL(r.URL.String()); e != nil {
 			return e
 		}
+		// Go synthesizes a Referer for every redirect, including signed media
+		// URLs. Some CDNs reject that header. Preserve only a Referer that the
+		// upstream addon explicitly supplied with the original request.
+		if via[0].Header.Get("Referer") == "" {
+			r.Header.Del("Referer")
+		}
 		return nil
 	}}}
 }

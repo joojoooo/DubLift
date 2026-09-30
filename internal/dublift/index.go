@@ -361,6 +361,81 @@ type mp4Box struct {
 	data []byte
 }
 
+type mp4EditTimeline struct {
+	mediaStart int64
+	emptyStart float64
+	duration   float64
+}
+
+// A leading empty edit is commonly used to compensate for video composition
+// delay. It only shifts the start of one otherwise continuous media edit.
+func parseMP4EditTimeline(elst, mvhd []byte) (mp4EditTimeline, error) {
+	if len(elst) < 8 || (elst[0] != 0 && elst[0] != 1) {
+		return mp4EditTimeline{}, errors.New("invalid MP4 edit list")
+	}
+	count := binary.BigEndian.Uint32(elst[4:])
+	if count < 1 || count > 2 {
+		return mp4EditTimeline{}, errors.New("complex MP4 edit list is unsupported")
+	}
+	entrySize := 12
+	if elst[0] == 1 {
+		entrySize = 20
+	}
+	if uint64(count)*uint64(entrySize) > uint64(len(elst)-8) {
+		return mp4EditTimeline{}, errors.New("truncated MP4 edit list")
+	}
+	if len(mvhd) < 20 || (mvhd[0] != 0 && mvhd[0] != 1) {
+		return mp4EditTimeline{}, errors.New("MP4 movie timescale missing")
+	}
+	movieScaleOffset := 12
+	if mvhd[0] == 1 {
+		movieScaleOffset = 20
+		if len(mvhd) < 28 {
+			return mp4EditTimeline{}, errors.New("truncated MP4 movie header")
+		}
+	}
+	movieScale := binary.BigEndian.Uint32(mvhd[movieScaleOffset:])
+	if movieScale == 0 {
+		return mp4EditTimeline{}, errors.New("invalid MP4 movie timescale")
+	}
+	type edit struct {
+		duration uint64
+		media    int64
+	}
+	edits := make([]edit, count)
+	for i := range edits {
+		off := 8 + i*entrySize
+		var rate uint32
+		if elst[0] == 1 {
+			edits[i] = edit{binary.BigEndian.Uint64(elst[off:]), int64(binary.BigEndian.Uint64(elst[off+8:]))}
+			rate = binary.BigEndian.Uint32(elst[off+16:])
+		} else {
+			edits[i] = edit{uint64(binary.BigEndian.Uint32(elst[off:])), int64(int32(binary.BigEndian.Uint32(elst[off+4:])))}
+			rate = binary.BigEndian.Uint32(elst[off+8:])
+		}
+		if rate != 0x00010000 {
+			return mp4EditTimeline{}, errors.New("MP4 dwell or variable-rate edit is unsupported")
+		}
+	}
+	timeline := mp4EditTimeline{}
+	media := edits[0]
+	if count == 2 {
+		if edits[0].media != -1 || edits[0].duration == 0 {
+			return mp4EditTimeline{}, errors.New("complex MP4 edit list is unsupported")
+		}
+		timeline.emptyStart = float64(edits[0].duration) / float64(movieScale)
+		media = edits[1]
+	}
+	if media.media < 0 {
+		return mp4EditTimeline{}, errors.New("empty MP4 edit without media is unsupported")
+	}
+	timeline.mediaStart = media.media
+	if media.duration > 0 {
+		timeline.duration = timeline.emptyStart + float64(media.duration)/float64(movieScale)
+	}
+	return timeline, nil
+}
+
 func mp4Boxes(b []byte) ([]mp4Box, error) {
 	var out []mp4Box
 	for i := uint64(0); i < uint64(len(b)); {
@@ -490,25 +565,18 @@ func indexMP4(r *metadataReader) (FileIndex, error) {
 		if len(stts) < 8 {
 			return FileIndex{}, errors.New("fragmented MP4 without a seek table is unsupported")
 		}
-		// Multiple edits / dwell edits cannot be represented by a 1:1 source timeline.
+		// A leading empty edit followed by one media edit is still a single
+		// continuous source timeline, shifted by the empty edit's duration.
 		mediaShift := int64(0)
-		if elst := mp4Child(trak.data, "edts", "elst"); len(elst) >= 8 {
-			if binary.BigEndian.Uint32(elst[4:]) != 1 {
-				return FileIndex{}, errors.New("complex MP4 edit list is unsupported")
+		emptyStart := float64(0)
+		if elst := mp4Child(trak.data, "edts", "elst"); len(elst) > 0 {
+			timeline, err := parseMP4EditTimeline(elst, mp4Child(moov, "mvhd"))
+			if err != nil {
+				return FileIndex{}, err
 			}
-			if elst[0] == 1 {
-				if len(elst) < 28 {
-					return FileIndex{}, errors.New("truncated edit list")
-				}
-				mediaShift = int64(binary.BigEndian.Uint64(elst[16:]))
-			} else {
-				if len(elst) < 20 {
-					return FileIndex{}, errors.New("truncated edit list")
-				}
-				mediaShift = int64(int32(binary.BigEndian.Uint32(elst[12:])))
-			}
-			if mediaShift < 0 {
-				return FileIndex{}, errors.New("empty MP4 edit is unsupported")
+			mediaShift, emptyStart = timeline.mediaStart, timeline.emptyStart
+			if timeline.duration > 0 {
+				duration = timeline.duration
 			}
 		}
 		syncs := map[uint32]bool{}
@@ -565,7 +633,7 @@ func indexMP4(r *metadataReader) (FileIndex, error) {
 					}
 				}
 				if len(stss) == 0 || syncs[sample] {
-					t := float64(dts+shift-mediaShift) / float64(scale)
+					t := emptyStart + float64(dts+shift-mediaShift)/float64(scale)
 					if t >= 0 && (len(keys) == 0 || t >= keys[len(keys)-1]+.1) {
 						keys = append(keys, t)
 					}
