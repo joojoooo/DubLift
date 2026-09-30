@@ -119,8 +119,9 @@ type Session struct {
 	Errors              []string  `json:"errors"`
 	Position            float64   `json:"position"`
 	PositionAt          time.Time `json:"positionAt"`
-	Duration            float64   `json:"duration"`
-	ProxyReason         string    `json:"proxyReason"`
+	positionFromVideo   bool
+	Duration            float64 `json:"duration"`
+	ProxyReason         string  `json:"proxyReason"`
 	videoDownload       videoDownload
 	videoRedirected     atomic.Bool
 	Aligning            bool `json:"aligning"`
@@ -148,6 +149,12 @@ type Session struct {
 	videoHighest        int
 	videoSequence       uint64
 	videoReady          map[int]bool
+	videoPrefetch       segmentLookahead
+	videoWindow         *fileVideoWindow
+	videoInit           []byte
+	audioPrefetch       segmentLookahead
+	audioPrefetchID     string
+	audioTS             map[string]tsContinuityState
 	videoChanged        chan struct{}
 	startupZero         bool
 	listedAsset         *Asset
@@ -188,10 +195,22 @@ func (s *Session) note(err error) {
 }
 func (s *Session) position(t float64) {
 	s.mu.Lock()
+	s.positionFromVideo = true
 	s.Position = t
 	s.PositionAt = time.Now()
 	s.LastUsed = time.Now()
 	s.mu.Unlock()
+}
+func (s *Session) audioPosition(t float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Direct video never reaches DubLift, so audio remains the best available
+	// position there. Otherwise the video request is the authoritative area.
+	if !s.positionFromVideo {
+		s.Position = t
+		s.PositionAt = time.Now()
+	}
+	s.LastUsed = time.Now()
 }
 func (s *Session) state(status string) { s.mu.Lock(); s.Status = status; s.mu.Unlock() }
 func (s *Session) addResource(o Origin, position float64, track, force, video bool) string {
@@ -599,6 +618,7 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 			var anchor Anchor
 			var err error
 			lastEnd := -1
+			allowSourceRead := false
 			sourceExtractor := source
 			if from == nil && i == 0 && !cfg.StartImmediately {
 				// The gated first check primes the beginning of the source file
@@ -630,12 +650,17 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 				v.mu.Unlock()
 				ctx, cancel := context.WithTimeout(context.WithValue(v.ctx, backgroundWorkKey{}, true), 30*time.Second)
 				radius := cfg.SearchRadius
-				if immediateFile {
+				if immediateFile && !allowSourceRead {
 					ctx = context.WithValue(ctx, cacheOnlyFileKey{}, true)
 				}
 				anchor, err = FindAnchor(ctx, sourceExtractor, vix, at, current.At(at, cfg.MinConfidence), radius, duration, window)
 				cancel()
-				if immediateFile && errors.Is(err, errRangeNotCached) {
+				if immediateFile && !allowSourceRead && errors.Is(err, errRangeNotCached) {
+					// Video remuxes need not read every interleaved audio byte.
+					// Retry this completed playback area with a lower-priority
+					// origin read instead of waiting for another player request.
+					allowSourceRead = true
+					lastEnd = -1
 					continue
 				}
 				if immediateFile {
@@ -644,6 +669,7 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 					v.mu.Unlock()
 					if seeked {
 						lastEnd = -1
+						allowSourceRead = false
 						continue
 					}
 				}
@@ -738,9 +764,39 @@ func (v *Session) signalVideoLocked() {
 	close(v.videoChanged)
 	v.videoChanged = make(chan struct{})
 }
+
+func (v *Session) fileAudioSegmentRequested(index int) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.video == nil || v.video.File == nil || v.videoBase < 0 {
+		return
+	}
+	// VLC can probe the audio renditions at a seek target before requesting
+	// its video. Release the old area's bandwidth immediately. Use the start
+	// of the video run for backward seeks: normal audio may lag video fetches.
+	if index > v.videoHighest+3 || index+1 < v.videoBase {
+		v.videoPrefetch.stop()
+		if w := v.videoWindow; w != nil && (index < w.first || index >= w.end) {
+			w.superseded = true
+			w.cancel()
+		}
+	}
+}
+
 func (v *Session) videoSegmentRequested(index int) {
 	v.mu.Lock()
-	if v.videoBase < 0 || index < v.videoBase || index > v.videoHighest+1 {
+	seeked := v.videoBase >= 0 && (index > v.videoHighest+3 || index+1 < v.videoHighest)
+	if seeked {
+		// A distant seek makes the old lookahead irrelevant. Stop its origin
+		// read so the one prefetch worker can follow the new playback area.
+		v.videoPrefetch.stop()
+		v.audioPrefetch.stop()
+		if v.videoWindow != nil {
+			v.videoWindow.superseded = true
+			v.videoWindow.cancel()
+		}
+	}
+	if v.videoBase < 0 || seeked || index < v.videoBase || index > v.videoHighest+1 {
 		v.videoBase, v.videoHighest = index, index
 		v.videoSequence++
 	} else if index > v.videoHighest {

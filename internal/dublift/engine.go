@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,9 @@ type Asset struct {
 	HLS    *HLS
 	File   *RemoteFile
 	Index  FileIndex
+	// Some Matroska files have valid video cues but mark every packet non-key.
+	// Remember the stream-copy fallback after the default remux emits no packets.
+	unmarkedVideo atomic.Bool
 }
 
 func (a *Asset) Duration() float64 {
@@ -69,16 +73,17 @@ type Probe struct {
 	} `json:"format"`
 }
 type Engine struct {
-	Config          *Config
-	Net             *Network
-	Cache           *ByteCache
-	mu              sync.Mutex
-	jobs            map[string]*mediaJob
-	base            string
-	srv             *http.Server
-	slots           chan struct{}
-	backgroundSlots chan struct{}
-	foregroundFiles map[string]*fileActivity
+	Config           *Config
+	Net              *Network
+	Cache            *ByteCache
+	mu               sync.Mutex
+	jobs             map[string]*mediaJob
+	base             string
+	srv              *http.Server
+	slots            chan struct{}
+	backgroundSlots  chan struct{}
+	foregroundFiles  map[string]*fileActivity
+	rangeReadTimeout time.Duration
 }
 type fileActivity struct {
 	count int
@@ -134,6 +139,7 @@ type mediaJob struct {
 	playlist  string
 	resources map[string]Origin
 	keys      map[string]bool
+	video     bool
 	budget    atomic.Int64
 	ctx       context.Context
 }
@@ -193,6 +199,15 @@ func (e *Engine) OpenAsset(ctx context.Context, o Origin, hls bool) (*Asset, err
 			}
 			a.File = f
 			a.Index, err = BuildFileIndex(ctx, f)
+			if err == nil && a.Index.Container == "matroska" && len(f.tail) == 0 {
+				if pinCtx, cancel, ok := optionalPinContext(ctx); ok {
+					_ = f.pinTail(pinCtx)
+					cancel()
+				}
+			}
+			if err == nil && ctx.Err() != nil {
+				err = ctx.Err()
+			}
 			return a, err
 		}
 	}
@@ -208,8 +223,8 @@ func (e *Engine) OpenAsset(ctx context.Context, o Origin, hls bool) (*Asset, err
 	}
 	return a, nil
 }
-func (e *Engine) job(ctx context.Context, a *Asset, start, duration float64) (string, float64, func(), error) {
-	j := &mediaJob{asset: a, resources: map[string]Origin{}, keys: map[string]bool{}, ctx: ctx}
+func (e *Engine) job(ctx context.Context, a *Asset, start, duration float64, video bool) (string, float64, func(), error) {
+	j := &mediaJob{asset: a, resources: map[string]Origin{}, keys: map[string]bool{}, video: video, ctx: ctx}
 	j.budget.Store(256 << 20)
 	id := token()
 	root := e.base + "/" + id
@@ -335,6 +350,11 @@ func (e *Engine) copyBudget(w io.Writer, r io.Reader, j *mediaJob, limit int64) 
 	}
 }
 func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJob) {
+	// A demuxer closes its previous HTTP request when seeking. Cancel that
+	// origin read immediately, even while the extraction itself remains alive.
+	ctx, cancel := context.WithCancel(j.ctx)
+	stop := context.AfterFunc(r.Context(), cancel)
+	defer func() { stop(); cancel() }()
 	f := j.asset.File
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -353,11 +373,91 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", a, b, f.Size))
 	w.Header().Set("Content-Length", strconv.FormatInt(b-a+1, 10))
 	w.WriteHeader(206)
+	var streamed *http.Response
+	var next, streamedEnd int64
+	var stopMeter func()
+	var cancelStream context.CancelFunc
+	closeStream := func() {
+		if streamed != nil {
+			cancelStream()
+			streamed.Body.Close()
+			streamed = nil
+			stopMeter()
+		}
+	}
+	defer closeStream()
+	streamFile := func(start, length int64) ([]byte, error) {
+		data := make([]byte, length)
+		read := 0
+		var readErr error
+		for attempt := 0; attempt < 4; attempt++ {
+			offset := start + int64(read)
+			if streamed == nil || offset != next || start+length-1 > streamedEnd {
+				closeStream()
+				// FFmpeg often asks for an open-ended virtual file range. Keep
+				// each real origin request finite, but reuse its connection while
+				// delivering and caching successive 1 MiB chunks.
+				span := min(int64(32<<20), b-offset+1)
+				streamCtx, streamCancel := context.WithCancel(ctx)
+				resp, err := f.openRange(streamCtx, offset, span)
+				if err != nil {
+					streamCancel()
+					if ctx.Err() != nil {
+						return data[:read], ctx.Err()
+					}
+					readErr = err
+					continue
+				}
+				streamed, next, streamedEnd = resp, offset, offset+span-1
+				cancelStream = streamCancel
+				stopMeter = beginVideoDownload(ctx)
+			}
+			// Bound each missing cache chunk, not the full large response. If a
+			// CDN worker stalls mid-body, resume only the remaining bytes through
+			// the entry URL instead of feeding FFmpeg a truncated virtual file.
+			timeout := e.rangeReadTimeout
+			if timeout <= 0 {
+				timeout = 15 * time.Second
+			}
+			timer := time.AfterFunc(timeout, cancelStream)
+			n, err := io.ReadFull(io.TeeReader(streamed.Body, videoByteWriter{ctx}), data[read:])
+			timedOut := !timer.Stop()
+			f.Net.Bytes.Add(int64(n))
+			next += int64(n)
+			read += n
+			if err != nil || timedOut || next > streamedEnd {
+				closeStream()
+			}
+			if err == nil {
+				return data, nil
+			}
+			if ctx.Err() != nil {
+				return data[:read], ctx.Err()
+			}
+			readErr = err
+		}
+		return data[:read], readErr
+	}
 	for off := a; off <= b; {
 		if r.Context().Err() != nil || j.ctx.Err() != nil {
 			return
 		}
 		size := min(int64(1<<20), b-off+1)
+		if pinned, n := f.pinnedAt(off, size); len(pinned) != 0 {
+			if j.budget.Add(-n) < 0 {
+				return
+			}
+			if _, err := w.Write(pinned); err != nil {
+				return
+			}
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			off += n
+			continue
+		} else {
+			size = n
+		}
 		if j.budget.Add(-size) < 0 {
 			return
 		}
@@ -365,7 +465,7 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 		// Cached analysis does not compete for origin bandwidth. Other
 		// background file work yields to playback before making a range read.
 		if !cacheOnly {
-			if err := e.waitForFileRead(j.ctx, j.asset.ID); err != nil {
+			if err := e.waitForFileRead(ctx, j.asset.ID); err != nil {
 				return
 			}
 		}
@@ -374,13 +474,20 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 		// the bounded session cache; never read ahead or keep a whole file.
 		var fetch func(int64, int64) ([]byte, error)
 		if !cacheOnly {
-			fetch = func(start, length int64) ([]byte, error) {
-				data := make([]byte, length)
-				n, err := f.ReadAtContext(j.ctx, data, start)
-				return data[:n], err
+			if j.video || j.ctx.Value(backgroundWorkKey{}) != true {
+				// Players also probe original file audio when seeking, before
+				// requesting video. Reopening the redirector for every MiB of
+				// that interleaved file can hold up the entire seek.
+				fetch = streamFile
+			} else {
+				fetch = func(start, length int64) ([]byte, error) {
+					data := make([]byte, length)
+					n, err := f.ReadAtContext(ctx, data, start)
+					return data[:n], err
+				}
 			}
 		}
-		buf, err := e.Cache.ReadRange(j.ctx, j.asset.ID, off, size, fetch)
+		buf, err := e.Cache.ReadRange(ctx, j.asset.ID, off, size, fetch)
 		if errors.Is(err, errRangeNotCached) {
 			miss.Store(true)
 		}
@@ -440,23 +547,43 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 func (e *Engine) run(ctx context.Context, binary string, args []string, limit int, packetInfo ...io.Writer) ([]byte, error) {
+	out := &limitedBuffer{limit: limit}
+	if err := e.runOutput(ctx, binary, args, out, packetInfo...); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func (e *Engine) runInput(ctx context.Context, binary string, args []string, input []byte, limit int) ([]byte, error) {
+	out := &limitedBuffer{limit: limit}
+	if err := e.runOutputInput(ctx, binary, args, bytes.NewReader(input), out); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func (e *Engine) runOutput(ctx context.Context, binary string, args []string, out io.Writer, packetInfo ...io.Writer) error {
+	return e.runOutputInput(ctx, binary, args, nil, out, packetInfo...)
+}
+
+func (e *Engine) runOutputInput(ctx context.Context, binary string, args []string, input io.Reader, out io.Writer, packetInfo ...io.Writer) error {
 	if background, _ := ctx.Value(backgroundWorkKey{}).(bool); background {
 		select {
 		case e.backgroundSlots <- struct{}{}:
 			defer func() { <-e.backgroundSlots }()
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 	}
 	select {
 	case e.slots <- struct{}{}:
 		defer func() { <-e.slots }()
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ctx.Err()
 	}
 	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Stdin = input
 	cmd.WaitDelay = 2 * time.Second
-	out := &limitedBuffer{limit: limit}
 	stderr := &limitedBuffer{limit: 64 << 10}
 	cmd.Stdout = out
 	cmd.Stderr = stderr
@@ -466,7 +593,7 @@ func (e *Engine) run(ctx context.Context, binary string, args []string, limit in
 		var err error
 		sideReader, sideWriter, err = os.Pipe()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer sideReader.Close()
 		cmd.ExtraFiles = []*os.File{sideWriter}
@@ -487,11 +614,11 @@ func (e *Engine) run(ctx context.Context, binary string, args []string, limit in
 	}
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
-		return nil, fmt.Errorf("%s failed (%s)", programName(binary), safeFFmpegError(stderr.String()))
+		return fmt.Errorf("%s failed (%s)", programName(binary), safeFFmpegError(stderr.String()))
 	}
-	return out.Bytes(), nil
+	return nil
 }
 func programName(s string) string {
 	if i := strings.LastIndexByte(s, '/'); i >= 0 {
@@ -537,7 +664,7 @@ func (e *Engine) Probe(ctx context.Context, a *Asset) (Probe, error) {
 }
 func (e *Engine) ProbeAt(ctx context.Context, a *Asset, at float64) (Probe, error) {
 	var p Probe
-	u, _, cleanup, err := e.job(ctx, a, at, min(8, a.Duration()-at))
+	u, _, cleanup, err := e.job(ctx, a, at, min(8, a.Duration()-at), false)
 	if err != nil {
 		return p, err
 	}
@@ -580,7 +707,7 @@ func (e *Engine) pcm(ctx context.Context, t Track, start, duration float64, from
 		if fromZero {
 			inputStart, inputDuration = 0, start+duration+1
 		}
-		u, skip, cleanup, err := e.job(fileCtx, t.Asset, inputStart, inputDuration)
+		u, skip, cleanup, err := e.job(fileCtx, t.Asset, inputStart, inputDuration, false)
 		if err != nil {
 			return nil, err
 		}
@@ -628,7 +755,7 @@ func (e *Engine) Audio(ctx context.Context, t Track, start, duration, offset, cl
 	args := []string{"-nostdin", "-v", "error", "-threads", "1"}
 	cleanup := func() {}
 	if available > .001 {
-		u, skip, done, err := e.job(ctx, t.Asset, inputStart, available+1)
+		u, skip, done, err := e.job(ctx, t.Asset, inputStart, available+1, false)
 		if err != nil {
 			return nil, err
 		}
@@ -647,18 +774,107 @@ func (e *Engine) Audio(ctx context.Context, t Track, start, duration, offset, cl
 	}
 	defer cleanup()
 	args = append(args, "-t", decimal(duration), "-vn", "-sn", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000", "-output_ts_offset", decimal(start+clockBase), "-mpegts_copyts", "1", "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", "pipe:1")
-	return e.run(ctx, e.Config.Get().FFmpeg, args, 4<<20)
+	encoded, err := e.run(ctx, e.Config.Get().FFmpeg, args, 4<<20)
+	if err != nil {
+		return nil, err
+	}
+	// Each fresh AAC encoder emits one priming frame before the requested
+	// start and flushes padding after its end. If those frames are carried into
+	// the next HLS segment, packet timestamps run backwards by about 40 ms at
+	// every boundary. Copy only complete encoded frames inside this window;
+	// this keeps the AAC data without another lossy encode.
+	const frame = 1024.0 / 48000
+	if duration <= 2*frame {
+		return encoded, nil
+	}
+	clockStart := start + clockBase
+	// A standalone seek starts with a signaled counter reset. The HTTP handler
+	// clears that mark and carries counters forward for adjacent segments.
+	trim := []string{"-nostdin", "-v", "error", "-i", "pipe:0", "-ss", decimal(clockStart), "-t", decimal(duration - frame), "-map", "0:a:0", "-c", "copy", "-copyts", "-mpegts_copyts", "1", "-output_ts_offset", decimal(clockStart), "-mpegts_flags", "+initial_discontinuity", "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", "pipe:1"}
+	return e.runInput(ctx, e.Config.Get().FFmpeg, trim, encoded, 4<<20)
 }
 func (e *Engine) Video(ctx context.Context, a *Asset, start, duration float64) ([]byte, error) {
 	finish := e.foregroundFile(a)
 	defer finish()
-	u, skip, cleanup, err := e.job(ctx, a, start, duration+1)
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var data []byte
+		data, err = e.videoAttempt(ctx, a, start, duration)
+		if err == nil || ctx.Err() != nil {
+			return data, err
+		}
+	}
+	return nil, err
+}
+
+// VideoInit asks the MP4 muxer for its empty movie. FFmpeg obtains the codec
+// configuration from the bounded file input, then writes no video packets.
+// The same stream-copy settings as videoArgsMode keep the track's sample
+// description and timescale compatible with every later media window.
+func (e *Engine) VideoInit(ctx context.Context, a *Asset) ([]byte, error) {
+	finish := e.foregroundFile(a)
+	defer finish()
+	u, _, cleanup, err := e.job(ctx, a, 0, 1, true)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
+	args := []string{"-nostdin", "-v", "error", "-threads", "1", "-discard:a", "all", "-discard:s", "all", "-discard:d", "all"}
+	args = append(args, ffInput(u)...)
+	args = append(args, "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-frames:v", "0", "-copytb", "1", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
+	init, err := e.run(ctx, e.Config.Get().FFmpeg, args, 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	if len(mp4Child(init, "moov", "trak", "mdia", "mdhd")) == 0 || len(mp4Child(init, "moov", "trak", "mdia", "minf", "stbl", "stsd")) == 0 {
+		return nil, errors.New("FFmpeg did not produce a video init segment")
+	}
+	return init, nil
+}
+
+func (e *Engine) videoAttempt(ctx context.Context, a *Asset, start, duration float64) ([]byte, error) {
+	u, skip, cleanup, err := e.job(ctx, a, start, duration+1, true)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	unmarked := a.unmarkedVideo.Load()
+	args := videoArgsMode(u, skip, start, duration, unmarked)
+	clock := &packetClock{}
+	raw, err := e.run(ctx, e.Config.Get().FFmpeg, args, segmentLimit, clock)
+	if err != nil {
+		return nil, err
+	}
+	if !clock.known {
+		if !unmarked {
+			a.unmarkedVideo.Store(true)
+		}
+		return nil, errNoVideoPacketTimestamps
+	}
+	// A short origin range response can end FFmpeg's input early while FFmpeg
+	// still exits successfully. Do not cache that fragment as a complete HLS
+	// segment: the next segment would jump over the missing video frames.
+	completeEnd := start+duration < a.Duration()-.01
+	return placeFragmentsMode(raw, start+clock.first+1, start+1, start+duration+1, completeEnd, videoSequence(a, start), unmarked)
+}
+
+var errNoVideoPacketTimestamps = errors.New("remux produced no video packet timestamps")
+
+func videoSequence(a *Asset, start float64) uint32 {
+	return uint32(sort.SearchFloat64s(a.Index.Boundaries, start) + 1)
+}
+
+func videoArgs(u string, skip, start, duration float64) []string {
+	return videoArgsMode(u, skip, start, duration, false)
+}
+
+func videoArgsMode(u string, skip, start, duration float64, unmarked bool) []string {
 	// Matroska cue times are rounded to the container's tick. Seek just after
-	// the cue so libavformat cannot round down to the previous GOP.
+	// the cue; placeFragments discards any preroll using its actual clock.
+	// Keep the bounded stream analysis in ffInput: Matroska headers do not
+	// supply decode timestamps or HEVC's frame reorder delay. Skipping it
+	// makes FFmpeg substitute PTS for DTS and clamp reordered B-frames to
+	// near-identical timestamps, even though all compressed bytes survive.
 	args := []string{"-nostdin", "-v", "error", "-threads", "1", "-copyts", "-ss", decimal(skip + .01), "-itsoffset", decimal(-start), "-discard:a", "all", "-discard:s", "all", "-discard:d", "all"}
 	args = append(args, ffInput(u)...)
 	// -dn does not disable the MP4 muxer's synthesized chapter text track.
@@ -666,22 +882,28 @@ func (e *Engine) Video(ctx context.Context, a *Asset, start, duration float64) (
 	// The MP4 muxer rebases timestamps. The framecrc side output records the
 	// first compressed packet's real PTS before rebasing; it is not decoded or
 	// re-encoded. This distinguishes actual preroll from the requested GOP.
-	args = append(args, "-t", decimal(duration+.25), "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-avoid_negative_ts", "disabled", "-f", "tee", "[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof:avoid_negative_ts=disabled]pipe:1|[f=framecrc]pipe:3")
-	clock := &packetClock{}
-	raw, err := e.run(ctx, e.Config.Get().FFmpeg, args, segmentLimit, clock)
-	if err != nil {
-		return nil, err
+	// tee otherwise chooses the decoder timebase, which can round distinct
+	// DTS to the same tick and make FFmpeg clamp the corresponding PTS too.
+	args = append(args, "-t", decimal(duration+.25), "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy")
+	fragmentFlags := "+frag_keyframe+empty_moov+default_base_moof"
+	if unmarked {
+		// FFmpeg otherwise drops every packet while waiting for a key flag.
+		// Frame fragments let placeFragments divide this file at its cues.
+		args = append(args, "-copyinkf")
+		fragmentFlags = "+frag_every_frame+empty_moov+default_base_moof"
 	}
-	if !clock.known {
-		return nil, errors.New("remux produced no video packet timestamps")
-	}
-	return placeFragments(raw, start+clock.first+1, start+1, start+duration+1)
+	args = append(args, "-copytb", "1", "-avoid_negative_ts", "disabled", "-f", "tee", "[f=mp4:movflags="+fragmentFlags+":avoid_negative_ts=disabled]pipe:1|[f=framecrc]pipe:3")
+	return args
 }
 
 // FFmpeg's standalone MP4 muxer resets each extraction's decode clock.
 // Rebase fragment metadata, keep only complete GOPs before the next indexed
 // boundary, and preserve every compressed video sample byte-for-byte.
-func placeFragments(raw []byte, first, start, end float64) ([]byte, error) {
+func placeFragments(raw []byte, first, start, end float64, completeEnd bool, sequence uint32) ([]byte, error) {
+	return placeFragmentsMode(raw, first, start, end, completeEnd, sequence, false)
+}
+
+func placeFragmentsMode(raw []byte, first, start, end float64, completeEnd bool, sequence uint32, unmarked bool) ([]byte, error) {
 	init, media, err := splitFMP4(raw)
 	if err != nil {
 		return nil, err
@@ -714,7 +936,9 @@ func placeFragments(raw []byte, first, start, end float64) ([]byte, error) {
 	delta := int64(math.Round(first*float64(scale))) - int64(t.BaseTime) - int64(t.Samples[0].PTSOffset)
 	var out seekablebuffer.Buffer
 	out.Write(init)
-	kept := 0
+	var combined *fmp4.PartTrack
+	var decodeEnd int64
+	firstPTS, lastEnd := math.Inf(1), math.Inf(-1)
 	for _, p := range parts {
 		if len(p.Tracks) != 1 || len(p.Tracks[0].Samples) == 0 {
 			return nil, errors.New("unexpected remux tracks")
@@ -731,15 +955,44 @@ func placeFragments(raw []byte, first, start, end float64) ([]byte, error) {
 		if base < 0 {
 			return nil, errors.New("negative video decode clock")
 		}
-		track.BaseTime = uint64(base)
-		p.SequenceNumber = uint32(kept + 1)
-		if err = p.Marshal(&out); err != nil {
-			return nil, err
+		if combined == nil {
+			combined = &fmp4.PartTrack{ID: track.ID, BaseTime: uint64(base)}
+		} else if base != decodeEnd {
+			return nil, errors.New("non-contiguous video decode clock")
 		}
-		kept++
+		decode := base
+		for _, sample := range track.Samples {
+			presentation := float64(decode+int64(sample.PTSOffset)) / float64(scale)
+			firstPTS = min(firstPTS, presentation)
+			lastEnd = max(lastEnd, presentation+float64(sample.Duration)/float64(scale))
+			decode += int64(sample.Duration)
+		}
+		decodeEnd = decode
+		combined.Samples = append(combined.Samples, track.Samples...)
 	}
-	if kept == 0 {
+	if combined == nil {
 		return nil, errors.New("no video samples at requested seek position")
+	}
+	endTolerance := .5
+	if unmarked {
+		// Frame fragments can be published before FFmpeg finishes the GOP.
+		// Wait until the packet coverage reaches the actual cue boundary.
+		endTolerance = .06
+	}
+	if firstPTS > start+.5 || (completeEnd && lastEnd < end-endTolerance) {
+		return nil, fmt.Errorf("incomplete video segment at %.1fs (packets cover %.1f–%.1fs of %.1f–%.1fs)", start-1, firstPTS-1, lastEnd-1, start-1, end-1)
+	}
+	if unmarked {
+		// The Matroska cue says this sample is independently seekable even
+		// though the source omitted its packet key flag.
+		combined.Samples[0].IsNonSyncSample = false
+	}
+	// Emit one fragment per HLS segment, with an absolute sequence number.
+	// Resetting mfhd to 1 for every extraction makes VLC detect a lost
+	// fragment and reset its clock even when the sample timestamps match.
+	part := fmp4.Part{SequenceNumber: sequence, Tracks: []*fmp4.PartTrack{combined}}
+	if err = part.Marshal(&out); err != nil {
+		return nil, err
 	}
 	return out.Bytes(), nil
 }

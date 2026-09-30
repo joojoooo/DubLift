@@ -31,6 +31,34 @@ func lifecycleServer(t *testing.T) *Server {
 	return s
 }
 
+func TestFileVideoLookaheadMovesWithSeek(t *testing.T) {
+	s := lifecycleServer(t)
+	v := s.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{URL: "https://example.test/source.mkv"})
+	v.videoSegmentRequested(0)
+	v.videoPrefetch.schedule(v.ctx, 1, 10, func(ctx context.Context, _ int) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	old := v.videoPrefetch.ctx
+	windowCtx, stopWindow := context.WithCancel(v.ctx)
+	v.videoWindow = &fileVideoWindow{ctx: windowCtx, cancel: stopWindow}
+	v.videoSegmentRequested(100)
+	select {
+	case <-old.Done():
+	default:
+		t.Fatal("old file-video prefetch survived a distant seek")
+	}
+	if windowCtx.Err() == nil {
+		t.Fatal("old sequential remux survived a seek")
+	}
+	v.videoSegmentRequested(101)
+	v.videoSegmentRequested(102)
+	v.videoSegmentRequested(50)
+	if v.videoBase != 50 || v.videoHighest != 50 {
+		t.Fatal("backward seek retained the old video window")
+	}
+}
+
 func jsonValue(t *testing.T, b []byte) any {
 	t.Helper()
 	var out any

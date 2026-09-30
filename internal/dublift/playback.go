@@ -104,16 +104,42 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if p[3] == "init.mp4" {
+			v.mu.Lock()
+			init := v.videoInit
+			v.mu.Unlock()
+			if len(init) == 0 {
+				ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+				defer cancel()
+				ctx = context.WithValue(ctx, videoBytesKey{}, &v.videoDownload)
+				var err error
+				init, err = s.Engine.Cache.Get(ctx, "video-init:"+v.video.ID, func() ([]byte, error) {
+					return s.Engine.VideoInit(ctx, v.video)
+				})
+				if err != nil {
+					v.note(err)
+					failure(w, 502, err)
+					return
+				}
+				v.mu.Lock()
+				if len(v.videoInit) == 0 {
+					v.videoInit = init
+				}
+				init = v.videoInit
+				v.mu.Unlock()
+			}
+			serveBytes(w, r, "video/mp4", init)
+			return
+		}
 		start := v.boundaries[n]
-		duration := v.boundaries[n+1] - start
-		v.position(start)
 		if p[3] == "segment.m4s" {
+			v.position(start)
 			v.videoSegmentRequested(n)
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 		ctx = context.WithValue(ctx, videoBytesKey{}, &v.videoDownload)
-		data, err := s.Engine.Cache.Get(ctx, fmt.Sprintf("video:%s:%d", v.video.ID, n), func() ([]byte, error) { return s.Engine.Video(ctx, v.video, start, duration) })
+		data, err := s.fileVideo(ctx, v, n)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				err = fmt.Errorf("video segment at %.1fs exceeded the 60-second read/remux limit; the source may be too slow", start)
@@ -130,12 +156,14 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			failure(w, 502, err)
 			return
 		}
-		if p[3] == "init.mp4" {
-			data = init
-		} else {
-			data = media
-			v.videoSegmentCompleted(n)
+		v.mu.Lock()
+		if v.videoInit == nil {
+			v.videoInit = append([]byte(nil), init...)
 		}
+		v.mu.Unlock()
+		data = media
+		v.videoSegmentCompleted(n)
+		s.prefetchFileVideo(v, n+1)
 		serveBytes(w, r, "video/mp4", data)
 	case p[1] == "track" && len(p) >= 3:
 		id := strings.TrimSuffix(p[2], ".m3u8")
@@ -170,7 +198,10 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		}
 		start := v.boundaries[n]
 		duration := v.boundaries[n+1] - start
-		v.position(start)
+		if !track.Subtitle {
+			v.audioPosition(start)
+			v.fileAudioSegmentRequested(n)
+		}
 		offset := 0.0
 		if !track.Original {
 			offset = s.playbackOffset(v, start)
@@ -198,12 +229,69 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		kind := "video/mp2t"
 		if track.Subtitle {
 			kind = "text/vtt"
+		} else {
+			s.prefetchAudio(v, *track, n)
+			if r.Method == http.MethodGet && r.Header.Get("Range") == "" {
+				data = v.continuousAudioTS(track.ID, n, data)
+			}
 		}
 		serveBytes(w, r, kind, data)
 	default:
 		http.NotFound(w, r)
 	}
 }
+
+func (s *Server) prefetchFileVideo(v *Session, n int) {
+	if s.videoPrefetch == nil || v.video == nil || v.video.File == nil || n >= len(v.boundaries)-1 {
+		return
+	}
+	ctx := context.WithValue(v.ctx, videoBytesKey{}, &v.videoDownload)
+	v.videoPrefetch.schedule(ctx, n, s.lookaheadEnd(v, n), func(ctx context.Context, index int) error {
+		select {
+		case s.videoPrefetch <- struct{}{}:
+			defer func() { <-s.videoPrefetch }()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		_, err := s.fileVideo(ctx, v, index)
+		return err
+	})
+}
+
+func (s *Server) prefetchAudio(v *Session, track Track, n int) {
+	if n+1 >= len(v.boundaries)-1 {
+		return
+	}
+	v.mu.Lock()
+	// Players probe segment zero of every rendition. Only warm the default
+	// Italian track until subsequent requests identify a different selection.
+	if n == 0 && (track.Original || track.Lang != "it" || v.audioPrefetchID != "") {
+		v.mu.Unlock()
+		return
+	}
+	if v.audioPrefetchID != track.ID {
+		v.audioPrefetch.stop()
+		v.audioPrefetchID = track.ID
+	}
+	v.audioPrefetch.schedule(v.ctx, n+1, s.lookaheadEnd(v, n+1), func(ctx context.Context, index int) error {
+		start := v.boundaries[index]
+		offset := 0.0
+		if !track.Original {
+			offset = s.playbackOffset(v, start)
+		}
+		clockBase, err := s.sectionClock(ctx, v, index)
+		if err != nil {
+			return err
+		}
+		key := fmt.Sprintf("track:%s:%s:%d:%.6f:%.6f", v.Key, track.ID, index, offset, clockBase)
+		_, err = s.Engine.Cache.Get(ctx, key, func() ([]byte, error) {
+			return s.Engine.Audio(ctx, track, start, v.boundaries[index+1]-start, offset, clockBase)
+		})
+		return err
+	})
+	v.mu.Unlock()
+}
+
 func (s *Server) playbackOffset(v *Session, at float64) float64 {
 	a := s.Alignments.Get(v.Key)
 	v.mu.Lock()
@@ -316,13 +404,19 @@ func (s *Server) generatedPlaylist(v *Session, t *Track) string {
 		sequence = v.video.HLS.Segments[0].Sequence
 	}
 	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%d\n#EXT-X-PLAYLIST-TYPE:VOD\n", target, sequence)
+	if t == nil {
+		// File tracks have one container configuration. Repeating an identical
+		// init map with a different URI at every segment makes VLC reopen the
+		// fMP4 demuxer and can reset its playback clock at each boundary.
+		b.WriteString("#EXT-X-MAP:URI=\"video/0/init.mp4\"\n")
+	}
 	for i := 0; i < len(v.boundaries)-1; i++ {
 		duration := v.boundaries[i+1] - v.boundaries[i]
 		if v.video.HLS != nil && v.video.HLS.Segments[i].Discontinuity {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
 		}
 		if t == nil {
-			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"video/%d/init.mp4\"\n#EXTINF:%.6f,\nvideo/%d/segment.m4s\n", i, duration, i)
+			fmt.Fprintf(&b, "#EXTINF:%.6f,\nvideo/%d/segment.m4s\n", duration, i)
 		} else {
 			ext := "ts"
 			if t.Subtitle {
@@ -405,8 +499,10 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 		http.NotFound(w, r)
 		return
 	}
-	if res.Track {
+	if res.Track && res.Video {
 		v.position(res.Position)
+	} else if res.Track {
+		v.audioPosition(res.Position)
 	}
 	force := res.Force || s.Config.Get().PreferProxy || len(res.Origin.Headers) > 0
 	if u, err := httpURL(res.Origin.URL); err == nil && s.Net.Client.Jar != nil && len(s.Net.Client.Jar.Cookies(u)) > 0 {

@@ -16,8 +16,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4/seekablebuffer"
 )
 
 func ffmpegAvailable(t *testing.T) {
@@ -25,6 +29,41 @@ func ffmpegAvailable(t *testing.T) {
 	for _, name := range []string{"ffmpeg", "ffprobe"} {
 		if _, e := exec.LookPath(name); e != nil {
 			t.Skip(name + " required for media integration test")
+		}
+	}
+}
+
+func assertContinuousTransport(t *testing.T, segments ...[]byte) {
+	t.Helper()
+	last := make(map[uint16]byte)
+	for segmentIndex, data := range segments {
+		if len(data)%188 != 0 {
+			t.Fatalf("audio segment %d is not packet aligned", segmentIndex)
+		}
+		for i := 0; i < len(data); i += 188 {
+			packet := data[i : i+188]
+			if packet[0] != 0x47 {
+				t.Fatalf("audio segment %d has bad transport sync", segmentIndex)
+			}
+			pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+			control := packet[3] >> 4 & 3
+			if pid == 0x1fff || control == 0 {
+				continue
+			}
+			counter := packet[3] & 15
+			if prior, ok := last[pid]; ok {
+				expected := prior
+				if control&1 != 0 {
+					expected++
+				}
+				if counter != expected&15 {
+					t.Fatalf("audio PID %d counter broke at segment %d packet %d: got %d, want %d", pid, segmentIndex, i/188, counter, expected&15)
+				}
+				if segmentIndex > 0 && control&2 != 0 && packet[4] > 0 && packet[5]&0x80 != 0 {
+					t.Fatalf("audio PID %d signaled a discontinuity in segment %d", pid, segmentIndex)
+				}
+			}
+			last[pid] = counter
 		}
 	}
 }
@@ -154,7 +193,7 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 			if len(p.Streams) < 2 {
 				t.Fatal(p)
 			}
-			for _, n := range []int{0, 7, 8} {
+			for _, n := range []int{0, 1, 7, 8} {
 				start, end := a.Index.Boundaries[n], a.Index.Boundaries[n+1]
 				b, e := engine.Video(ctx, a, start, end-start)
 				if e != nil {
@@ -178,7 +217,49 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 				if math.Abs(lo-(start+1)) > .13 || math.Abs(hi-(end+1)) > .15 {
 					t.Errorf("fragment timestamp mismatch: %.3f..%.3f vs %.3f..%.3f", lo, hi, start, end)
 				}
+				if ext == "mkv" && n == 7 {
+					// A range that ends early may still make FFmpeg exit with a
+					// valid but incomplete MP4. It must never enter the VOD cache.
+					var parts fmp4.Parts
+					if err := parts.Unmarshal(media); err != nil {
+						t.Fatal(err)
+					}
+					parts[0].Tracks[0].Samples = parts[0].Tracks[0].Samples[:len(parts[0].Tracks[0].Samples)/2]
+					var partial seekablebuffer.Buffer
+					partial.Write(init)
+					if err := parts[0].Marshal(&partial); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := placeFragments(partial.Bytes(), lo, start+1, end+1, true, uint32(n+1)); err == nil || !strings.Contains(err.Error(), "incomplete video segment") {
+						t.Fatalf("short remux accepted: %v", err)
+					}
+				}
 				command(t, "ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-f", "null", "-")
+			}
+			var segments [][]byte
+			bounds := a.Index.Boundaries[1:5]
+			if err := engine.VideoWindow(ctx, a, bounds, func(n int, data []byte) error {
+				segments = append(segments, data)
+				return nil
+			}); err != nil {
+				t.Fatal("sequential video window", err)
+			}
+			if len(segments) != len(bounds)-1 {
+				t.Fatal("video window omitted segments")
+			}
+			for n, data := range segments {
+				path := filepath.Join(dir, fmt.Sprintf("window-%s-%d.mp4", ext, n))
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				lo, hi := packetTimes(t, path, "v:0")
+				if math.Abs(lo-bounds[n]-1) > .13 || math.Abs(hi-bounds[n+1]-1) > .15 {
+					t.Fatalf("window segment %d has wrong packet clock: %.3f..%.3f", n, lo, hi)
+				}
+				command(t, "ffmpeg", "-v", "error", "-i", path, "-map", "0:v:0", "-f", "null", "-")
+			}
+			if ext == "mkv" {
+				checkProgressiveVideoWindow(t, engine, ctx, a)
 			}
 		})
 	}
@@ -188,6 +269,139 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 		if r == "" {
 			t.Fatal("unranged file read")
 		}
+	}
+}
+
+func TestIndexedMKVRemuxKeepsTailAfterOriginStopsServingIt(t *testing.T) {
+	dir := fixture(t)
+	path := filepath.Join(dir, "source.mkv")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tailOff atomic.Int64
+	var rejectTail atomic.Bool
+	var blocked atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if raw := r.Header.Get("Range"); raw != "" && rejectTail.Load() {
+			start, _, err := requestRange(raw, info.Size())
+			if err == nil && start >= tailOff.Load() {
+				blocked.Add(1)
+				http.Error(w, "tail unavailable", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		http.FileServer(http.Dir(dir)).ServeHTTP(w, r)
+	}))
+	defer origin.Close()
+	engine := testEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	asset, err := engine.OpenAsset(ctx, Origin{URL: origin.URL + "/source.mkv"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(asset.File.tail) == 0 || asset.File.tailOff+int64(len(asset.File.tail)) != info.Size() {
+		t.Fatal("Matroska tail was not retained")
+	}
+	tailOff.Store(asset.File.tailOff)
+	rejectTail.Store(true)
+	bounds := asset.Index.Boundaries[:3]
+	count := 0
+	if err := engine.VideoWindow(ctx, asset, bounds, func(int, []byte) error { count++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || blocked.Load() != 0 {
+		t.Fatalf("segments=%d, attempted unavailable tail reads=%d", count, blocked.Load())
+	}
+}
+
+func TestIndexedMKVDoesNotRequireUnrelatedTailBytes(t *testing.T) {
+	dir := fixture(t)
+	base, err := os.ReadFile(filepath.Join(dir, "source.mkv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, padding := range []int{1 << 20, 5 << 20} {
+		t.Run(fmt.Sprint(padding), func(t *testing.T) {
+			name := fmt.Sprintf("padded-%d.mkv", padding)
+			if err := os.WriteFile(filepath.Join(dir, name), append(bytes.Clone(base), make([]byte, padding)...), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var rejected atomic.Int32
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if raw := r.Header.Get("Range"); raw != "" {
+					start, end, err := requestRange(raw, int64(len(base)+padding))
+					if err == nil && end >= int64(len(base)) && end-start+1 >= 1<<20 {
+						rejected.Add(1)
+						http.Error(w, "trailing bytes unavailable", http.StatusServiceUnavailable)
+						return
+					}
+				}
+				http.FileServer(http.Dir(dir)).ServeHTTP(w, r)
+			}))
+			defer origin.Close()
+			engine := testEngine(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			asset, err := engine.OpenAsset(ctx, Origin{URL: origin.URL + "/" + name}, false)
+			if err != nil || asset == nil || len(asset.Index.Boundaries) < 2 {
+				t.Fatalf("valid cues were rejected after a tail read failed: asset=%v, err=%v", asset, err)
+			}
+			if rejected.Load() == 0 {
+				t.Fatal("fixture did not reject an optional tail request")
+			}
+		})
+	}
+}
+
+func checkProgressiveVideoWindow(t *testing.T, engine *Engine, ctx context.Context, a *Asset) {
+	t.Helper()
+	bounds := a.Index.Boundaries[:5]
+	u, skip, cleanup, err := engine.job(ctx, a, bounds[0], bounds[len(bounds)-1]+1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	clock := &packetClock{}
+	raw, err := engine.run(ctx, "ffmpeg", videoArgs(u, skip, bounds[0], bounds[len(bounds)-1]), segmentLimit, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "window.mp4")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	published := 0
+	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), clock: &windowClock{packetClock: packetClock{known: true, first: clock.first}}, publish: func(n int, data []byte) error {
+		if n != published {
+			t.Errorf("out-of-order segment: %d", n)
+		}
+		published++
+		return nil
+	}}
+	checkedPartial := false
+	for off := 0; off < len(raw); {
+		end := min(off+997, len(raw)) // Deliberately split MP4 box headers/bodies.
+		if _, err := w.Write(raw[off:end]); err != nil {
+			t.Fatal(err)
+		}
+		off = end
+		if published == 1 && !checkedPartial {
+			if off == len(raw) {
+				t.Fatal("first segment waited for the entire window")
+			}
+			if err := w.flush(true); err == nil {
+				t.Fatal("truncated window was accepted as complete")
+			}
+			checkedPartial = true
+		}
+	}
+	if err := w.flush(true); err != nil {
+		t.Fatal(err)
+	}
+	if !checkedPartial || published != len(bounds)-1 {
+		t.Fatal("segments were not published progressively")
 	}
 }
 
@@ -300,11 +514,25 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 					break
 				}
 			}
+			if zero := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/0.ts"); len(zero) == 0 {
+				t.Fatal("empty startup audio")
+			}
 			audioURL := local.URL + "/media/" + id + "/track/" + it.ID + "/" + strconv.Itoa(n) + ".ts"
 			audio := getBytes(t, audioURL)
+			nextAudio := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+1)+".ts")
+			assertContinuousTransport(t, audio, nextAudio)
+			seekAudio := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+4)+".ts")
+			assertInitialTransportReset(t, seekAudio)
+			assertContinuousTransport(t, seekAudio, getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+5)+".ts"))
 			path := filepath.Join(dir, "audio-"+id+".ts")
 			os.WriteFile(path, audio, 0600)
 			lo, hi := packetTimes(t, path, "a:0")
+			nextPath := filepath.Join(dir, "audio-next-"+id+".ts")
+			os.WriteFile(nextPath, nextAudio, 0600)
+			nextLo, _ := packetTimes(t, nextPath, "a:0")
+			if gap := nextLo - hi; gap < -.002 || gap > .05 {
+				t.Errorf("adjacent AAC segments have a %.3f second gap/overlap", gap)
+			}
 			want := session.boundaries[n] + session.clockBase
 			t.Logf("audio clock %.3f..%.3f expected %.3f", lo, hi, want)
 			if math.Abs(lo-want) > .04 {
@@ -315,6 +543,9 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 				t.Fatal("not seekable VOD")
 			}
 			if session.video.File != nil {
+				if strings.Count(string(playlist), "#EXT-X-MAP:") != 1 || !strings.Contains(string(playlist), `#EXT-X-MAP:URI="video/0/init.mp4"`) {
+					t.Fatal("file video should use one initialization map")
+				}
 				getBytes(t, local.URL+"/media/"+id+"/video/7/init.mp4")
 				getBytes(t, local.URL+"/media/"+id+"/video/7/segment.m4s")
 			}
@@ -358,6 +589,24 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 				if e != nil {
 					t.Fatal(e)
 				}
+				seenPID := map[uint16]bool{}
+				for off := 0; off+188 <= len(content); off += 188 {
+					packet := content[off : off+188]
+					if packet[0] != 0x47 {
+						t.Fatal("generated audio lost MPEG-TS packet alignment")
+					}
+					pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+					if seenPID[pid] {
+						continue
+					}
+					seenPID[pid] = true
+					if packet[3]&0x20 == 0 || packet[4] == 0 || packet[5]&0x80 == 0 {
+						t.Fatalf("first MPEG-TS packet for PID %d does not mark its counter reset", pid)
+					}
+				}
+				if len(seenPID) < 3 {
+					t.Fatalf("incomplete generated audio transport: %d PIDs", len(seenPID))
+				}
 				encoded := filepath.Join(dir, "content.ts")
 				os.WriteFile(encoded, content, 0600)
 				pcm := command(t, "ffmpeg", "-v", "error", "-i", encoded, "-ac", "1", "-ar", "11025", "-f", "s16le", "pipe:1")
@@ -380,7 +629,7 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			}
 			postJSON(t, local.URL+"/api/sessions/"+id+"/offset", `{"offset":null}`, 200)
 			if session.video.File != nil {
-				getBytes(t, audioURL) // infer the current area from a requested segment
+				getBytes(t, local.URL+"/media/"+id+"/video/7/segment.m4s") // video controls the requested area
 				postJSON(t, local.URL+"/api/sessions/"+id+"/realign", `{}`, 202)
 				until := time.Now().Add(15 * time.Second)
 				for time.Now().Before(until) {
@@ -456,6 +705,25 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 403 {
 		t.Fatal("private settings exposed cross-origin")
+	}
+}
+
+func assertInitialTransportReset(t *testing.T, data []byte) {
+	t.Helper()
+	seen := make(map[uint16]bool)
+	for i := 0; i+188 <= len(data); i += 188 {
+		packet := data[i : i+188]
+		pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+		if pid == 0x1fff || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		if packet[3]&0x20 == 0 || packet[4] == 0 || packet[5]&0x80 == 0 {
+			t.Fatalf("audio PID %d did not mark a seek discontinuity", pid)
+		}
+	}
+	if len(seen) < 3 {
+		t.Fatalf("incomplete transport after seek: %d PIDs", len(seen))
 	}
 }
 func getJSON(t *testing.T, url string, v any) {

@@ -71,6 +71,31 @@ func (c *ByteCache) ownerKey(ctx context.Context, key string) string {
 	return key
 }
 func (c *ByteCache) Used() int64 { c.mu.Lock(); defer c.mu.Unlock(); return c.used }
+func (c *ByteCache) Lookup(ctx context.Context, key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e := c.items[c.ownerKey(ctx, key)]; e != nil {
+		c.lru.MoveToFront(e)
+		return e.Value.(cacheEntry).data, true
+	}
+	return nil, false
+}
+
+func (c *ByteCache) Put(ctx context.Context, key string, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ctx.Err() != nil || int64(len(data)) > c.max {
+		return
+	}
+	key = c.ownerKey(ctx, key)
+	if old := c.items[key]; old != nil {
+		c.used -= int64(len(old.Value.(cacheEntry).data))
+		c.lru.Remove(old)
+	}
+	c.items[key] = c.lru.PushFront(cacheEntry{key: key, data: data})
+	c.used += int64(len(data))
+	c.evict()
+}
 func (c *ByteCache) Get(ctx context.Context, key string, build func() ([]byte, error)) ([]byte, error) {
 	originalKey := key
 	key = c.ownerKey(ctx, key)

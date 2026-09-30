@@ -27,6 +27,7 @@ type Server struct {
 	Config           *Config
 	Net              *Network
 	Engine           *Engine
+	videoPrefetch    chan struct{}
 	Alignments       *AlignmentStore
 	mu               sync.Mutex
 	sessions         map[string]*Session
@@ -56,7 +57,7 @@ func NewServer(c *Config) (*Server, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{Config: c, Net: n, Engine: e, Alignments: a, sessions: map[string]*Session{}, events: []string{}, ctx: ctx, cancel: cancel, playbackKey: key}
+	s := &Server{Config: c, Net: n, Engine: e, Alignments: a, sessions: map[string]*Session{}, events: []string{}, ctx: ctx, cancel: cancel, playbackKey: key, videoPrefetch: make(chan struct{}, 1)}
 	s.collectExpired(time.Now())
 	go s.collectLoop()
 	return s, nil
