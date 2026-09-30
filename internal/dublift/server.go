@@ -111,7 +111,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/manifest.json":
 		s.manifestRequests.Add(1)
-		jsonResponse(w, 200, map[string]any{"id": "local.dublift", "version": "0.1.0", "name": "DubLift", "description": "Your high-quality streams with synchronized Italian audio. Runs on your local network.", "resources": []string{"stream"}, "types": []string{"movie", "series"}, "catalogs": []any{}, "behaviorHints": map[string]any{"configurable": true, "configurationRequired": len(s.Config.Get().Addons) == 0}})
+		jsonResponse(w, 200, map[string]any{"id": "local.dublift", "version": "0.1.0", "name": "DubLift", "logo": s.base(r) + "/icon.svg", "description": "Your high-quality streams with synchronized Italian audio. Runs on your local network.", "resources": []string{"stream"}, "types": []string{"movie", "series"}, "catalogs": []any{}, "behaviorHints": map[string]any{"configurable": true, "configurationRequired": len(s.Config.Get().Addons) == 0}})
 	case strings.HasPrefix(r.URL.Path, "/stream/"):
 		s.streams(w, r)
 	case strings.HasPrefix(r.URL.Path, "/media/"):
