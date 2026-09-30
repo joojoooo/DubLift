@@ -232,6 +232,48 @@ func TestFileRangeResumesStalledBodyWithoutTruncatingDemuxerInput(t *testing.T) 
 	}
 }
 
+func TestFileRangeRetriesAdditionalFailedWorkers(t *testing.T) {
+	engine := testEngine(t)
+	payload := bytes.Repeat([]byte("video-range"), 10000)
+	var requests atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, err := requestRange(r.Header.Get("Range"), int64(len(payload)))
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(416)
+			return
+		}
+		if requests.Add(1) <= 2 {
+			http.Error(w, "worker unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+		w.WriteHeader(206)
+		w.Write(payload[start : end+1])
+	}))
+	defer origin.Close()
+	asset := &Asset{ID: "failed-workers", File: &RemoteFile{Net: engine.Net, Origin: Origin{URL: origin.URL}, Size: int64(len(payload))}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	u, _, cleanup, err := engine.job(ctx, asset, 0, 6, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req.Header.Set("Range", "bytes=0-")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Equal(got, payload) || requests.Load() != 3 {
+		t.Fatalf("origin recovery: %d bytes, %d requests, %v", len(got), requests.Load(), err)
+	}
+}
+
 func TestFileRangeCacheSharesOverlappingReadsInFlight(t *testing.T) {
 	cache := NewByteCache(256)
 	ctx := context.Background()

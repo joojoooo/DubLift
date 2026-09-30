@@ -70,6 +70,10 @@ func NewNetwork() *Network {
 	}}}
 }
 func (n *Network) request(ctx context.Context, o Origin, method, byteRange string) (*http.Response, error) {
+	return n.requestWithClient(ctx, o, method, byteRange, n.Client)
+}
+
+func (n *Network) requestWithClient(ctx context.Context, o Origin, method, byteRange string, client *http.Client) (*http.Response, error) {
 	if _, e := httpURL(o.URL); e != nil {
 		return nil, e
 	}
@@ -88,7 +92,7 @@ func (n *Network) request(ctx context.Context, o Origin, method, byteRange strin
 	if byteRange != "" {
 		r.Header.Set("Range", byteRange)
 	}
-	resp, e := n.Client.Do(r)
+	resp, e := client.Do(r)
 	if e != nil {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("origin request failed: %s: %w", networkError(ctx.Err()), ctx.Err())
@@ -99,6 +103,12 @@ func (n *Network) request(ctx context.Context, o Origin, method, byteRange strin
 }
 
 func (n *Network) requestFileRange(ctx context.Context, o Origin, byteRange string) (*http.Response, error) {
+	// A finite origin range can stay open while the demuxer consumes many
+	// cached chunks. The general HTTP client's whole-response timeout must
+	// not cut off an otherwise progressing read. The header and per-chunk
+	// deadlines, plus the caller's job context, still bound this request.
+	client := *n.Client
+	client.Timeout = 0
 	for attempt := 0; ; attempt++ {
 		requestCtx, cancel := context.WithCancel(ctx)
 		var timer *time.Timer
@@ -112,7 +122,7 @@ func (n *Network) requestFileRange(ctx context.Context, o Origin, byteRange stri
 			// Stop this timer at the headers, not at the end of a large body.
 			timer = time.AfterFunc(timeout, cancel)
 		}
-		resp, err := n.request(requestCtx, o, "GET", byteRange)
+		resp, err := n.requestWithClient(requestCtx, o, "GET", byteRange, &client)
 		if timer != nil && !timer.Stop() && err == nil {
 			resp.Body.Close()
 			err = context.DeadlineExceeded
@@ -210,11 +220,44 @@ func parseContentRange(s string) (start, end, total int64, err error) {
 }
 
 type RemoteFile struct {
-	Net    *Network
-	Origin Origin
-	Size   int64
-	ETag   string
-	prefix []byte
+	Net     *Network
+	Origin  Origin
+	Size    int64
+	ETag    string
+	prefix  []byte
+	tailOff int64
+	tail    []byte
+}
+
+// Matroska seek tables commonly live at EOF. Retain that small region after
+// indexing so each short remux can seek even if a later CDN worker fails.
+func (f *RemoteFile) pinTail(ctx context.Context) error {
+	const limit = 2 << 20
+	n := min(f.Size, int64(limit))
+	data := make([]byte, n)
+	if _, err := f.ReadAtContext(ctx, data, f.Size-n); err != nil {
+		return err
+	}
+	f.tailOff, f.tail = f.Size-n, data
+	return nil
+}
+
+// Return pinned bytes starting at off, or the size of the gap before them.
+func (f *RemoteFile) pinnedAt(off, size int64) ([]byte, int64) {
+	if off < int64(len(f.prefix)) {
+		n := min(size, int64(len(f.prefix))-off)
+		return f.prefix[off : off+n], n
+	}
+	if len(f.tail) != 0 {
+		if off >= f.tailOff {
+			n := min(size, f.Size-off)
+			return f.tail[off-f.tailOff : off-f.tailOff+n], n
+		}
+		if off+size > f.tailOff {
+			return nil, f.tailOff - off
+		}
+	}
+	return nil, size
 }
 
 func (n *Network) OpenFile(ctx context.Context, o Origin) (*RemoteFile, error) {

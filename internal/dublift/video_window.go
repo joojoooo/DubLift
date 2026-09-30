@@ -28,6 +28,8 @@ type videoWindowWriter struct {
 	bounds                 []float64
 	duration               float64
 	sequence               uint32
+	unmarked               bool
+	fragments              int
 	clock                  *windowClock
 	publish                func(int, []byte) error
 }
@@ -56,6 +58,12 @@ func (w *videoWindowWriter) Write(b []byte) (int, error) {
 		w.parsed += int(size)
 		if string(box[4:8]) == "mdat" {
 			w.complete = w.parsed
+			w.fragments++
+			// A file with missing key flags emits one fragment per frame. Check
+			// in small batches instead of reparsing the whole window per frame.
+			if w.unmarked && w.fragments%16 != 0 {
+				continue
+			}
 			if err := w.flush(false); err != nil {
 				return 0, err
 			}
@@ -70,14 +78,14 @@ func (w *videoWindowWriter) flush(final bool) error {
 	w.clock.mu.Unlock()
 	if !known {
 		if final {
-			return errors.New("remux produced no video packet timestamps")
+			return errNoVideoPacketTimestamps
 		}
 		return nil
 	}
 	for w.next < len(w.bounds)-1 {
 		start, end := w.bounds[w.next], w.bounds[w.next+1]
 		completeEnd := !final || end < w.duration-.01
-		data, err := placeFragments(w.raw[:w.complete], w.bounds[0]+first+1, start+1, end+1, completeEnd, w.sequence+uint32(w.next))
+		data, err := placeFragmentsMode(w.raw[:w.complete], w.bounds[0]+first+1, start+1, end+1, completeEnd, w.sequence+uint32(w.next), w.unmarked)
 		if err != nil {
 			if final {
 				return err
@@ -95,14 +103,27 @@ func (w *videoWindowWriter) flush(final bool) error {
 func (e *Engine) VideoWindow(ctx context.Context, a *Asset, bounds []float64, publish func(int, []byte) error) error {
 	finish := e.foregroundFile(a)
 	defer finish()
+	for attempt := 0; attempt < 2; attempt++ {
+		err := e.videoWindowAttempt(ctx, a, bounds, publish)
+		if errors.Is(err, errNoVideoPacketTimestamps) && attempt == 0 && ctx.Err() == nil {
+			a.unmarkedVideo.Store(true)
+			continue
+		}
+		return err
+	}
+	return errNoVideoPacketTimestamps
+}
+
+func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []float64, publish func(int, []byte) error) error {
 	start, end := bounds[0], bounds[len(bounds)-1]
 	u, skip, cleanup, err := e.job(ctx, a, start, end-start+1, true)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), sequence: videoSequence(a, start), clock: &windowClock{}, publish: publish}
-	if err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgs(u, skip, start, end-start), w, w.clock); err != nil {
+	unmarked := a.unmarkedVideo.Load()
+	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), sequence: videoSequence(a, start), unmarked: unmarked, clock: &windowClock{}, publish: publish}
+	if err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgsMode(u, skip, start, end-start, unmarked), w, w.clock); err != nil {
 		return err
 	}
 	return w.flush(true)

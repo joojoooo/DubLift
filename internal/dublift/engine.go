@@ -32,6 +32,9 @@ type Asset struct {
 	HLS    *HLS
 	File   *RemoteFile
 	Index  FileIndex
+	// Some Matroska files have valid video cues but mark every packet non-key.
+	// Remember the stream-copy fallback after the default remux emits no packets.
+	unmarkedVideo atomic.Bool
 }
 
 func (a *Asset) Duration() float64 {
@@ -196,6 +199,9 @@ func (e *Engine) OpenAsset(ctx context.Context, o Origin, hls bool) (*Asset, err
 			}
 			a.File = f
 			a.Index, err = BuildFileIndex(ctx, f)
+			if err == nil && a.Index.Container == "matroska" && len(f.tail) == 0 {
+				err = f.pinTail(ctx)
+			}
 			return a, err
 		}
 	}
@@ -378,7 +384,7 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 		data := make([]byte, length)
 		read := 0
 		var readErr error
-		for attempt := 0; attempt < 2; attempt++ {
+		for attempt := 0; attempt < 4; attempt++ {
 			offset := start + int64(read)
 			if streamed == nil || offset != next || start+length-1 > streamedEnd {
 				closeStream()
@@ -390,7 +396,11 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 				resp, err := f.openRange(streamCtx, offset, span)
 				if err != nil {
 					streamCancel()
-					return data[:read], err
+					if ctx.Err() != nil {
+						return data[:read], ctx.Err()
+					}
+					readErr = err
+					continue
 				}
 				streamed, next, streamedEnd = resp, offset, offset+span-1
 				cancelStream = streamCancel
@@ -401,7 +411,7 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 			// the entry URL instead of feeding FFmpeg a truncated virtual file.
 			timeout := e.rangeReadTimeout
 			if timeout <= 0 {
-				timeout = 5 * time.Second
+				timeout = 15 * time.Second
 			}
 			timer := time.AfterFunc(timeout, cancelStream)
 			n, err := io.ReadFull(io.TeeReader(streamed.Body, videoByteWriter{ctx}), data[read:])
@@ -427,6 +437,21 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 			return
 		}
 		size := min(int64(1<<20), b-off+1)
+		if pinned, n := f.pinnedAt(off, size); len(pinned) != 0 {
+			if j.budget.Add(-n) < 0 {
+				return
+			}
+			if _, err := w.Write(pinned); err != nil {
+				return
+			}
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			off += n
+			continue
+		} else {
+			size = n
+		}
 		if j.budget.Add(-size) < 0 {
 			return
 		}
@@ -782,27 +807,37 @@ func (e *Engine) videoAttempt(ctx context.Context, a *Asset, start, duration flo
 		return nil, err
 	}
 	defer cleanup()
-	args := videoArgs(u, skip, start, duration)
+	unmarked := a.unmarkedVideo.Load()
+	args := videoArgsMode(u, skip, start, duration, unmarked)
 	clock := &packetClock{}
 	raw, err := e.run(ctx, e.Config.Get().FFmpeg, args, segmentLimit, clock)
 	if err != nil {
 		return nil, err
 	}
 	if !clock.known {
-		return nil, errors.New("remux produced no video packet timestamps")
+		if !unmarked {
+			a.unmarkedVideo.Store(true)
+		}
+		return nil, errNoVideoPacketTimestamps
 	}
 	// A short origin range response can end FFmpeg's input early while FFmpeg
 	// still exits successfully. Do not cache that fragment as a complete HLS
 	// segment: the next segment would jump over the missing video frames.
 	completeEnd := start+duration < a.Duration()-.01
-	return placeFragments(raw, start+clock.first+1, start+1, start+duration+1, completeEnd, videoSequence(a, start))
+	return placeFragmentsMode(raw, start+clock.first+1, start+1, start+duration+1, completeEnd, videoSequence(a, start), unmarked)
 }
+
+var errNoVideoPacketTimestamps = errors.New("remux produced no video packet timestamps")
 
 func videoSequence(a *Asset, start float64) uint32 {
 	return uint32(sort.SearchFloat64s(a.Index.Boundaries, start) + 1)
 }
 
 func videoArgs(u string, skip, start, duration float64) []string {
+	return videoArgsMode(u, skip, start, duration, false)
+}
+
+func videoArgsMode(u string, skip, start, duration float64, unmarked bool) []string {
 	// Matroska cue times are rounded to the container's tick. Seek just after
 	// the cue; placeFragments discards any preroll using its actual clock.
 	// Keep the bounded stream analysis in ffInput: Matroska headers do not
@@ -818,7 +853,15 @@ func videoArgs(u string, skip, start, duration float64) []string {
 	// re-encoded. This distinguishes actual preroll from the requested GOP.
 	// tee otherwise chooses the decoder timebase, which can round distinct
 	// DTS to the same tick and make FFmpeg clamp the corresponding PTS too.
-	args = append(args, "-t", decimal(duration+.25), "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-copytb", "1", "-avoid_negative_ts", "disabled", "-f", "tee", "[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof:avoid_negative_ts=disabled]pipe:1|[f=framecrc]pipe:3")
+	args = append(args, "-t", decimal(duration+.25), "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy")
+	fragmentFlags := "+frag_keyframe+empty_moov+default_base_moof"
+	if unmarked {
+		// FFmpeg otherwise drops every packet while waiting for a key flag.
+		// Frame fragments let placeFragments divide this file at its cues.
+		args = append(args, "-copyinkf")
+		fragmentFlags = "+frag_every_frame+empty_moov+default_base_moof"
+	}
+	args = append(args, "-copytb", "1", "-avoid_negative_ts", "disabled", "-f", "tee", "[f=mp4:movflags="+fragmentFlags+":avoid_negative_ts=disabled]pipe:1|[f=framecrc]pipe:3")
 	return args
 }
 
@@ -826,6 +869,10 @@ func videoArgs(u string, skip, start, duration float64) []string {
 // Rebase fragment metadata, keep only complete GOPs before the next indexed
 // boundary, and preserve every compressed video sample byte-for-byte.
 func placeFragments(raw []byte, first, start, end float64, completeEnd bool, sequence uint32) ([]byte, error) {
+	return placeFragmentsMode(raw, first, start, end, completeEnd, sequence, false)
+}
+
+func placeFragmentsMode(raw []byte, first, start, end float64, completeEnd bool, sequence uint32, unmarked bool) ([]byte, error) {
 	init, media, err := splitFMP4(raw)
 	if err != nil {
 		return nil, err
@@ -895,8 +942,19 @@ func placeFragments(raw []byte, first, start, end float64, completeEnd bool, seq
 	if combined == nil {
 		return nil, errors.New("no video samples at requested seek position")
 	}
-	if firstPTS > start+.5 || (completeEnd && lastEnd < end-.5) {
+	endTolerance := .5
+	if unmarked {
+		// Frame fragments can be published before FFmpeg finishes the GOP.
+		// Wait until the packet coverage reaches the actual cue boundary.
+		endTolerance = .06
+	}
+	if firstPTS > start+.5 || (completeEnd && lastEnd < end-endTolerance) {
 		return nil, fmt.Errorf("incomplete video segment at %.1fs (packets cover %.1f–%.1fs of %.1f–%.1fs)", start-1, firstPTS-1, lastEnd-1, start-1, end-1)
+	}
+	if unmarked {
+		// The Matroska cue says this sample is independently seekable even
+		// though the source omitted its packet key flag.
+		combined.Samples[0].IsNonSyncSample = false
 	}
 	// Emit one fragment per HLS segment, with an absolute sequence number.
 	// Resetting mfhd to 1 for every extraction makes VLC detect a lost

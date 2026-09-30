@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -268,6 +269,50 @@ func TestIndexedFileSeekAndCopy(t *testing.T) {
 		if r == "" {
 			t.Fatal("unranged file read")
 		}
+	}
+}
+
+func TestIndexedMKVRemuxKeepsTailAfterOriginStopsServingIt(t *testing.T) {
+	dir := fixture(t)
+	path := filepath.Join(dir, "source.mkv")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tailOff atomic.Int64
+	var rejectTail atomic.Bool
+	var blocked atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if raw := r.Header.Get("Range"); raw != "" && rejectTail.Load() {
+			start, _, err := requestRange(raw, info.Size())
+			if err == nil && start >= tailOff.Load() {
+				blocked.Add(1)
+				http.Error(w, "tail unavailable", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		http.FileServer(http.Dir(dir)).ServeHTTP(w, r)
+	}))
+	defer origin.Close()
+	engine := testEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	asset, err := engine.OpenAsset(ctx, Origin{URL: origin.URL + "/source.mkv"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(asset.File.tail) == 0 || asset.File.tailOff+int64(len(asset.File.tail)) != info.Size() {
+		t.Fatal("Matroska tail was not retained")
+	}
+	tailOff.Store(asset.File.tailOff)
+	rejectTail.Store(true)
+	bounds := asset.Index.Boundaries[:3]
+	count := 0
+	if err := engine.VideoWindow(ctx, asset, bounds, func(int, []byte) error { count++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || blocked.Load() != 0 {
+		t.Fatalf("segments=%d, attempted unavailable tail reads=%d", count, blocked.Load())
 	}
 }
 

@@ -292,6 +292,16 @@ func indexMKV(r *metadataReader) (FileIndex, error) {
 	if video == 0 {
 		return FileIndex{}, errors.New("Matroska has no video track")
 	}
+	// Read the cue table together with any trailing metadata once. FFmpeg
+	// revisits this EOF region for every short extraction; retaining the same
+	// verified bytes avoids another CDN request after playback has started.
+	if off, ok := loc[0x1c53bb6b]; ok && r.f.Size-off <= 4<<20 {
+		tail, err := r.read(off, r.f.Size-off)
+		if err != nil {
+			return FileIndex{}, err
+		}
+		r.f.tailOff, r.f.tail = off, tail
+	}
 	cues, e := readFields(0x1c53bb6b)
 	if e != nil {
 		return FileIndex{}, e

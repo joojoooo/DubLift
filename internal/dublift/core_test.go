@@ -166,6 +166,32 @@ func TestFileRangeRetriesStalledHeadersWithoutTimingOutBody(t *testing.T) {
 	}
 }
 
+func TestFileRangeCanOutliveGeneralHTTPClientTimeout(t *testing.T) {
+	const clientTimeout = 40 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=0-1" {
+			t.Errorf("range = %q", got)
+		}
+		w.Header().Set("Content-Range", "bytes 0-1/2")
+		w.Header().Set("Content-Length", "2")
+		w.WriteHeader(206)
+		w.Write([]byte{1})
+		w.(http.Flusher).Flush()
+		time.Sleep(3 * clientTimeout)
+		w.Write([]byte{2})
+	}))
+	defer srv.Close()
+	n := NewNetwork()
+	n.Client.Timeout = clientTimeout
+	f := &RemoteFile{Net: n, Origin: Origin{URL: srv.URL}, Size: 2}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	data := make([]byte, 2)
+	if _, err := f.ReadAtContext(ctx, data, 0); err != nil || !bytes.Equal(data, []byte{1, 2}) {
+		t.Fatalf("progressing file body was cut off: %v, %v", data, err)
+	}
+}
+
 func TestOpenAssetUsesOneBoundedInitialRequest(t *testing.T) {
 	data := bytes.Repeat([]byte("x"), 128<<10)
 	requests := 0
