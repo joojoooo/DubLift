@@ -24,6 +24,10 @@ type metadataReader struct {
 }
 
 func (r *metadataReader) read(off, n int64) ([]byte, error) {
+	return r.readContext(r.ctx, off, n)
+}
+
+func (r *metadataReader) readContext(ctx context.Context, off, n int64) ([]byte, error) {
 	if n < 0 || n > 32<<20 || off < 0 || off > r.f.Size-n {
 		return nil, errors.New("container metadata exceeds bounded read budget")
 	}
@@ -40,7 +44,7 @@ func (r *metadataReader) read(off, n int64) ([]byte, error) {
 	r.used += length
 	r.cacheOff = off
 	r.cache = make([]byte, length)
-	_, e := r.f.ReadAtContext(r.ctx, r.cache, off)
+	_, e := r.f.ReadAtContext(ctx, r.cache, off)
 	return r.cache[:n], e
 }
 func BuildFileIndex(ctx context.Context, f *RemoteFile) (FileIndex, error) {
@@ -292,16 +296,6 @@ func indexMKV(r *metadataReader) (FileIndex, error) {
 	if video == 0 {
 		return FileIndex{}, errors.New("Matroska has no video track")
 	}
-	// Read the cue table together with any trailing metadata once. FFmpeg
-	// revisits this EOF region for every short extraction; retaining the same
-	// verified bytes avoids another CDN request after playback has started.
-	if off, ok := loc[0x1c53bb6b]; ok && r.f.Size-off <= 4<<20 {
-		tail, err := r.read(off, r.f.Size-off)
-		if err != nil {
-			return FileIndex{}, err
-		}
-		r.f.tailOff, r.f.tail = off, tail
-	}
 	cues, e := readFields(0x1c53bb6b)
 	if e != nil {
 		return FileIndex{}, e
@@ -341,7 +335,25 @@ func indexMKV(r *metadataReader) (FileIndex, error) {
 		return FileIndex{}, errors.New("Matroska has no video cues")
 	}
 	bounds, e := segmentBoundaries(keys, duration)
-	return FileIndex{duration, bounds, "matroska", keys[0]}, e
+	if e != nil {
+		return FileIndex{}, e
+	}
+	// FFmpeg revisits cues near EOF for every short extraction. Retain that
+	// region when available, but a failed read of unrelated trailing bytes
+	// must not invalidate the cue table we have already parsed.
+	if off, ok := loc[0x1c53bb6b]; ok && r.f.Size-off <= 4<<20 {
+		if off >= r.cacheOff && r.f.Size <= r.cacheOff+int64(len(r.cache)) {
+			r.f.tailOff = off
+			r.f.tail = append([]byte(nil), r.cache[off-r.cacheOff:]...)
+		} else if pinCtx, cancel, ok := optionalPinContext(r.ctx); ok {
+			if data, err := r.readContext(pinCtx, off, r.f.Size-off); err == nil {
+				r.f.tailOff = off
+				r.f.tail = append([]byte(nil), data...)
+			}
+			cancel()
+		}
+	}
+	return FileIndex{duration, bounds, "matroska", keys[0]}, nil
 }
 
 type mp4Box struct {

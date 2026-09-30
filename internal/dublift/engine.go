@@ -200,7 +200,13 @@ func (e *Engine) OpenAsset(ctx context.Context, o Origin, hls bool) (*Asset, err
 			a.File = f
 			a.Index, err = BuildFileIndex(ctx, f)
 			if err == nil && a.Index.Container == "matroska" && len(f.tail) == 0 {
-				err = f.pinTail(ctx)
+				if pinCtx, cancel, ok := optionalPinContext(ctx); ok {
+					_ = f.pinTail(pinCtx)
+					cancel()
+				}
+			}
+			if err == nil && ctx.Err() != nil {
+				err = ctx.Err()
 			}
 			return a, err
 		}

@@ -316,6 +316,45 @@ func TestIndexedMKVRemuxKeepsTailAfterOriginStopsServingIt(t *testing.T) {
 	}
 }
 
+func TestIndexedMKVDoesNotRequireUnrelatedTailBytes(t *testing.T) {
+	dir := fixture(t)
+	base, err := os.ReadFile(filepath.Join(dir, "source.mkv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, padding := range []int{1 << 20, 5 << 20} {
+		t.Run(fmt.Sprint(padding), func(t *testing.T) {
+			name := fmt.Sprintf("padded-%d.mkv", padding)
+			if err := os.WriteFile(filepath.Join(dir, name), append(bytes.Clone(base), make([]byte, padding)...), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var rejected atomic.Int32
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if raw := r.Header.Get("Range"); raw != "" {
+					start, end, err := requestRange(raw, int64(len(base)+padding))
+					if err == nil && end >= int64(len(base)) && end-start+1 >= 1<<20 {
+						rejected.Add(1)
+						http.Error(w, "trailing bytes unavailable", http.StatusServiceUnavailable)
+						return
+					}
+				}
+				http.FileServer(http.Dir(dir)).ServeHTTP(w, r)
+			}))
+			defer origin.Close()
+			engine := testEngine(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			asset, err := engine.OpenAsset(ctx, Origin{URL: origin.URL + "/" + name}, false)
+			if err != nil || asset == nil || len(asset.Index.Boundaries) < 2 {
+				t.Fatalf("valid cues were rejected after a tail read failed: asset=%v, err=%v", asset, err)
+			}
+			if rejected.Load() == 0 {
+				t.Fatal("fixture did not reject an optional tail request")
+			}
+		})
+	}
+}
+
 func checkProgressiveVideoWindow(t *testing.T, engine *Engine, ctx context.Context, a *Asset) {
 	t.Helper()
 	bounds := a.Index.Boundaries[:5]

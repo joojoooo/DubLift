@@ -618,6 +618,7 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 			var anchor Anchor
 			var err error
 			lastEnd := -1
+			allowSourceRead := false
 			sourceExtractor := source
 			if from == nil && i == 0 && !cfg.StartImmediately {
 				// The gated first check primes the beginning of the source file
@@ -649,12 +650,17 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 				v.mu.Unlock()
 				ctx, cancel := context.WithTimeout(context.WithValue(v.ctx, backgroundWorkKey{}, true), 30*time.Second)
 				radius := cfg.SearchRadius
-				if immediateFile {
+				if immediateFile && !allowSourceRead {
 					ctx = context.WithValue(ctx, cacheOnlyFileKey{}, true)
 				}
 				anchor, err = FindAnchor(ctx, sourceExtractor, vix, at, current.At(at, cfg.MinConfidence), radius, duration, window)
 				cancel()
-				if immediateFile && errors.Is(err, errRangeNotCached) {
+				if immediateFile && !allowSourceRead && errors.Is(err, errRangeNotCached) {
+					// Video remuxes need not read every interleaved audio byte.
+					// Retry this completed playback area with a lower-priority
+					// origin read instead of waiting for another player request.
+					allowSourceRead = true
+					lastEnd = -1
 					continue
 				}
 				if immediateFile {
@@ -663,6 +669,7 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 					v.mu.Unlock()
 					if seeked {
 						lastEnd = -1
+						allowSourceRead = false
 						continue
 					}
 				}

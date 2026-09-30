@@ -1,4 +1,4 @@
-# Validation — through 29 September 2026
+# Validation — through 30 September 2026
 
 ## Deterministic checks
 
@@ -100,3 +100,9 @@ The saved first 12 MiB of that source, served through DubLift's ranged file path
 The first-prefix check missed failures reported at 44.9 seconds and on a four-minute seek. FFmpeg can exit after receiving a truncated ranged file, leaving one or zero video packets; the coverage check correctly rejects those segments. A cold-range trace caught an advertised `206` for the file's tail metadata with zero body bytes. Without that seek data, FFmpeg scanned earlier media and produced one packet far before the requested segment. DubLift now retains the header and a bounded tail containing the Matroska cue table after indexing, so later remuxes do not reread them from the CDN. The supplied file's cue table and trailing metadata fit in about 1.3 MiB, already fetched during indexing. File chunks can reopen the entry URL on additional failed workers. The general HTTP client timeout also canceled a finite CDN range after 45 seconds even if its body was still progressing through the 1 MiB cache chunks. File ranges now keep the existing header deadline, per-chunk timeout, and remux job limit without that whole-response cutoff. The default per-chunk read allowance was increased from five to fifteen seconds.
 
 For an origin-independent seek check, a sparse local copy containing the source header, cue table, and 233.650–248.540 second media bytes produced complete 2.95 MB and 3.34 MB remuxed segments. VLC opened video output for each independently and saved six decoded frames from the first. A live ranged-source check returned complete two-segment windows at both 44.878–62.854 and 233.650–248.540 seconds. Regression tests cover a progressing response beyond the general HTTP client timeout, playback after the origin stops serving the indexed MKV tail, and recovery through an additional CDN worker. These sampled checks do not establish uninterrupted playback of the full live title or Vixsrc audio at the seek.
+
+## 30 September — merge review fixes
+
+The full race suite intermittently left the MKV fixture's automatic alignment waiting after all requested video segments had completed. A trace found the source audio probe repeatedly requesting the same uncached 1 MiB range. Video remuxing had not needed that interleaved audio range, so waiting for another video request could not fill it. Alignment now tries cached bytes first, then fills a missing range through the existing lower-priority file-read path and retries the same completed playback area. The full race suite passed three consecutive runs after this change.
+
+Matroska cue parsing now completes before optional EOF pinning. A failed read of unrelated trailing bytes does not reject an otherwise indexed file, and optional pin reads have a short deadline that leaves time for the source check to finish. A regression test covers both a nearby and a distant unavailable tail. `go test ./...`, `go vet ./...`, and `git diff --check` passed.

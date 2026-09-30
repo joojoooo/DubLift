@@ -242,6 +242,21 @@ func (f *RemoteFile) pinTail(ctx context.Context) error {
 	return nil
 }
 
+// Leave time for the source check to complete. Tail retention only avoids
+// later reads, so it should be skipped when discovery is near its
+// deadline or an optional origin range stalls.
+func optionalPinContext(parent context.Context) (context.Context, context.CancelFunc, bool) {
+	const timeout = 5 * time.Second
+	if parent.Err() != nil {
+		return nil, nil, false
+	}
+	if deadline, ok := parent.Deadline(); ok && time.Until(deadline) <= timeout+time.Second {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	return ctx, cancel, true
+}
+
 // Return pinned bytes starting at off, or the size of the gap before them.
 func (f *RemoteFile) pinnedAt(off, size int64) ([]byte, int64) {
 	if off < int64(len(f.prefix)) {
