@@ -31,12 +31,13 @@
         </div>
         <div class="wizard-steps" aria-hidden="true"><span>Install</span><span>Sources</span><span>Playback</span></div>
         <div class="wizard-step" data-step="0">
-          <h3>Install DubLift in your player</h3>
-          <p class="help">Add this manifest in Stremio or Nuvio. This step continues when your player requests it.</p>
-          <div class="copy-row"><input id="manifest" readonly aria-label="Addon manifest URL" /><button id="copy-manifest" class="icon-button" type="button">Copy</button></div>
-          <a id="install" class="button primary" href="#">Install in Stremio ↗</a>
-          <p class="help install-warning">Stremio may refuse to install a local HTTP addon through this button. If that happens, copy the manifest URL above and paste it into Stremio’s Add-ons page manually.</p>
-          <p id="manifest-wait" class="help" role="status">Waiting for a manifest request…</p>
+          <h3>Install DubLift on Nuvio/Stremio</h3>
+          <div class="copy-row">
+            <input id="manifest" readonly aria-label="Addon manifest URL" />
+            <button id="copy-manifest" class="icon-button" type="button">Copy</button>
+            <a id="install" class="button primary" href="#">Install in Nuvio ↗</a>
+          </div>
+          <p class="help install-warning"><strong>Stremio doesn't allow adding HTTP addons directly.</strong> Use <a class="inline-link" href="https://gateniomer.github.io/stremio-addon-manager/" target="_blank" rel="noopener noreferrer">Stremio Addon Manager ↗</a> to sync the addon to your Stremio account.</p>
         </div>
         <div class="wizard-step" data-step="1" hidden>
           <h3>Connect upstream addons</h3>

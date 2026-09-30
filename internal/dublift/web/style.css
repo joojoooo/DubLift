@@ -107,7 +107,6 @@ header {
 .wizard-steps span { border-top: 3px solid var(--line); padding-top: 8px; color: var(--muted); font-size: 12px; }
 .wizard-steps span.active { border-color: var(--accent); color: var(--text); }
 .wizard-step h3 { font-size: 21px; }
-.wizard-step .copy-row { max-width: 650px; }
 .wizard-fields { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 20px; }
 .wizard-actions { justify-content: flex-end; margin-top: 28px; }
 .wizard-actions #wizard-back { margin-right: auto; }
@@ -155,7 +154,8 @@ h3 {
   padding: 24px;
 }
 .copy-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(2, 130px);
   gap: 7px;
   margin: 22px 0 16px;
 }
@@ -163,6 +163,17 @@ h3 {
   font-family: monospace;
   font-size: 12px;
   min-width: 0;
+  height: 40px;
+  margin: 0;
+}
+.copy-row > .icon-button,
+.copy-row > .button {
+  width: 100%;
+  height: 40px;
+}
+.copy-row > .button {
+  padding-inline: 6px;
+  white-space: nowrap;
 }
 .button {
   display: inline-flex;
@@ -601,6 +612,10 @@ code {
   .offset-form {
     gap: 8px;
   }
+}
+@media (max-width: 600px) {
+  .copy-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .copy-row input { grid-column: 1 / -1; }
 }
 
 [hidden] {

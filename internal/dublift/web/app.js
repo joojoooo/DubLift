@@ -659,7 +659,6 @@ function renderStatus(state) {
     if (setupStep === 0) {
       if (manifestBaseline === null) manifestBaseline = state.manifestRequests;
       else if (state.manifestRequests > manifestBaseline) {
-        $("manifest-wait").textContent = "Manifest request detected.";
         setupStep = 1;
         renderWizard();
       }
