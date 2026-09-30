@@ -20,34 +20,29 @@ type Addon struct {
 }
 
 type Settings struct {
-	Listen         string `json:"listen"`
-	PublicURL      string `json:"publicURL"`
-	PreferProxy    bool   `json:"preferProxy"`
-	DirectPlayback bool   `json:"directPlayback"`
-	// nil is infinite: prefer direct audio regardless of measured offset.
-	DirectTolerance                *float64 `json:"directTolerance"`
-	MinConfidence                  float64  `json:"minConfidence"`
-	SearchRadius                   float64  `json:"searchRadius"`
-	AlignmentSampleSeconds         int      `json:"alignmentSampleSeconds"`
-	AlignmentSamples               int      `json:"alignmentSamples"`
-	MaxItalianResults              int      `json:"maxItalianResults"`
-	MaxItalianResultsPerStreamType int      `json:"maxItalianResultsPerStreamType"`
-	SourceCheckTimeoutSeconds      int      `json:"sourceCheckTimeoutSeconds"`
-	SourceCheckParallelism         int      `json:"sourceCheckParallelism"`
-	BypassSourceChecks             bool     `json:"bypassSourceChecks"`
-	StartImmediately               bool     `json:"startImmediately"`
-	CacheMB                        int      `json:"cacheMB"`
-	FFmpeg                         string   `json:"ffmpeg"`
-	FFprobe                        string   `json:"ffprobe"`
-	VixBaseURL                     string   `json:"vixBaseURL"`
-	TMDBToken                      string   `json:"tmdbToken"`
-	Addons                         []Addon  `json:"addons"`
-	SetupCompleted                 bool     `json:"setupCompleted"`
+	Listen                         string  `json:"listen"`
+	PublicURL                      string  `json:"publicURL"`
+	MinConfidence                  float64 `json:"minConfidence"`
+	SearchRadius                   float64 `json:"searchRadius"`
+	AlignmentSampleSeconds         int     `json:"alignmentSampleSeconds"`
+	AlignmentSamples               int     `json:"alignmentSamples"`
+	MaxItalianResults              int     `json:"maxItalianResults"`
+	MaxItalianResultsPerStreamType int     `json:"maxItalianResultsPerStreamType"`
+	SourceCheckTimeoutSeconds      int     `json:"sourceCheckTimeoutSeconds"`
+	SourceCheckParallelism         int     `json:"sourceCheckParallelism"`
+	BypassSourceChecks             bool    `json:"bypassSourceChecks"`
+	StartImmediately               bool    `json:"startImmediately"`
+	CacheMB                        int     `json:"cacheMB"`
+	FFmpeg                         string  `json:"ffmpeg"`
+	FFprobe                        string  `json:"ffprobe"`
+	VixBaseURL                     string  `json:"vixBaseURL"`
+	TMDBToken                      string  `json:"tmdbToken"`
+	Addons                         []Addon `json:"addons"`
+	SetupCompleted                 bool    `json:"setupCompleted"`
 }
 
 func DefaultSettings() Settings {
-	tolerance := .125
-	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), DirectPlayback: true, DirectTolerance: &tolerance, MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, MaxItalianResults: 3, MaxItalianResultsPerStreamType: 2, SourceCheckTimeoutSeconds: 20, SourceCheckParallelism: 3, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
+	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, MaxItalianResults: 3, MaxItalianResultsPerStreamType: 2, SourceCheckTimeoutSeconds: 20, SourceCheckParallelism: 3, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
 }
 
 func defaultPublicURL() string {
@@ -107,9 +102,6 @@ func (c Settings) Validate() error {
 	}
 	if c.SourceCheckParallelism < 1 || c.SourceCheckParallelism > 16 {
 		return errors.New("parallel source checks must be between 1 and 16")
-	}
-	if c.DirectTolerance != nil && (math.IsNaN(*c.DirectTolerance) || math.IsInf(*c.DirectTolerance, 0) || *c.DirectTolerance < 0) {
-		return errors.New("direct tolerance must be nonnegative, or null for infinite")
 	}
 	if math.IsNaN(c.MinConfidence) || c.MinConfidence < 0 || c.MinConfidence > 1 {
 		return errors.New("minimum confidence must be between 0 and 1")
@@ -175,10 +167,6 @@ func (c *Config) Get() Settings {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	s := c.value
-	if s.DirectTolerance != nil {
-		x := *s.DirectTolerance
-		s.DirectTolerance = &x
-	}
 	s.Addons = append([]Addon{}, s.Addons...)
 	return s
 }

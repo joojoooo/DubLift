@@ -567,6 +567,7 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 			SourceCheckDeferred bool
 			Passthrough         bool
 			FallbackReason      string
+			Status              string
 		}
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
@@ -587,13 +588,13 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if !state.Sessions[0].Passthrough || state.Sessions[0].SourceCheckDeferred || state.Sessions[0].FallbackReason == "" {
+	if state.Sessions[0].Passthrough || state.Sessions[0].SourceCheckDeferred || state.Sessions[0].Status != "Source unavailable" {
 		t.Fatal(w.Body.String())
 	}
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "/media/"+state.Sessions[1].ID+"/master.m3u8", nil))
-	if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != streams[1].URL || sourceRequests.Load() != 1 {
-		t.Fatal("result beyond the limit must keep its original source:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
+	if w.Code != http.StatusBadGateway || w.Header().Get("Location") != "" || sourceRequests.Load() != 1 {
+		t.Fatal("untransformed result exposed an upstream redirect:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
 	}
 	italian.Store(false)
 	w = httptest.NewRecorder()

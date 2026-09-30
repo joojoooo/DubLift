@@ -20,6 +20,25 @@ func sendPlaylist(w http.ResponseWriter, b []byte) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Write(b)
 }
+func (s *Server) awaitStartupAlignment(ctx context.Context, v *Session) {
+	if s.Config.Get().StartImmediately {
+		return
+	}
+	v.mu.Lock()
+	done := v.firstAligned
+	running := v.Aligning
+	v.mu.Unlock()
+	if !running || done == nil {
+		return
+	}
+	// The first attempted sample gates startup. A failed attempt releases the
+	// player with offset zero; later samples never delay the selected stream.
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-v.ctx.Done():
+	}
+}
 func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	p := strings.Split(strings.TrimPrefix(r.URL.Path, "/media/"), "/")
 	if len(p) < 2 {
@@ -64,23 +83,15 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.prepareSession(r.Context(), v); err != nil {
 		v.note(err)
-		if p[1] == "master.m3u8" {
-			v.mu.Lock()
-			v.Passthrough = true
-			v.FallbackReason = err.Error()
-			v.Status = "Returning original upstream stream"
-			v.mu.Unlock()
-			http.Redirect(w, r, v.stream.URL, http.StatusTemporaryRedirect)
-			return
-		}
 		failure(w, 502, err)
 		return
 	}
 	switch {
 	case p[1] == "master.m3u8":
 		v.mu.Lock()
-		if v.delivery == nil {
+		if !v.masterLoaded {
 			v.startupZero = s.Config.Get().StartImmediately && v.Aligning
+			v.masterLoaded = true
 		}
 		v.mu.Unlock()
 		s.awaitStartupAlignment(r.Context(), v)
@@ -90,8 +101,6 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sendPlaylist(w, b)
-	case p[1] == "direct" && len(p) == 3:
-		s.serveDirect(w, r, v, p[2])
 	case p[1] == "video.m3u8":
 		if v.video.HLS != nil {
 			sendPlaylist(w, []byte(s.proxyPlaylist(v, v.video, true)))
@@ -308,10 +317,6 @@ func serveBytes(w http.ResponseWriter, r *http.Request, kind string, data []byte
 	http.ServeContent(w, r, "segment", time.Time{}, bytes.NewReader(data))
 }
 func (s *Server) master(v *Session) ([]byte, error) {
-	delivery := s.deliveryFor(v)
-	v.mu.Lock()
-	v.delivery = &delivery
-	v.mu.Unlock()
 	m := playlist.Multivariant{Version: 7}
 	variant := playlist.MultivariantVariant{Bandwidth: 20000000}
 	if v.variant != nil {
@@ -319,9 +324,6 @@ func (s *Server) master(v *Session) ([]byte, error) {
 		variant.Codecs = append([]string{}, v.variant.Codecs...)
 	}
 	variant.URI = "video.m3u8"
-	if delivery.VideoDirect {
-		variant.URI = v.directURI(v.video)
-	}
 	variant.Audio = "audio"
 	variant.Subtitles = ""
 	variant.Video = ""
@@ -358,9 +360,6 @@ func (s *Server) master(v *Session) ([]byte, error) {
 	names := map[string]int{}
 	for _, t := range ordered {
 		uri := "track/" + t.ID + ".m3u8"
-		if delivery.Tracks[t.ID] {
-			uri = v.directURI(t.Asset)
-		}
 		uriPointer := &uri
 		if t.Original && !t.Subtitle && t.Asset == v.video && v.video.HLS != nil {
 			uriPointer = nil
@@ -446,22 +445,20 @@ func (s *Server) proxyPlaylist(v *Session, a *Asset, track bool) string {
 	var b strings.Builder
 	idx := 0
 	rewrite := func(raw string) string {
-		return s.baseResource(v, Origin{raw, a.Origin.Headers}, 0, false, false, false)
+		return v.addResource(Origin{raw, a.Origin.Headers}, 0, false, false)
 	}
 	for _, line := range strings.Split(a.HLS.Raw, "\n") {
 		l := strings.TrimSpace(line)
 		if l != "" && !strings.HasPrefix(l, "#") {
 			position := 0.0
-			force := false
 			if idx < len(a.HLS.Segments) {
 				position = a.HLS.Segments[idx].Start
-				force = a.HLS.Segments[idx].Range != ""
 			}
 			u, err := resolveURL(a.HLS.Origin.URL, l)
 			if err != nil {
 				continue
 			}
-			b.WriteString(s.baseResource(v, Origin{u, a.Origin.Headers}, position, track, force, a == v.video))
+			b.WriteString(v.addResource(Origin{u, a.Origin.Headers}, position, track, a == v.video))
 			idx++
 		} else {
 			b.WriteString(rewriteURI(line, a.HLS.Origin.URL, rewrite))
@@ -502,9 +499,6 @@ func (s *Server) sectionClock(ctx context.Context, v *Session, n int) (float64, 
 	}
 	return strconv.ParseFloat(string(b), 64)
 }
-func (s *Server) baseResource(v *Session, o Origin, at float64, track, force, video bool) string {
-	return v.addResource(o, at, track, force, video)
-}
 func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id string) {
 	v.mu.Lock()
 	res, ok := v.resources[id]
@@ -517,18 +511,6 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 		v.position(res.Position)
 	} else if res.Track {
 		v.audioPosition(res.Position)
-	}
-	force := res.Force || s.Config.Get().PreferProxy || len(res.Origin.Headers) > 0
-	if u, err := httpURL(res.Origin.URL); err == nil && s.Net.Client.Jar != nil && len(s.Net.Client.Jar.Cookies(u)) > 0 {
-		force = true
-	}
-	if res.Video {
-		v.videoRedirected.Store(!force)
-	}
-	if !force {
-		w.Header().Set("Cache-Control", "no-store")
-		http.Redirect(w, r, res.Origin.URL, http.StatusTemporaryRedirect)
-		return
 	}
 	if res.Video {
 		defer beginVideoDownload(context.WithValue(r.Context(), videoBytesKey{}, &v.videoDownload))()

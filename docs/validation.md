@@ -9,9 +9,7 @@
 - Complete upstream JSON preservation for missing Italian, torrents, external links and non-seekable sources; emoji-only name changes; configured-addon/response ordering; full dashboard text.
 - Playback detection before preparation completes; harmless HEAD checks; replacement of unselected results while preserving active playback; cancellation and cache collection; one-hour expiry of memory and disk alignment data; canceled work cannot restore deleted entries. Encrypted links recreate discarded sessions, including after a server restart; expired or tampered tickets are rejected.
 - Requested file ranges share the bounded cache. Foreground reads can complete while analysis is paused, including when both request the same range; canceled analysis does not poison subsequent playback reads.
-- Default ±0.125-second direct policy, failed/incomplete samples, differing edits, native clocks, discontinuities, infinite tolerance, setting persistence and proxy preference priority.
-- A cached master continued to play and seek to encrypted alternate audio after both DubLift HTTP listeners were stopped. The mock origins stayed available; no DubLift redirect or media URL was needed.
-- Headless Chromium: desktop and 390-pixel mobile layouts, settings save/reload, custom/infinite tolerance, upstream editing, episode presets, active-session delivery guidance, manual offset/reset and an explicit-position realignment request. New sample-count and startup controls were saved and reloaded. Full multiline stream details, original result order, selected-session removal, sample progress and zero-to-calculated offset updates were checked. No JavaScript errors or horizontal overflow.
+- Headless Chromium: desktop and 390-pixel mobile layouts, settings save/reload, upstream editing, episode presets, manual offset/reset and realignment requests. New sample-count and startup controls were saved and reloaded. Full multiline stream details, original result order, selected-session removal, sample progress and zero-to-calculated offset updates were checked. No JavaScript errors or horizontal overflow.
 - Linux amd64, Linux arm64 and Android arm64 builds. Android binary execution has not been tested on a physical device.
 
 ## Live provider checks
@@ -33,7 +31,7 @@ On 26 September, the development checker resolved upstream HTTP streams for all 
 | Inception / 27205 | Italian and English |
 | Interstellar / 157336 | Italian and English |
 
-On 27 September, a Matrix 4K HLS source produced three verified anchors: +1.110 s, +1.124 s and +1.118 s, with confidence approximately 92%, 94% and 78%. The selected global offset was +1.118 s. Late video and Italian-audio segments were fetched and decoded. Anonymous origin checks rejected direct access for this source, so playback correctly retained header proxying.
+On 27 September, a Matrix 4K HLS source produced three verified anchors: +1.110 s, +1.124 s and +1.118 s, with confidence approximately 92%, 94% and 78%. The selected global offset was +1.118 s. Late video and Italian-audio segments were fetched and decoded. The source required media headers, which DubLift forwarded through its local media endpoints.
 
 A separate 37.7 GB indexed Matrix Matroska source passed strict range probing and exposed its original audio tracks. Its origin transferred a 4 MiB range in about 5.2 seconds, below the source's average media bitrate. After the fixes below, VLC decoded 4K HEVC video and Italian audio, but could not sustain playback or complete the seek within the test deadline. Requested video remuxes exceeded their 60-second limit. This source remains unsuitable on that measured connection; successful playlist generation is not counted as a playback pass.
 
@@ -41,7 +39,7 @@ The installed FFmpeg 6.1 HLS client reproduced its upstream fMP4 seek defect. Sa
 
 VLC 3.0.24 was exercised with dummy audio/video outputs through the ordinary local master URL. Its status reported decoded 3840×2160 H.264 video and Italian AAC audio while playback advanced past ten minutes. A seek to twenty minutes then produced 297 new decoded video frames and increased the decoded-audio counter by 832, with playback advancing past 20:02. DubLift reported no session errors. The private `.local/vlc-*-status.json` files contain the detailed playback counters.
 
-Stremio ExoPlayer and Nuvio device playback, and Android/Termux runtime behavior, still need hardware validation. Direct URLs remain subject to their providers' expiry and availability after DubLift stops.
+Stremio ExoPlayer and Nuvio device playback, and Android/Termux runtime behavior, still need hardware validation.
 
 ## Startup changes — live recheck
 
@@ -72,7 +70,7 @@ File video range reads now keep a finite origin response open for up to 8 MiB wh
 
 The one-minute check above missed recurring stalls. An extended R2 run reproduced video requests taking 13–22 seconds: repeated six-second remuxes and origin reconnects eventually exhausted the player's buffer. Increasing lookahead alone did not resolve this. Audio and video requests also overwrote the same dashboard position, causing misleading backward movements.
 
-File video now uses sequential remux windows of up to 30 seconds, sized toward 24 MiB of source data, publishing each complete segment while FFmpeg is still working. Finite origin requests stream up to 32 MiB in 1 MiB cache chunks. Indexed metadata avoids repeated stream-info scans. Rolling workers prepare video and the selected audio, retry failures, revisit evicted entries, and cancel obsolete reads/remuxes on seeks. The initialization map survives media-cache eviction. The dashboard follows video requests when visible and otherwise uses audio for direct-video playback.
+File video now uses sequential remux windows of up to 30 seconds, sized toward 24 MiB of source data, publishing each complete segment while FFmpeg is still working. Finite origin requests stream up to 32 MiB in 1 MiB cache chunks. Indexed metadata avoids repeated stream-info scans. Rolling workers prepare video and the selected audio, retry failures, revisit evicted entries, and cancel obsolete reads/remuxes on seeks. The initialization map survives media-cache eviction. The dashboard follows video requests when visible and otherwise uses audio requests.
 
 An extended VLC run of the same 2.91 GB R2 source reached **479 seconds**. After playback began, its clock advanced **478 seconds in 478.21 seconds** of wall time, with **zero backward clock or requested-area jumps** and no observed rebuffering. The maximum unchanged-clock interval in one-second samples was 1.03 seconds. After the first 20 seconds, all 79 video responses completed within **5 ms** and all 80 selected Italian audio responses within **1 ms**. VLC reported 22,990 decoded video frames and 45,306 decoded audio blocks. Cache use stayed below its configured 512 MiB limit while old entries were evicted; the server process recorded zero disk writes. This is an eight-minute check, not a full-episode guarantee.
 

@@ -84,7 +84,7 @@ func TestRequestedAreaFollowsVideoAcrossAudioRequestsAndSeeks(t *testing.T) {
 	v := &Session{}
 	v.audioPosition(30)
 	if v.Position != 30 {
-		t.Fatal("direct-video playback lost audio position tracking")
+		t.Fatal("audio playback lost position tracking")
 	}
 	v.position(42)
 	v.audioPosition(36)

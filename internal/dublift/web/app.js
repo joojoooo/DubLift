@@ -231,13 +231,7 @@ async function loadSettings() {
   for (const [key, id] of Object.entries(fields))
     $(id).value = settings[key] ?? "";
   $("bypass-source-checks").checked = settings.bypassSourceChecks;
-  $("prefer-proxy").checked = settings.preferProxy;
   $("start-immediately").checked = settings.startImmediately;
-  $("direct-playback").checked = settings.directPlayback;
-  $("direct-mode").value =
-    settings.directTolerance === null ? "infinite" : "finite";
-  $("direct-tolerance").value = settings.directTolerance ?? 0.125;
-  directControls();
   $("confidence").value = settings.minConfidence;
   confidenceLabel();
   $("addons").replaceChildren();
@@ -257,14 +251,6 @@ function confidenceLabel() {
   $("confidence-value").textContent =
     Math.round(Number($("confidence").value) * 100) + "%";
 }
-function directControls() {
-  const infinite = $("direct-mode").value === "infinite";
-  $("direct-tolerance-label").hidden = infinite;
-  $("direct-tolerance").disabled = infinite || !$("direct-playback").checked;
-  $("direct-mode").disabled = !$("direct-playback").checked;
-}
-$("direct-mode").onchange = directControls;
-$("direct-playback").onchange = directControls;
 $("confidence").oninput = confidenceLabel;
 $("add-addon").onclick = () => addonRow();
 $("wizard-add-addon").onclick = () => addonRow(undefined, $("wizard-addons"));
@@ -280,13 +266,7 @@ $("settings-form").onsubmit = async (e) => {
       ? Number($(id).value)
       : $(id).value.trim();
   cfg.bypassSourceChecks = $("bypass-source-checks").checked;
-  cfg.preferProxy = $("prefer-proxy").checked;
   cfg.startImmediately = $("start-immediately").checked;
-  cfg.directPlayback = $("direct-playback").checked;
-  cfg.directTolerance =
-    $("direct-mode").value === "infinite"
-      ? null
-      : Number($("direct-tolerance").value);
   cfg.minConfidence = Number($("confidence").value);
   cfg.addons = readAddons($("addons"));
   try {
@@ -416,12 +396,7 @@ function createCard(session) {
       const btn = card.querySelector(selector);
       btn.disabled = true;
       try {
-        let payload = body;
-        if (route === "realign") {
-          const position = card.querySelector(".player-position").value;
-          if (position !== "") payload = { position: Number(position) };
-        }
-        await api(`/api/sessions/${id}/${route}`, payload);
+        await api(`/api/sessions/${id}/${route}`, body);
         toast(message);
       } catch (err) {
         toast(err.message);
@@ -504,60 +479,16 @@ function updateCard(v) {
   card.querySelector(".confidence-bar span").style.width =
     (a.confidence || 0) * 100 + "%";
   set(".tracks", (v.tracks || []).map((t) => t.name).join(" · "));
-  set(".proxy", v.proxyReason || "");
-  const direct = v.directPlayback || {};
-  const loaded = v.loadedDelivery;
-  const reload =
-    loaded &&
-    (loaded.videoDirect !== direct.videoDirect ||
-      loaded.audioDirect !== direct.audioDirect ||
-      loaded.canStopServer !== direct.canStopServer);
-  set(
-    ".delivery-mode",
-    reload
-      ? direct.canStopServer
-        ? "Direct playback ready · reopen the HLS URL"
-        : "Playback settings changed · reopen the HLS URL"
-      : direct.canStopServer
-        ? "Fully direct playback available"
-        : direct.audioDirect
-          ? "Direct audio · DubLift still needed"
-          : direct.videoDirect
-            ? "Direct video · generated audio"
-            : "DubLift media processing",
-  );
-  set(
-    ".delivery-reason",
-    (direct.reasons || []).filter(Boolean).join(" ") +
-      (direct.canStopServer
-        ? " Once the player has loaded these playlists, playback and seeking use the origins. Signed URLs still have their normal expiry."
-        : "") +
-      (reload
-        ? " Existing buffered playback keeps its previous URLs. Reopen to switch."
-        : ""),
-  );
-  set(
-    ".player-delay",
-    direct.forced
-      ? direct.playerOffset != null && a.confidence > 0
-        ? `Suggested player audio delay: ${direct.playerOffset >= 0 ? "+" : ""}${direct.playerOffset.toFixed(3)} s. This includes the native media clock difference.`
-        : "Infinite tolerance is active. No verified player delay is available yet."
-      : "",
-  );
-  card.querySelector(".player-position-label").hidden = !(
-    loaded?.canStopServer || direct.canStopServer
-  );
   card.querySelector(".prepare").textContent = v.sourceCheckDeferred ? "Check & prepare" : "Prepare playback";
   card.querySelector(".prepare").hidden = !!v.preparationStarted || !!v.ready || !!v.passthrough;
   card.querySelector(".prepare").disabled = v.checked === false;
   card.querySelector(".session-metrics").hidden = !v.ready;
   card.querySelector(".confidence-bar").hidden = !v.ready;
-  card.querySelector(".delivery-info").hidden = !v.ready;
   card.querySelector("details").hidden = !v.ready;
   card.querySelector(".realign").hidden = !v.ready;
   card.querySelector(".copy").textContent = v.passthrough ? "Copy original upstream URL" : "Copy DubLift URL";
   card.querySelector(".copy-original").hidden = v.passthrough || !v.originalUrl;
-  if (v.passthrough) set(".sample-progress", `${v.fallbackReason || "DubLift unavailable"}. Sent unchanged to Stremio. Direct upstream playback does not report activity to DubLift.`);
+  if (v.passthrough) set(".sample-progress", `${v.fallbackReason || "DubLift unavailable"}. Original link returned to Stremio; DubLift cannot track its playback.`);
   card.querySelector(".realign").disabled = v.aligning || !v.ready;
   card.querySelector(".analyze").disabled = v.aligning || !v.ready;
   const input = card.querySelector(".manual");
@@ -600,9 +531,6 @@ function updateVideoDownload() {
     if (!playingVideo || $("connection-dot").classList.contains("offline")) {
       videoSample = null;
       setText(videoStat, "—");
-    } else if (playingVideo.passthrough || playingVideo.loadedDelivery?.videoDirect || playingVideo.videoRedirected) {
-      videoSample = null;
-      setText(videoStat, "Direct");
     } else {
       const now = performance.now();
       const bytes = playingVideo.videoBytes || 0;

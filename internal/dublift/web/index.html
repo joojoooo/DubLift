@@ -72,7 +72,7 @@
         </div>
         <div>
           <span class="small">VIDEO DOWNLOAD</span
-          ><strong id="video-download" title="Live speed of video bytes received from the upstream source. Idle means no video request is active; Direct means the player downloads video without DubLift.">—</strong>
+          ><strong id="video-download" title="Live speed of video bytes received from the upstream source. Idle means no video request is active.">—</strong>
         </div>
         <div>
           <span class="small">ROLLING CACHE</span
@@ -208,50 +208,6 @@
             <label class="switch-row"><input id="bypass-source-checks" type="checkbox" /><span><strong>Bypass source checks when listing</strong><small>Return up to the configured number of HTTP streams with Italian audio as soon as Vixsrc Italian audio is confirmed. Check each source when you play it or click Check &amp; prepare. Parallel source checks apply only when this is off.</small></span></label>
             <p class="help">Check earlier streams of each type first, then use remaining slots when other types cannot fill them. Up to the selected number of checks run at once. Results keep upstream order, and unchecked streams keep their original links.</p>
             <hr />
-            <h3>Playback delivery</h3>
-            <label class="switch-row"
-              ><input id="prefer-proxy" type="checkbox" /><span
-                ><strong>Prefer proxying upstream media through DubLift</strong
-                ><small
-                  >Off: let the player fetch eligible video directly from its
-                  origin. Headers, generated media and file remuxing still use
-                  DubLift.</small
-                ></span
-              ></label
-            >
-            <div class="direct-settings">
-              <label class="switch-row"
-                ><input id="direct-playback" type="checkbox" /><span
-                  ><strong>Use direct Vixsrc audio when possible</strong
-                  ><small
-                    >Let the player fetch untouched audio and video itself. Once
-                    their playlists are loaded, fully direct playback can
-                    continue after DubLift stops.</small
-                  ></span
-                ></label
-              ><label
-                >Direct audio tolerance<select id="direct-mode">
-                  <option value="finite">Only when all samples agree</option>
-                  <option value="infinite">
-                    Infinite · synchronize in the player
-                  </option>
-                </select></label
-              ><label id="direct-tolerance-label"
-                >Maximum absolute offset (seconds)<input
-                  id="direct-tolerance"
-                  type="number"
-                  min="0"
-                  step="0.001"
-                  value="0.125"
-              /></label>
-              <p class="help">
-                Default: ±0.125 seconds. Infinite skips the alignment threshold;
-                use the calculated delay in your player. Required headers or
-                remuxing can still need DubLift. Proxy preference takes
-                priority.
-              </p>
-            </div>
-            <hr />
             <h3>Audio alignment</h3>
             <label
               >Minimum alignment confidence
@@ -351,19 +307,6 @@
         </div>
         <div class="confidence-bar"><span></span></div>
         <p class="tracks help"></p>
-        <div class="delivery-info">
-          <strong class="delivery-mode"></strong>
-          <p class="delivery-reason help"></p>
-          <p class="player-delay help"></p>
-        </div>
-        <label class="player-position-label" hidden
-          >Current player position (seconds)<input
-            class="player-position"
-            type="number"
-            min="0"
-            step="1"
-            placeholder="Needed to realign fully direct playback"
-        /></label>
         <div class="actions">
           <button class="button primary prepare">Prepare playback</button
           ><button class="button secondary realign">
@@ -398,7 +341,6 @@
               Reset saved synchronization
             </button>
           </div>
-          <p class="proxy help"></p>
           <pre class="anchors"></pre>
         </details>
         <ul class="errors"></ul></article

@@ -500,7 +500,7 @@ func TestPrivateConfigAndIDs(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if st.Mode().Perm() != 0600 || c.Get().PreferProxy || c.Get().Listen != "0.0.0.0:7000" {
+	if st.Mode().Perm() != 0600 || c.Get().Listen != "0.0.0.0:7000" {
 		t.Fatal("incorrect defaults or permissions")
 	}
 	for _, id := range []string{"tmdb:81349:1:2", "81349:1:2", "tt8134186:1:2"} {

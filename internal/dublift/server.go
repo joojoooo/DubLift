@@ -270,7 +270,7 @@ func (s *Server) status(r *http.Request) map[string]any {
 	snapshots := []map[string]any{}
 	for _, v := range sessions {
 		v.mu.Lock()
-		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, v.listedAsset), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "sourceCheckDeferred": v.SourceCheckDeferred, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "videoRedirected": v.videoRedirected.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
+		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, v.listedAsset), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "sourceCheckDeferred": v.SourceCheckDeferred, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
 		if v.Passthrough {
 			view["url"] = v.stream.URL
 		}
@@ -290,7 +290,6 @@ func (s *Server) status(r *http.Request) map[string]any {
 			view["preparationDone"] = true
 			view["sourceFormat"] = streamSourceFormat(v.stream, v.video)
 			view["duration"] = v.Duration
-			view["proxyReason"] = v.ProxyReason
 			view["alignment"] = s.Alignments.Get(v.Key)
 			view["ready"] = v.prepareErr == nil
 			tracks := []map[string]string{}
@@ -298,12 +297,6 @@ func (s *Server) status(r *http.Request) map[string]any {
 				tracks = append(tracks, map[string]string{"name": t.Name, "language": t.Lang, "id": t.ID})
 			}
 			view["tracks"] = tracks
-			if v.prepareErr == nil {
-				view["directPlayback"] = s.deliveryFor(v)
-				v.mu.Lock()
-				view["loadedDelivery"] = v.delivery
-				v.mu.Unlock()
-			}
 		default:
 		}
 		snapshots = append(snapshots, view)
@@ -552,7 +545,7 @@ func (s *Server) sessionAction(w http.ResponseWriter, r *http.Request) {
 			known = true
 		}
 		if !known {
-			failure(w, 409, errors.New("direct playback does not report its position; enter the player's current position, or play a local media segment first"))
+			failure(w, 409, errors.New("play a media segment before realigning from the current position"))
 			return
 		}
 		if !s.startAlignment(v, &at) {

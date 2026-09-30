@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bluenviron/gohlslib/v2/pkg/playlist"
@@ -121,9 +120,7 @@ type Session struct {
 	PositionAt          time.Time `json:"positionAt"`
 	positionFromVideo   bool
 	Duration            float64 `json:"duration"`
-	ProxyReason         string  `json:"proxyReason"`
 	videoDownload       videoDownload
-	videoRedirected     atomic.Bool
 	Aligning            bool `json:"aligning"`
 	Revision            int  `json:"revision"`
 	stream              Stream
@@ -139,10 +136,7 @@ type Session struct {
 	vixEnglish          *Track
 	boundaries          []float64
 	resources           map[string]resource
-	directOnce          sync.Once
-	directReady         chan struct{}
-	directAccess        map[string]DirectAccess
-	delivery            *Delivery
+	masterLoaded        bool
 	alignDone           chan struct{}
 	firstAligned        chan struct{}
 	videoBase           int
@@ -170,7 +164,6 @@ type resource struct {
 	Origin   Origin
 	Position float64
 	Track    bool
-	Force    bool
 	Video    bool
 }
 
@@ -204,8 +197,7 @@ func (s *Session) position(t float64) {
 func (s *Session) audioPosition(t float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Direct video never reaches DubLift, so audio remains the best available
-	// position there. Otherwise the video request is the authoritative area.
+	// Video requests establish the authoritative area when available.
 	if !s.positionFromVideo {
 		s.Position = t
 		s.PositionAt = time.Now()
@@ -213,10 +205,10 @@ func (s *Session) audioPosition(t float64) {
 	s.LastUsed = time.Now()
 }
 func (s *Session) state(status string) { s.mu.Lock(); s.Status = status; s.mu.Unlock() }
-func (s *Session) addResource(o Origin, position float64, track, force, video bool) string {
-	key := identity(o.URL, fmt.Sprint(o.Headers), strconv.FormatBool(force), strconv.FormatBool(video), decimal(position))[:32]
+func (s *Session) addResource(o Origin, position float64, track, video bool) string {
+	key := identity(o.URL, fmt.Sprint(o.Headers), strconv.FormatBool(track), strconv.FormatBool(video), decimal(position))[:32]
 	s.mu.Lock()
-	s.resources[key] = resource{o, position, track, force, video}
+	s.resources[key] = resource{o, position, track, video}
 	s.mu.Unlock()
 	return "/media/" + s.ID + "/resource/" + key
 }
@@ -231,7 +223,7 @@ func (s *Server) newSessionLocked(c Content, stream Stream) *Session {
 func (s *Server) newSessionIDLocked(c Content, stream Stream, id string) *Session {
 	key := identity(c.Type, c.ID, stream.URL, fmt.Sprint(stream.Origin().Headers))
 	ctx, cancel := context.WithCancel(context.WithValue(s.ctx, cacheOwnerKey{}, id))
-	v := &Session{ID: id, Key: key, lookupKey: key, Content: c, Name: stream.Name, Created: time.Now(), LastUsed: time.Now(), Status: "Available · waiting for player", Errors: []string{}, stream: stream, ready: make(chan struct{}), directReady: make(chan struct{}), videoBase: -1, videoReady: map[int]bool{}, videoChanged: make(chan struct{}), resources: map[string]resource{}, ctx: ctx, cancel: cancel}
+	v := &Session{ID: id, Key: key, lookupKey: key, Content: c, Name: stream.Name, Created: time.Now(), LastUsed: time.Now(), Status: "Available · waiting for player", Errors: []string{}, stream: stream, ready: make(chan struct{}), videoBase: -1, videoReady: map[int]bool{}, videoChanged: make(chan struct{}), resources: map[string]resource{}, ctx: ctx, cancel: cancel}
 	s.sessions[v.ID] = v
 	return v
 }
@@ -258,22 +250,11 @@ func (s *Server) prepareSession(ctx context.Context, v *Session) error {
 			defer cancel()
 			v.prepareErr = s.prepareMedia(work, v)
 			v.mu.Lock()
-			deferred := v.SourceCheckDeferred
 			v.SourceCheckDeferred = false
-			if deferred && v.prepareErr != nil {
-				v.Passthrough = true
-				v.FallbackReason = v.prepareErr.Error()
-			}
 			v.mu.Unlock()
 			if v.prepareErr != nil {
 				v.note(v.prepareErr)
-				if deferred {
-					v.state("Source unavailable · original stream")
-				} else {
-					v.state("Source unavailable")
-				}
-			} else {
-				go s.ensureDirectAccess(v.ctx, v)
+				v.state("Source unavailable")
 			}
 		}()
 	})
@@ -337,18 +318,13 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 	}
 	v.video = a
 	v.Duration = a.Duration()
-	v.ProxyReason = "Video uses its origin directly when possible; generated tracks remain local."
 	if a.File != nil {
 		v.clockBase = 1 // room for B-frame decode timestamps before presentation
 		v.boundaries = a.Index.Boundaries
-		v.ProxyReason = "Ranged file input is required for on-demand video stream-copy remux."
 	} else {
 		v.boundaries = []float64{0}
 		for _, seg := range a.HLS.Segments {
 			v.boundaries = append(v.boundaries, seg.Start+seg.Duration)
-		}
-		if len(a.Origin.Headers) > 0 {
-			v.ProxyReason = "The source supplies media headers; direct-access checks determine whether proxying is required."
 		}
 	}
 	p, probeErr := s.Engine.Probe(ctx, a)

@@ -621,27 +621,6 @@ code {
 [hidden] {
   display: none !important;
 }
-.direct-settings {
-  margin-top: 24px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
-}
-.delivery-info {
-  border-left: 2px solid #536542;
-  padding: 3px 14px;
-  margin: 18px 0;
-}
-.delivery-mode {
-  font-size: 12px;
-  color: var(--accent);
-}
-.delivery-info p {
-  margin: 6px 0;
-}
-.player-position-label {
-  max-width: 310px;
-}
-
 .session .name, .stream-title, .description, .file-details { white-space: pre-wrap; overflow-wrap: anywhere; }
 .session .content-name { margin: 10px 0 14px; }
 .session .description { line-height: 1.6; }
