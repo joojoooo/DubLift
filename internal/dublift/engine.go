@@ -807,6 +807,31 @@ func (e *Engine) Video(ctx context.Context, a *Asset, start, duration float64) (
 	return nil, err
 }
 
+// VideoInit asks the MP4 muxer for its empty movie. FFmpeg obtains the codec
+// configuration from the bounded file input, then writes no video packets.
+// The same stream-copy settings as videoArgsMode keep the track's sample
+// description and timescale compatible with every later media window.
+func (e *Engine) VideoInit(ctx context.Context, a *Asset) ([]byte, error) {
+	finish := e.foregroundFile(a)
+	defer finish()
+	u, _, cleanup, err := e.job(ctx, a, 0, 1, true)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	args := []string{"-nostdin", "-v", "error", "-threads", "1", "-discard:a", "all", "-discard:s", "all", "-discard:d", "all"}
+	args = append(args, ffInput(u)...)
+	args = append(args, "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-frames:v", "0", "-copytb", "1", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
+	init, err := e.run(ctx, e.Config.Get().FFmpeg, args, 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	if len(mp4Child(init, "moov", "trak", "mdia", "mdhd")) == 0 || len(mp4Child(init, "moov", "trak", "mdia", "minf", "stbl", "stsd")) == 0 {
+		return nil, errors.New("FFmpeg did not produce a video init segment")
+	}
+	return init, nil
+}
+
 func (e *Engine) videoAttempt(ctx context.Context, a *Asset, start, duration float64) ([]byte, error) {
 	u, skip, cleanup, err := e.job(ctx, a, start, duration+1, true)
 	if err != nil {

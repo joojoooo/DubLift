@@ -108,10 +108,28 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			v.mu.Lock()
 			init := v.videoInit
 			v.mu.Unlock()
-			if len(init) > 0 {
-				serveBytes(w, r, "video/mp4", init)
-				return
+			if len(init) == 0 {
+				ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+				defer cancel()
+				ctx = context.WithValue(ctx, videoBytesKey{}, &v.videoDownload)
+				var err error
+				init, err = s.Engine.Cache.Get(ctx, "video-init:"+v.video.ID, func() ([]byte, error) {
+					return s.Engine.VideoInit(ctx, v.video)
+				})
+				if err != nil {
+					v.note(err)
+					failure(w, 502, err)
+					return
+				}
+				v.mu.Lock()
+				if len(v.videoInit) == 0 {
+					v.videoInit = init
+				}
+				init = v.videoInit
+				v.mu.Unlock()
 			}
+			serveBytes(w, r, "video/mp4", init)
+			return
 		}
 		start := v.boundaries[n]
 		if p[3] == "segment.m4s" {
@@ -143,13 +161,9 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			v.videoInit = append([]byte(nil), init...)
 		}
 		v.mu.Unlock()
-		if p[3] == "init.mp4" {
-			data = init
-		} else {
-			data = media
-			v.videoSegmentCompleted(n)
-			s.prefetchFileVideo(v, n+1)
-		}
+		data = media
+		v.videoSegmentCompleted(n)
+		s.prefetchFileVideo(v, n+1)
 		serveBytes(w, r, "video/mp4", data)
 	case p[1] == "track" && len(p) >= 3:
 		id := strings.TrimSuffix(p[2], ".m3u8")

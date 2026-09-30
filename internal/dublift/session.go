@@ -777,6 +777,7 @@ func (v *Session) fileAudioSegmentRequested(index int) {
 	if index > v.videoHighest+3 || index+1 < v.videoBase {
 		v.videoPrefetch.stop()
 		if w := v.videoWindow; w != nil && (index < w.first || index >= w.end) {
+			w.superseded = true
 			w.cancel()
 		}
 	}
@@ -791,6 +792,7 @@ func (v *Session) videoSegmentRequested(index int) {
 		v.videoPrefetch.stop()
 		v.audioPrefetch.stop()
 		if v.videoWindow != nil {
+			v.videoWindow.superseded = true
 			v.videoWindow.cancel()
 		}
 	}

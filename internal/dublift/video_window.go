@@ -136,6 +136,7 @@ type fileVideoWindow struct {
 	changed    chan struct{}
 	done       bool
 	err        error
+	superseded bool
 	// The last published segment remains available to waiters even if the
 	// configured byte cache is smaller than one unusually large segment.
 	last int
@@ -145,6 +146,7 @@ type fileVideoWindow struct {
 func videoCacheKey(v *Session, n int) string { return fmt.Sprintf("video:%s:%d", v.video.ID, n) }
 
 func (s *Server) fileVideo(ctx context.Context, v *Session, n int) ([]byte, error) {
+	var waiting *fileVideoWindow
 	for attempt := 0; attempt < 2; {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -159,13 +161,29 @@ func (s *Server) fileVideo(ctx context.Context, v *Session, n int) ([]byte, erro
 			v.mu.Unlock()
 			return data, nil
 		}
+		if waiting != nil && waiting.superseded {
+			if waiting.last == n {
+				data := waiting.data
+				v.mu.Unlock()
+				return data, nil
+			}
+			v.mu.Unlock()
+			return nil, context.Canceled
+		}
 		window := v.videoWindow
 		if window != nil && window.first <= n && n < window.end && window.last == n {
 			data := window.data
 			v.mu.Unlock()
 			return data, nil
 		}
-		if window == nil || window.done || window.ctx.Err() != nil {
+		if window == nil || window.done || window.ctx.Err() != nil || n < window.first || n >= window.end {
+			if window != nil && !window.done {
+				// The next boundary (as well as a seek) needs a new extraction.
+				// Cancel the old producer before starting it, but retain its
+				// already published segments in the cache.
+				window.superseded = true
+				window.cancel()
+			}
 			// A window covers up to 30 seconds / approximately 24 MiB of
 			// source media. Publish its first segment without waiting for its end.
 			seconds := min(30.0, float64(24<<20)*v.Duration/float64(v.video.File.Size))
@@ -181,6 +199,7 @@ func (s *Server) fileVideo(ctx context.Context, v *Session, n int) ([]byte, erro
 			go s.fillVideoWindow(v, window)
 		}
 		changed := window.changed
+		waiting = window
 		v.mu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -188,9 +207,32 @@ func (s *Server) fileVideo(ctx context.Context, v *Session, n int) ([]byte, erro
 		case <-changed:
 		}
 		v.mu.Lock()
-		done, err := window.done, window.err
+		done, err, superseded := window.done, window.err, window.superseded
+		last, lastData := window.last, window.data
 		v.mu.Unlock()
+		if last == n {
+			return lastData, nil
+		}
+		if superseded {
+			if data, ok := s.Engine.Cache.Lookup(ctx, videoCacheKey(v, n)); ok {
+				return data, nil
+			}
+			return nil, context.Canceled
+		}
+		if window.ctx.Err() != nil && !done {
+			// A canceled or expired producer cannot publish this segment.
+			if data, ok := s.Engine.Cache.Lookup(ctx, videoCacheKey(v, n)); ok {
+				return data, nil
+			}
+			return nil, window.ctx.Err()
+		}
 		if done && err != nil {
+			if errors.Is(err, context.Canceled) {
+				if data, ok := s.Engine.Cache.Lookup(ctx, videoCacheKey(v, n)); ok {
+					return data, nil
+				}
+				return nil, err
+			}
 			attempt++
 			if attempt == 2 {
 				return nil, err
