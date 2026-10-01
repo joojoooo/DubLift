@@ -426,27 +426,23 @@ func TestCacheBoundAndSingleFlight(t *testing.T) {
 		t.Fatal("cache grew without bound")
 	}
 }
-func TestSourceCheckSettings(t *testing.T) {
+func TestPreparationTimeoutSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	c, err := OpenConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	settings := c.Get()
-	if settings.MaxItalianResults != 3 || settings.MaxItalianResultsPerStreamType != 2 || settings.SourceCheckTimeoutSeconds != 20 || settings.SourceCheckParallelism != 3 || settings.BypassSourceChecks {
-		t.Fatalf("unexpected source check defaults: %d results, %d seconds, %d parallel", settings.MaxItalianResults, settings.SourceCheckTimeoutSeconds, settings.SourceCheckParallelism)
+	if settings.PreparationTimeoutSeconds != 120 {
+		t.Fatal("unexpected preparation timeout", settings.PreparationTimeoutSeconds)
 	}
-	settings.MaxItalianResults = 7
-	settings.MaxItalianResultsPerStreamType = 4
-	settings.SourceCheckTimeoutSeconds = 42
-	settings.SourceCheckParallelism = 4
-	settings.BypassSourceChecks = true
+	settings.PreparationTimeoutSeconds = 240
 	if err := c.Save(settings); err != nil {
 		t.Fatal(err)
 	}
 	c, err = OpenConfig(path)
-	if err != nil || c.Get().MaxItalianResults != 7 || c.Get().MaxItalianResultsPerStreamType != 4 || c.Get().SourceCheckTimeoutSeconds != 42 || c.Get().SourceCheckParallelism != 4 || !c.Get().BypassSourceChecks {
-		t.Fatalf("source check settings did not persist: %v", err)
+	if err != nil || c.Get().PreparationTimeoutSeconds != 240 {
+		t.Fatalf("timeout did not persist: %v", err)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -456,8 +452,7 @@ func TestSourceCheckSettings(t *testing.T) {
 	if err := json.Unmarshal(b, &legacy); err != nil {
 		t.Fatal(err)
 	}
-	delete(legacy, "maxItalianResultsPerStreamType")
-	delete(legacy, "alignmentSampleSeconds")
+	delete(legacy, "preparationTimeoutSeconds")
 	b, err = json.Marshal(legacy)
 	if err != nil {
 		t.Fatal(err)
@@ -466,27 +461,14 @@ func TestSourceCheckSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err = OpenConfig(path)
-	if err != nil || c.Get().MaxItalianResultsPerStreamType != 2 || c.Get().AlignmentSampleSeconds != 5 {
-		t.Fatalf("existing config did not receive new defaults: %v", err)
+	if err != nil || c.Get().PreparationTimeoutSeconds != 120 {
+		t.Fatalf("existing config did not receive timeout default: %v", err)
 	}
-	settings.MaxItalianResults = 0
-	if settings.Validate() == nil {
-		t.Fatal("accepted zero Italian results")
-	}
-	settings.MaxItalianResults = 7
-	settings.MaxItalianResultsPerStreamType = 0
-	if settings.Validate() == nil {
-		t.Fatal("accepted zero Italian results per stream type")
-	}
-	settings.MaxItalianResultsPerStreamType = 4
-	settings.SourceCheckTimeoutSeconds = 121
-	if settings.Validate() == nil {
-		t.Fatal("accepted source check timeout over 120 seconds")
-	}
-	settings.SourceCheckTimeoutSeconds = 42
-	settings.SourceCheckParallelism = 17
-	if settings.Validate() == nil {
-		t.Fatal("accepted more than 16 parallel source checks")
+	for _, timeout := range []int{0, 601} {
+		settings.PreparationTimeoutSeconds = timeout
+		if settings.Validate() == nil {
+			t.Fatalf("accepted timeout %d", timeout)
+		}
 	}
 }
 

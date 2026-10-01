@@ -20,29 +20,25 @@ type Addon struct {
 }
 
 type Settings struct {
-	Listen                         string  `json:"listen"`
-	PublicURL                      string  `json:"publicURL"`
-	MinConfidence                  float64 `json:"minConfidence"`
-	SearchRadius                   float64 `json:"searchRadius"`
-	AlignmentSampleSeconds         int     `json:"alignmentSampleSeconds"`
-	AlignmentSamples               int     `json:"alignmentSamples"`
-	MaxItalianResults              int     `json:"maxItalianResults"`
-	MaxItalianResultsPerStreamType int     `json:"maxItalianResultsPerStreamType"`
-	SourceCheckTimeoutSeconds      int     `json:"sourceCheckTimeoutSeconds"`
-	SourceCheckParallelism         int     `json:"sourceCheckParallelism"`
-	BypassSourceChecks             bool    `json:"bypassSourceChecks"`
-	StartImmediately               bool    `json:"startImmediately"`
-	CacheMB                        int     `json:"cacheMB"`
-	FFmpeg                         string  `json:"ffmpeg"`
-	FFprobe                        string  `json:"ffprobe"`
-	VixBaseURL                     string  `json:"vixBaseURL"`
-	TMDBToken                      string  `json:"tmdbToken"`
-	Addons                         []Addon `json:"addons"`
-	SetupCompleted                 bool    `json:"setupCompleted"`
+	Listen                    string  `json:"listen"`
+	PublicURL                 string  `json:"publicURL"`
+	MinConfidence             float64 `json:"minConfidence"`
+	SearchRadius              float64 `json:"searchRadius"`
+	AlignmentSampleSeconds    int     `json:"alignmentSampleSeconds"`
+	AlignmentSamples          int     `json:"alignmentSamples"`
+	PreparationTimeoutSeconds int     `json:"preparationTimeoutSeconds"`
+	StartImmediately          bool    `json:"startImmediately"`
+	CacheMB                   int     `json:"cacheMB"`
+	FFmpeg                    string  `json:"ffmpeg"`
+	FFprobe                   string  `json:"ffprobe"`
+	VixBaseURL                string  `json:"vixBaseURL"`
+	TMDBToken                 string  `json:"tmdbToken"`
+	Addons                    []Addon `json:"addons"`
+	SetupCompleted            bool    `json:"setupCompleted"`
 }
 
 func DefaultSettings() Settings {
-	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, MaxItalianResults: 3, MaxItalianResultsPerStreamType: 2, SourceCheckTimeoutSeconds: 20, SourceCheckParallelism: 3, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
+	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, PreparationTimeoutSeconds: 120, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
 }
 
 func defaultPublicURL() string {
@@ -91,17 +87,8 @@ func (c Settings) Validate() error {
 	if c.AlignmentSamples < 1 || c.AlignmentSamples > 12 {
 		return errors.New("alignment samples must be between 1 and 12")
 	}
-	if c.MaxItalianResults < 1 || c.MaxItalianResults > 100 {
-		return errors.New("maximum Italian results must be between 1 and 100")
-	}
-	if c.MaxItalianResultsPerStreamType < 1 || c.MaxItalianResultsPerStreamType > 100 {
-		return errors.New("maximum Italian results per stream type must be between 1 and 100")
-	}
-	if c.SourceCheckTimeoutSeconds < 1 || c.SourceCheckTimeoutSeconds > 120 {
-		return errors.New("source check timeout must be between 1 and 120 seconds")
-	}
-	if c.SourceCheckParallelism < 1 || c.SourceCheckParallelism > 16 {
-		return errors.New("parallel source checks must be between 1 and 16")
+	if c.PreparationTimeoutSeconds < 1 || c.PreparationTimeoutSeconds > 600 {
+		return errors.New("preparation timeout must be between 1 and 600 seconds")
 	}
 	if math.IsNaN(c.MinConfidence) || c.MinConfidence < 0 || c.MinConfidence > 1 {
 		return errors.New("minimum confidence must be between 0 and 1")

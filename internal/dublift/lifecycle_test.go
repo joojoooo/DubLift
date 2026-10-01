@@ -9,9 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,7 +141,7 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			}
 			for i := range want {
 				got, expected := jsonValue(t, result.Streams[i]), jsonValue(t, want[i])
-				if italian && i == 0 {
+				if italian && (i == 0 || i == 2) {
 					m, e := got.(map[string]any), expected.(map[string]any)
 					if m["name"] != "🇮🇹 "+e["name"].(string) || !strings.Contains(m["url"].(string), "/media/") {
 						t.Fatal(m)
@@ -153,9 +151,16 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 					if h["notWebReady"] != true {
 						t.Fatal(h)
 					}
-					h["filename"] = e["behaviorHints"].(map[string]any)["filename"]
-					h["proxyHeaders"] = e["behaviorHints"].(map[string]any)["proxyHeaders"]
-					delete(h, "notWebReady")
+					if expectedHints, ok := e["behaviorHints"].(map[string]any); ok {
+						h["filename"] = expectedHints["filename"]
+						h["proxyHeaders"] = expectedHints["proxyHeaders"]
+						delete(h, "notWebReady")
+					} else {
+						delete(m, "behaviorHints")
+					}
+					if headers, ok := e["headers"]; ok {
+						m["headers"] = headers
+					}
 				}
 				if !reflect.DeepEqual(got, expected) {
 					t.Fatalf("stream %d changed: %s", i, result.Streams[i])
@@ -186,316 +191,7 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 	}
 }
 
-func TestOrderedItalianResultLimitAndSourceTimeout(t *testing.T) {
-	for _, parallel := range []int{1, 2, 3} {
-		t.Run(fmt.Sprintf("parallel=%d", parallel), func(t *testing.T) {
-			ffmpegAvailable(t)
-			var mu sync.Mutex
-			var checked []string
-			active, maxActive := 0, 0
-			var streams []Stream
-			var origin *httptest.Server
-			origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/stream/movie/tmdb:603.json":
-					jsonResponse(w, 200, map[string]any{"streams": streams})
-				case "/api/movie/603":
-					io.WriteString(w, `{"src":"/embed"}`)
-				case "/embed":
-					io.WriteString(w, `window.masterPlaylist={url:'/vix',params:{token:'fixture',expires:9999999999}}`)
-				case "/vix.m3u8":
-					io.WriteString(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italiano\",LANGUAGE=\"it\",URI=\"it.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo.m3u8\n")
-				case "/it.m3u8":
-					io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
-				case "/bad.m3u8", "/one.m3u8", "/two.m3u8", "/three.m3u8":
-					mu.Lock()
-					checked = append(checked, r.URL.Path)
-					active++
-					maxActive = max(maxActive, active)
-					mu.Unlock()
-					defer func() {
-						mu.Lock()
-						active--
-						mu.Unlock()
-					}()
-					if r.URL.Path == "/one.m3u8" {
-						time.Sleep(200 * time.Millisecond)
-					}
-					if r.URL.Path == "/bad.m3u8" && parallel == 3 {
-						time.Sleep(400 * time.Millisecond)
-						io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
-						return
-					}
-					if r.URL.Path == "/bad.m3u8" {
-						select {
-						case <-r.Context().Done():
-						case <-time.After(1500 * time.Millisecond):
-							http.Error(w, "slow source", http.StatusServiceUnavailable)
-						}
-						return
-					}
-					io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
-				case "/segment.ts":
-					w.Header().Set("Content-Type", "video/mp2t")
-					w.Write(make([]byte, 512))
-				default:
-					http.NotFound(w, r)
-				}
-			}))
-			defer origin.Close()
-			for _, name := range []string{"bad", "one", "two", "three"} {
-				streams = append(streams, Stream{Name: name, URL: origin.URL + "/" + name + ".m3u8"})
-			}
-			s := lifecycleServer(t)
-			cfg := s.Config.Get()
-			cfg.VixBaseURL = origin.URL
-			cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
-			cfg.MaxItalianResults = 2
-			cfg.SourceCheckTimeoutSeconds = 1
-			cfg.SourceCheckParallelism = parallel
-			if err := s.Config.Save(cfg); err != nil {
-				t.Fatal(err)
-			}
-			w := httptest.NewRecorder()
-			s.ServeHTTP(w, httptest.NewRequest("GET", "/stream/movie/tmdb:603.json", nil))
-			var response struct {
-				Streams []Stream `json:"streams"`
-			}
-			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-				t.Fatal(err)
-			}
-			if len(response.Streams) != 4 {
-				t.Fatal(w.Body.String())
-			}
-			for i, stream := range response.Streams {
-				wantItalian := (parallel == 3 && i < 2) || (parallel != 3 && (i == 1 || i == 2))
-				if strings.HasPrefix(stream.Name, "🇮🇹 ") != wantItalian {
-					t.Fatalf("stream %d Italian=%t, want %t", i, strings.HasPrefix(stream.Name, "🇮🇹 "), wantItalian)
-				}
-				if (stream.URL != streams[i].URL) != wantItalian {
-					t.Fatalf("stream %d URL transformed unexpectedly", i)
-				}
-			}
-			mu.Lock()
-			order := append([]string(nil), checked...)
-			observedParallel := maxActive
-			mu.Unlock()
-			if parallel == 1 && !reflect.DeepEqual(order, []string{"/bad.m3u8", "/one.m3u8", "/two.m3u8"}) {
-				t.Fatalf("source checks = %v", order)
-			}
-			sort.Strings(order)
-			wantChecks := []string{"/bad.m3u8", "/one.m3u8", "/two.m3u8"}
-			if parallel == 3 {
-				wantChecks = wantChecks[:2]
-			}
-			if !reflect.DeepEqual(order, wantChecks) || observedParallel != min(parallel, cfg.MaxItalianResults) {
-				t.Fatalf("source checks = %v, max parallel = %d", order, observedParallel)
-			}
-			w = httptest.NewRecorder()
-			s.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
-			var state struct {
-				Sessions []struct {
-					Passthrough    bool
-					FallbackReason string
-				}
-			}
-			if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
-				t.Fatal(err)
-			}
-			if len(state.Sessions) != 4 || !state.Sessions[3].Passthrough || state.Sessions[3].FallbackReason != "Italian result limit reached" {
-				t.Fatal(w.Body.String())
-			}
-			if parallel == 3 {
-				if state.Sessions[0].Passthrough || state.Sessions[2].FallbackReason != "Italian result limit reached" {
-					t.Fatal(w.Body.String())
-				}
-			} else if !strings.Contains(state.Sessions[0].FallbackReason, "timeout") {
-				t.Fatal(w.Body.String())
-			}
-		})
-	}
-}
-
-func TestItalianResultsPreferOtherStreamTypesAndFillUnusedSlots(t *testing.T) {
-	ffmpegAvailable(t)
-	tests := []struct {
-		name, streams string
-		bypass        bool
-		failFirstTwo  bool
-		want          []bool
-	}{
-		{"mixed types", "mkv,mkv,mkv,hls", true, false, []bool{true, true, false, true}},
-		{"file formats share remuxed type", "mkv,mkv,mkv,mp4", true, false, []bool{true, true, true, false}},
-		{"HLS after MKV and MP4", "mkv,mkv,mp4,hls", true, false, []bool{true, true, false, true}},
-		{"HLS after MP4 and MKV", "mp4,mkv,mkv,hls", true, false, []bool{true, true, false, true}},
-		{"only one type", "mkv,mkv,mkv", true, false, []bool{true, true, true}},
-		{"unavailable alternative", "hls,hls,hls,bad-mkv", false, false, []bool{true, true, true, false}},
-		{"later viable HLS", "hls,hls,hls,hls,bad-mkv", false, true, []bool{false, false, true, true, false}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var streams []Stream
-			var checked sync.Map
-			var origin *httptest.Server
-			origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/stream/movie/tmdb:603.json":
-					jsonResponse(w, 200, map[string]any{"streams": streams})
-				case "/api/movie/603":
-					io.WriteString(w, `{"src":"/embed"}`)
-				case "/embed":
-					io.WriteString(w, `window.masterPlaylist={url:'/vix',params:{token:'fixture',expires:9999999999}}`)
-				case "/vix.m3u8":
-					io.WriteString(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italiano\",LANGUAGE=\"it\",URI=\"it.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo.m3u8\n")
-				case "/it.m3u8":
-					io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
-				case "/segment.ts":
-					w.Header().Set("Content-Type", "video/mp2t")
-					w.Write(make([]byte, 512))
-				default:
-					checked.Store(r.URL.Path, true)
-					if strings.HasSuffix(r.URL.Path, ".m3u8") && !(tt.failFirstTwo && (r.URL.Path == "/source-0.m3u8" || r.URL.Path == "/source-1.m3u8")) {
-						io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
-					} else {
-						http.Error(w, "unavailable", http.StatusServiceUnavailable)
-					}
-				}
-			}))
-			defer origin.Close()
-			for i, kind := range strings.Split(tt.streams, ",") {
-				ext := ".mkv"
-				if kind == "hls" {
-					ext = ".m3u8"
-				} else if kind == "mp4" {
-					ext = ".mp4"
-				}
-				streams = append(streams, Stream{Name: fmt.Sprintf("stream %d", i), URL: fmt.Sprintf("%s/source-%d%s", origin.URL, i, ext)})
-			}
-			s := lifecycleServer(t)
-			cfg := s.Config.Get()
-			cfg.VixBaseURL = origin.URL
-			cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
-			cfg.BypassSourceChecks = tt.bypass
-			if err := s.Config.Save(cfg); err != nil {
-				t.Fatal(err)
-			}
-			w := httptest.NewRecorder()
-			s.ServeHTTP(w, httptest.NewRequest("GET", "/stream/movie/tmdb:603.json", nil))
-			var result struct {
-				Streams []Stream `json:"streams"`
-			}
-			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || len(result.Streams) != len(tt.want) {
-				t.Fatal(w.Body.String(), err)
-			}
-			for i, want := range tt.want {
-				got := strings.HasPrefix(result.Streams[i].Name, "🇮🇹 ")
-				if got != want || (result.Streams[i].URL != streams[i].URL) != want {
-					t.Fatalf("stream %d: Italian=%t, want %t: %s", i, got, want, w.Body.String())
-				}
-			}
-			if tt.bypass {
-				for _, stream := range streams {
-					if _, ok := checked.Load(strings.TrimPrefix(stream.URL, origin.URL)); ok {
-						t.Fatal("bypass checked a source")
-					}
-				}
-			} else if _, ok := checked.Load(fmt.Sprintf("/source-%d.mkv", len(tt.want)-1)); !ok {
-				t.Fatal("unavailable alternative was not checked")
-			}
-		})
-	}
-}
-
-func TestItalianResultStreamTypeGroupsByRemuxing(t *testing.T) {
-	hls := Stream{URL: "https://origin.test/master.m3u8"}
-	hls.BehaviorHints.Filename = "fragment.mp4"
-	for _, stream := range []Stream{hls, {URL: "https://origin.test/master.m3u8?token=abc"}} {
-		if got := streamSelectionType(stream, nil); got != "hls" {
-			t.Fatalf("HLS with MP4 fragments classified as %s", got)
-		}
-	}
-	for _, url := range []string{"https://origin.test/video.mkv", "https://origin.test/video.mp4", "https://origin.test/opaque"} {
-		if got := streamSelectionType(Stream{URL: url}, nil); got != "remuxed" {
-			t.Fatalf("file source %s classified as %s", url, got)
-		}
-	}
-	if got := streamSelectionType(Stream{URL: "https://origin.test/opaque"}, &Asset{HLS: &HLS{}}); got != "hls" {
-		t.Fatalf("checked HLS source classified as %s", got)
-	}
-}
-
-func TestAvailabilityStatusOnlyMarksStartedSourceChecks(t *testing.T) {
-	ffmpegAvailable(t)
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var origin *httptest.Server
-	origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/stream/movie/tmdb:603.json":
-			jsonResponse(w, 200, map[string]any{"streams": []Stream{
-				{Name: "one", URL: origin.URL + "/one.m3u8"},
-				{Name: "two", URL: origin.URL + "/two.m3u8"},
-			}})
-		case "/api/movie/603":
-			io.WriteString(w, `{"src":"/embed"}`)
-		case "/embed":
-			io.WriteString(w, `window.masterPlaylist={url:'/vix',params:{token:'fixture',expires:9999999999}}`)
-		case "/vix.m3u8":
-			io.WriteString(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italiano\",LANGUAGE=\"it\",URI=\"it.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo.m3u8\n")
-		case "/it.m3u8":
-			io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
-		case "/one.m3u8":
-			close(started)
-			<-release
-			io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
-		case "/segment.ts":
-			w.Header().Set("Content-Type", "video/mp2t")
-			w.Write(make([]byte, 512))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer origin.Close()
-	defer close(release)
-	s := lifecycleServer(t)
-	cfg := s.Config.Get()
-	cfg.VixBaseURL = origin.URL
-	cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
-	cfg.MaxItalianResults = 1
-	cfg.SourceCheckParallelism = 1
-	if err := s.Config.Save(cfg); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/stream/movie/tmdb:603.json", nil))
-	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("first source check did not start")
-	}
-	w := httptest.NewRecorder()
-	s.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
-	var state struct {
-		Sessions []struct{ Status string }
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Sessions) != 2 || state.Sessions[0].Status != "Checking DubLift availability" || state.Sessions[1].Status != "Waiting in upstream order" {
-		t.Fatal(w.Body.String())
-	}
-	release <- struct{}{}
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("stream lookup did not finish")
-	}
-}
-
-func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
+func TestListingDefersPreparationAndRequiresItalian(t *testing.T) {
 	ffmpegAvailable(t)
 	var italian atomic.Bool
 	italian.Store(true)
@@ -517,7 +213,7 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Audio\",LANGUAGE=\"%s\",URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo.m3u8\n", lang)
 		case "/audio.m3u8":
 			io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n#EXT-X-ENDLIST\n")
-		case "/one.m3u8", "/two.m3u8":
+		case "/one.m3u8", "/two.m3u8", "/three.mkv", "/four.mp4", "/five.mkv":
 			sourceRequests.Add(1)
 			http.Error(w, "unavailable source", http.StatusServiceUnavailable)
 		default:
@@ -528,6 +224,9 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	streams = []Stream{
 		{Name: "one", URL: origin.URL + "/one.m3u8"},
 		{Name: "two", URL: origin.URL + "/two.m3u8"},
+		{Name: "three", URL: origin.URL + "/three.mkv"},
+		{Name: "four", URL: origin.URL + "/four.mp4"},
+		{Name: "five", URL: origin.URL + "/five.mkv"},
 		{Name: "torrent"},
 		{Name: "donation", ExternalURL: "https://pengu.uk/donate"},
 	}
@@ -535,8 +234,6 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	cfg := s.Config.Get()
 	cfg.VixBaseURL = origin.URL
 	cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
-	cfg.MaxItalianResults = 1
-	cfg.BypassSourceChecks = true
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -548,32 +245,31 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Streams) != 3 || sourceRequests.Load() != 0 {
+	if len(response.Streams) != 6 || sourceRequests.Load() != 0 {
 		t.Fatal(w.Body.String(), "source requests:", sourceRequests.Load())
 	}
 	for i, stream := range response.Streams {
-		if (i == 0) != strings.HasPrefix(stream.Name, "🇮🇹 ") {
+		if (i < 5) != strings.HasPrefix(stream.Name, "🇮🇹 ") {
 			t.Fatalf("stream %d: %s", i, stream.Name)
 		}
-		if i > 0 && stream.URL != streams[i].URL {
-			t.Fatalf("stream %d should retain its original URL: %s", i, stream.URL)
+		if i < 5 && !strings.Contains(stream.URL, "/media/") {
+			t.Fatalf("stream %d should use a DubLift URL: %s", i, stream.URL)
 		}
 	}
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
 	var state struct {
 		Sessions []struct {
-			ID                  string
-			SourceCheckDeferred bool
-			Passthrough         bool
-			FallbackReason      string
-			Status              string
+			ID             string
+			Passthrough    bool
+			FallbackReason string
+			Status         string
 		}
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if len(state.Sessions) != 3 || !state.Sessions[0].SourceCheckDeferred || state.Sessions[1].SourceCheckDeferred || state.Sessions[2].SourceCheckDeferred || !state.Sessions[1].Passthrough || state.Sessions[1].FallbackReason != "Italian result limit reached" {
+	if len(state.Sessions) != 6 || state.Sessions[0].Passthrough || state.Sessions[1].Passthrough || !state.Sessions[5].Passthrough {
 		t.Fatal(w.Body.String())
 	}
 	prepare := httptest.NewRequest("POST", "/api/sessions/"+state.Sessions[0].ID+"/prepare", strings.NewReader(`{}`))
@@ -588,13 +284,13 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if state.Sessions[0].Passthrough || state.Sessions[0].SourceCheckDeferred || state.Sessions[0].Status != "Source unavailable" {
+	if state.Sessions[0].Passthrough || state.Sessions[0].Status != "Preparation failed" {
 		t.Fatal(w.Body.String())
 	}
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "/media/"+state.Sessions[1].ID+"/master.m3u8", nil))
-	if w.Code != http.StatusBadGateway || w.Header().Get("Location") != "" || sourceRequests.Load() != 1 {
-		t.Fatal("untransformed result exposed an upstream redirect:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
+	if w.Code != http.StatusBadGateway || w.Header().Get("Location") != "" || sourceRequests.Load() != 2 {
+		t.Fatal("unavailable source unexpectedly redirected:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
 	}
 	italian.Store(false)
 	w = httptest.NewRecorder()
@@ -602,7 +298,7 @@ func TestBypassSourceChecksDefersUntilPrepareAndRequiresItalian(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Streams) != 3 || sourceRequests.Load() != 1 {
+	if len(response.Streams) != 6 || sourceRequests.Load() != 2 {
 		t.Fatal(w.Body.String(), "source requests:", sourceRequests.Load())
 	}
 	for i, stream := range response.Streams {

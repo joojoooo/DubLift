@@ -38,6 +38,7 @@ type Server struct {
 	lookupCancel     context.CancelFunc
 	lookupStatus     string
 	playbackKey      cipher.AEAD
+	redirectOriginal atomic.Bool
 	manifestRequests atomic.Uint64
 }
 
@@ -225,6 +226,20 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonResponse(w, 200, map[string]bool{"ok": true})
+	case "/api/dev/redirect-original":
+		if r.Method != "POST" {
+			w.WriteHeader(405)
+			return
+		}
+		var req struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := decodeRequest(w, r, &req); err != nil {
+			failure(w, 400, err)
+			return
+		}
+		s.redirectOriginal.Store(req.Enabled)
+		jsonResponse(w, 200, map[string]bool{"enabled": s.redirectOriginal.Load()})
 	case "/api/status":
 		if r.Method != "GET" {
 			w.WriteHeader(405)
@@ -270,19 +285,19 @@ func (s *Server) status(r *http.Request) map[string]any {
 	snapshots := []map[string]any{}
 	for _, v := range sessions {
 		v.mu.Lock()
-		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, v.listedAsset), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "sourceCheckDeferred": v.SourceCheckDeferred, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
+		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, nil), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
 		if v.Passthrough {
 			view["url"] = v.stream.URL
 		}
 		if v.listedReady != nil {
 			select {
 			case <-v.listedReady:
-				view["checked"] = true
+				view["listed"] = true
 			default:
-				view["checked"] = false
+				view["listed"] = false
 			}
 		} else {
-			view["checked"] = true
+			view["listed"] = true
 		}
 		v.mu.Unlock()
 		select {
@@ -312,7 +327,7 @@ func (s *Server) status(r *http.Request) map[string]any {
 	lookupStatus := s.lookupStatus
 	s.mu.Unlock()
 	cfg := s.Config.Get()
-	return map[string]any{"sessions": snapshots, "lookupStatus": lookupStatus, "events": events, "cacheBytes": s.Engine.Cache.Used(), "cacheMaxBytes": int64(cfg.CacheMB) << 20, "originBytes": s.Net.Bytes.Load(), "manifestURL": s.base(r) + "/manifest.json", "manifestRequests": s.manifestRequests.Load()}
+	return map[string]any{"sessions": snapshots, "redirectOriginal": s.redirectOriginal.Load(), "lookupStatus": lookupStatus, "events": events, "cacheBytes": s.Engine.Cache.Used(), "cacheMaxBytes": int64(cfg.CacheMB) << 20, "originBytes": s.Net.Bytes.Load(), "manifestURL": s.base(r) + "/manifest.json", "manifestRequests": s.manifestRequests.Load()}
 }
 
 func streamSourceFormat(stream Stream, asset *Asset) string {

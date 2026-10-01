@@ -46,6 +46,23 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v := s.getSession(p[0])
+	// Diagnostics redirects resolve the original from the live session or its
+	// authenticated resume ticket without probing or preparing any media.
+	if s.redirectOriginal.Load() {
+		original := ""
+		if v != nil {
+			original = v.stream.URL
+		} else if len(p) == 2 && p[1] == "master.m3u8" {
+			if ticket, err := s.readPlayback(p[0], r.URL.Query().Get("resume")); err == nil {
+				original = ticket.Stream.URL
+			}
+		}
+		if _, err := httpURL(original); err == nil {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, original, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	if v == nil && len(p) == 2 && p[1] == "master.m3u8" && r.URL.Query().Get("resume") != "" {
 		encoded := r.URL.Query().Get("resume")
 		if r.Method == "HEAD" {

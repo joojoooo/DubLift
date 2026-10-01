@@ -179,7 +179,7 @@ function applyStreamFilters(sessions) {
       continue;
     }
     resultCount++;
-    const italian = session.checked !== false && !session.passthrough;
+    const italian = session.listed !== false && !session.passthrough;
     const format = !streamFilters.hls && !streamFilters.mkv && !streamFilters.mp4 || !!streamFilters[session.sourceFormat];
     const matches = (!streamFilters.italian || italian) && format;
     card.hidden = !matches;
@@ -210,16 +210,26 @@ for (const key of Object.keys(streamFilters)) {
     setStreamFilters({ ...streamFilters, [key]: !streamFilters[key] });
 }
 $("clear-filters").onclick = () => setStreamFilters({});
+$("redirect-original").onchange = async () => {
+  const toggle = $("redirect-original");
+  const enabled = toggle.checked;
+  toggle.disabled = true;
+  try {
+    const result = await api("/api/dev/redirect-original", { enabled });
+    toggle.checked = result.enabled;
+    toast(result.enabled ? "Original upstream redirects enabled" : "DubLift playback enabled");
+  } catch (err) {
+    toggle.checked = !enabled;
+    toast(err.message);
+  } finally { toggle.disabled = false; }
+};
 const fields = {
   publicURL: "public-url",
   listen: "listen",
   searchRadius: "search-radius",
   alignmentSampleSeconds: "alignment-sample-seconds",
   alignmentSamples: "alignment-samples",
-  maxItalianResults: "max-italian-results",
-  maxItalianResultsPerStreamType: "max-italian-results-per-stream-type",
-  sourceCheckTimeoutSeconds: "source-check-timeout",
-  sourceCheckParallelism: "source-check-parallelism",
+  preparationTimeoutSeconds: "preparation-timeout",
   cacheMB: "cache-mb",
   ffmpeg: "ffmpeg",
   ffprobe: "ffprobe",
@@ -230,7 +240,6 @@ async function loadSettings() {
   settings = await api("/api/settings");
   for (const [key, id] of Object.entries(fields))
     $(id).value = settings[key] ?? "";
-  $("bypass-source-checks").checked = settings.bypassSourceChecks;
   $("start-immediately").checked = settings.startImmediately;
   $("confidence").value = settings.minConfidence;
   confidenceLabel();
@@ -240,10 +249,7 @@ async function loadSettings() {
   $("wizard-addons").replaceChildren();
   settings.addons.forEach((addon) => addonRow(addon, $("wizard-addons")));
   if (!settings.addons.length) addonRow(undefined, $("wizard-addons"));
-  $("wizard-max-results").value = settings.maxItalianResults;
-  $("wizard-max-per-type").value = settings.maxItalianResultsPerStreamType;
-  $("wizard-parallelism").value = settings.sourceCheckParallelism;
-  $("wizard-timeout").value = settings.sourceCheckTimeoutSeconds;
+  $("wizard-timeout").value = settings.preparationTimeoutSeconds;
   $("wizard-samples").value = settings.alignmentSamples;
   $("wizard-sample-seconds").value = settings.alignmentSampleSeconds;
 }
@@ -262,10 +268,9 @@ $("settings-form").onsubmit = async (e) => {
   e.preventDefault();
   const cfg = { ...settings };
   for (const [key, id] of Object.entries(fields))
-    cfg[key] = ["searchRadius", "alignmentSampleSeconds", "alignmentSamples", "maxItalianResults", "maxItalianResultsPerStreamType", "sourceCheckTimeoutSeconds", "sourceCheckParallelism", "cacheMB"].includes(key)
+    cfg[key] = ["searchRadius", "alignmentSampleSeconds", "alignmentSamples", "preparationTimeoutSeconds", "cacheMB"].includes(key)
       ? Number($(id).value)
       : $(id).value.trim();
-  cfg.bypassSourceChecks = $("bypass-source-checks").checked;
   cfg.startImmediately = $("start-immediately").checked;
   cfg.minConfidence = Number($("confidence").value);
   cfg.addons = readAddons($("addons"));
@@ -344,10 +349,7 @@ $("wizard-next").onclick = async () => {
       if (!inputs.every((input) => input.reportValidity())) return;
       await saveConfig({
         ...settings,
-        maxItalianResults: Number($("wizard-max-results").value),
-        maxItalianResultsPerStreamType: Number($("wizard-max-per-type").value),
-        sourceCheckParallelism: Number($("wizard-parallelism").value),
-        sourceCheckTimeoutSeconds: Number($("wizard-timeout").value),
+        preparationTimeoutSeconds: Number($("wizard-timeout").value),
         alignmentSamples: Number($("wizard-samples").value),
         alignmentSampleSeconds: Number($("wizard-sample-seconds").value),
       });
@@ -375,9 +377,7 @@ $("resolve-form").onsubmit = async (e) => {
     });
     const hint = !r.streams.length
       ? "Check the activity log for provider errors."
-      : settings?.bypassSourceChecks
-        ? "Prepare a session to check its source."
-        : "Prepare a session to inspect audio.";
+      : "Prepare or play any session to try it.";
     $("resolve-status").textContent = `${r.streams.length} streams found. ${hint}`;
   } catch (err) {
     $("resolve-status").textContent = err.message;
@@ -442,7 +442,7 @@ function playbackBadge(v) {
     return v.ready ? "Ready for playback" : "Preparation failed";
   }
   if (v.requestMethod === "HEAD") return "Player checked stream";
-  return v.sourceCheckDeferred ? "Source unchecked" : "Available";
+  return "Ready to prepare";
 }
 function updateCard(v) {
   const card = cards.get(v.id) || createCard(v);
@@ -479,9 +479,9 @@ function updateCard(v) {
   card.querySelector(".confidence-bar span").style.width =
     (a.confidence || 0) * 100 + "%";
   set(".tracks", (v.tracks || []).map((t) => t.name).join(" · "));
-  card.querySelector(".prepare").textContent = v.sourceCheckDeferred ? "Check & prepare" : "Prepare playback";
+  card.querySelector(".prepare").textContent = "Prepare playback";
   card.querySelector(".prepare").hidden = !!v.preparationStarted || !!v.ready || !!v.passthrough;
-  card.querySelector(".prepare").disabled = v.checked === false;
+  card.querySelector(".prepare").disabled = v.listed === false;
   card.querySelector(".session-metrics").hidden = !v.ready;
   card.querySelector(".confidence-bar").hidden = !v.ready;
   card.querySelector("details").hidden = !v.ready;
@@ -550,6 +550,7 @@ function updateVideoDownload() {
 setInterval(updateVideoDownload, 1000);
 function renderStatus(state) {
     latestStatus = state;
+    if (!$("redirect-original").disabled) $("redirect-original").checked = !!state.redirectOriginal;
     setText($("connection"), "Connected to local server");
     $("connection-dot").classList.remove("offline");
     if ($("manifest").value !== state.manifestURL) $("manifest").value = state.manifestURL;

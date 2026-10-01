@@ -74,8 +74,8 @@ func (s *Server) inspectSource(ctx context.Context, stream Stream) (*Asset, *HLS
 }
 
 // A valid manifest is not evidence that its video still exists. Check only
-// tiny prefixes of the first media resource and its initialization map before
-// adding Italian audio; broken origins must not become audio-only streams.
+// tiny prefixes of the first media resource and its initialization map during
+// preparation; broken origins must not become audio-only streams.
 func (s *Server) checkVideoResources(ctx context.Context, a *Asset) error {
 	if len(a.HLS.Segments) == 0 {
 		return errors.New("source video playlist is empty")
@@ -146,8 +146,8 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(lookup)
 	stop := context.AfterFunc(r.Context(), cancel)
 	defer func() { stop(); cancel() }()
-	// Discovery has a bounded fetch phase. Each source check gets its own
-	// timeout, so later entries are not cut off by an earlier slow source.
+	// Discovery fetches upstream results and Vixsrc audio only. Source media
+	// is inspected when the user prepares or plays a selected stream.
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, 40*time.Second)
 	defer fetchCancel()
 	cfg := s.Config.Get()
@@ -205,10 +205,8 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	}
 	if bundle.err != nil {
 		s.lookupStatus = "Vixsrc Italian audio unavailable; returning original links…"
-	} else if cfg.BypassSourceChecks {
-		s.lookupStatus = fmt.Sprintf("Vixsrc Italian audio confirmed; returning up to %d Italian results with source checks deferred…", cfg.MaxItalianResults)
 	} else {
-		s.lookupStatus = fmt.Sprintf("Checking up to %d streams at once for up to %d Italian results…", cfg.SourceCheckParallelism, cfg.MaxItalianResults)
+		s.lookupStatus = "Vixsrc Italian audio confirmed; returning streams…"
 	}
 	sessions := make([]*Session, len(upstream))
 	for i, stream := range upstream {
@@ -221,148 +219,22 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		sessions[i] = v
 	}
 	s.mu.Unlock()
-	// Normal listing reads only manifests, container indexes and range
-	// probes. Bypass listing reads no source media; neither path decodes it.
-	// Reserve each type's first slots before trying further streams of that
-	// type. Keep the response in upstream order, regardless of check order.
-	type sourceCheckResult struct {
-		asset   *Asset
-		master  *HLS
-		variant *playlist.MultivariantVariant
-		reason  string
-	}
-	checks := make([]chan sourceCheckResult, len(upstream))
-	launch := func(i int) {
-		ready := make(chan sourceCheckResult, 1)
-		checks[i] = ready
-		if bundle.err == nil && !cfg.BypassSourceChecks {
-			if _, err := httpURL(upstream[i].URL); err == nil {
-				sessions[i].mu.Lock()
-				sessions[i].Status = "Checking DubLift availability"
-				sessions[i].mu.Unlock()
-			}
-		}
-		go func(stream Stream) {
-			var result sourceCheckResult
-			if bundle.err != nil {
-				result.reason = bundle.err.Error()
-			} else if _, e := httpURL(stream.URL); e != nil {
-				result.reason = "Upstream torrent or external stream"
-			} else if !cfg.BypassSourceChecks {
-				work, done := context.WithTimeout(ctx, time.Duration(cfg.SourceCheckTimeoutSeconds)*time.Second)
-				var e error
-				result.asset, result.master, result.variant, e = s.inspectSource(work, stream)
-				done()
-				if e != nil {
-					result.reason = e.Error()
-				}
-			}
-			ready <- result
-		}(upstream[i])
-	}
-	maxResults, perType := cfg.MaxItalianResults, cfg.MaxItalianResultsPerStreamType
 	italianResults := 0
-	counts := make(map[string]int)
-	kinds := make([]string, len(upstream))
-	seen := make(map[string]int)
-	var balanced, overflow []int
 	for i, stream := range upstream {
-		kind := streamSelectionType(stream, nil)
-		kinds[i] = kind
-		if seen[kind] < perType {
-			balanced = append(balanced, i)
-		} else {
-			overflow = append(overflow, i)
-		}
-		seen[kind]++
-	}
-	outcomes := make([]sourceCheckResult, len(upstream))
-	inspected := make([]bool, len(upstream))
-	selected := make([]bool, len(upstream))
-	// Checks still run concurrently, but their results are applied in each
-	// pass's priority order. A failed alternative leaves room for overflow.
-	runPass := func(indices []int, enforceTypeLimit bool) {
-		nextToStart := 0
-		for pos, i := range indices {
-			if italianResults >= maxResults {
-				break
-			}
-			if selected[i] || inspected[i] && outcomes[i].reason != "" {
-				continue
-			}
-			for nextToStart < len(indices) && nextToStart-pos < cfg.SourceCheckParallelism && italianResults+nextToStart-pos < maxResults {
-				candidate := indices[nextToStart]
-				if checks[candidate] == nil && !inspected[candidate] && (!enforceTypeLimit || counts[kinds[candidate]] < perType) {
-					launch(candidate)
-				}
-				nextToStart++
-			}
-			if checks[i] == nil && !inspected[i] {
-				if enforceTypeLimit && counts[kinds[i]] >= perType {
-					continue
-				}
-				launch(i)
-			}
-			if !inspected[i] {
-				if !cfg.BypassSourceChecks {
-					s.mu.Lock()
-					if generation == s.generation {
-						s.lookupStatus = fmt.Sprintf("Resolving stream %d of %d · %d/%d Italian results…", i+1, len(upstream), italianResults, maxResults)
-					}
-					s.mu.Unlock()
-				}
-				outcomes[i] = <-checks[i]
-				inspected[i] = true
-			}
-			if outcomes[i].reason == "" {
-				kind := streamSelectionType(upstream[i], outcomes[i].asset)
-				if !enforceTypeLimit || counts[kind] < perType {
-					selected[i] = true
-					counts[kind]++
-					italianResults++
-				}
-			}
-		}
-	}
-	runPass(balanced, true)
-	if italianResults < maxResults {
-		var alternatives []int
-		for _, i := range overflow {
-			if counts[kinds[i]] < perType {
-				alternatives = append(alternatives, i)
-			}
-		}
-		runPass(alternatives, true)
-	}
-	if italianResults < maxResults {
-		var remaining []int
-		for i := range upstream {
-			if !selected[i] && (!inspected[i] || outcomes[i].reason == "") {
-				remaining = append(remaining, i)
-			}
-		}
-		runPass(remaining, false)
-	}
-	for i, stream := range upstream {
-		check := outcomes[i]
-		if !selected[i] && check.reason == "" {
-			check.reason = "Italian result limit reached"
-		}
 		v := sessions[i]
 		v.mu.Lock()
-		if selected[i] {
-			v.listedAsset, v.listedMaster, v.listedVariant = check.asset, check.master, check.variant
+		_, urlErr := httpURL(stream.URL)
+		if bundle.err == nil && urlErr == nil {
 			v.listedVix, v.listedEnglish = bundle.tracks, bundle.english
-			if cfg.BypassSourceChecks {
-				v.SourceCheckDeferred = true
-				v.Status = "Italian audio found · source check deferred until Prepare or playback"
-			} else {
-				v.Status = "Available · waiting for player"
-			}
+			v.Status = "Italian audio found · ready to prepare or play"
 			results[i] = stream.dubbed(s.playbackURL(r, v))
+			italianResults++
 		} else {
 			v.Passthrough = true
-			v.FallbackReason = check.reason
+			v.FallbackReason = "Upstream torrent or external stream"
+			if bundle.err != nil {
+				v.FallbackReason = bundle.err.Error()
+			}
 			v.Status = "Original stream · unchanged upstream link"
 		}
 		v.mu.Unlock()
@@ -373,8 +245,6 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	if current {
 		if bundle.err != nil {
 			s.lookupStatus = fmt.Sprintf("Vixsrc Italian audio unavailable · %d original streams returned", len(results))
-		} else if cfg.BypassSourceChecks {
-			s.lookupStatus = fmt.Sprintf("%d Italian results returned · source checks deferred until Prepare or playback", italianResults)
 		} else {
 			s.lookupStatus = fmt.Sprintf("%d Italian results · %d streams returned in upstream order", italianResults, len(results))
 		}
@@ -386,21 +256,6 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		go s.resolveContentName(c, cfg)
 	}
 	jsonResponse(w, 200, map[string]any{"streams": results, "cacheMaxAge": 0, "staleRevalidate": 0, "staleError": 0})
-}
-
-// The result limit groups sources by whether their video needs file remuxing.
-// HLS keeps its source segments even when those segments are fragmented MP4.
-func streamSelectionType(stream Stream, asset *Asset) string {
-	if asset != nil {
-		if asset.HLS != nil {
-			return "hls"
-		}
-		return "remuxed"
-	}
-	if isHLSURL(stream.URL, stream.BehaviorHints.Filename) {
-		return "hls"
-	}
-	return "remuxed"
 }
 
 func fallbackContentName(c Content, stream Stream) string {

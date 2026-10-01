@@ -93,72 +93,68 @@ func (s Stream) Origin() Origin {
 }
 
 type Session struct {
-	mu                  sync.Mutex
-	ID                  string `json:"id"`
-	Key                 string `json:"-"`
-	lookupKey           string
-	ticket              string
-	Content             Content `json:"content"`
-	Name                string  `json:"name"`
-	ContentName         string
-	Order               int
-	Playing             bool
-	PlaybackAt          time.Time
-	RequestAt           time.Time
-	RequestMethod       string
-	SampleIndex         int
-	SampleTotal         int
-	SamplePhase         string
-	Passthrough         bool
-	SourceCheckDeferred bool
-	FallbackReason      string
-	Created             time.Time `json:"created"`
-	LastUsed            time.Time `json:"lastUsed"`
-	Status              string    `json:"status"`
-	Errors              []string  `json:"errors"`
-	Position            float64   `json:"position"`
-	PositionAt          time.Time `json:"positionAt"`
-	positionFromVideo   bool
-	Duration            float64 `json:"duration"`
-	videoDownload       videoDownload
-	Aligning            bool `json:"aligning"`
-	Revision            int  `json:"revision"`
-	stream              Stream
-	prepare             sync.Once
-	preparationStarted  bool
-	ready               chan struct{}
-	prepareErr          error
-	video               *Asset
-	variant             *playlist.MultivariantVariant
-	clockBase           float64
-	tracks              []Track
-	sourceEnglish       *Track
-	vixEnglish          *Track
-	boundaries          []float64
-	resources           map[string]resource
-	masterLoaded        bool
-	alignDone           chan struct{}
-	firstAligned        chan struct{}
-	videoBase           int
-	videoHighest        int
-	videoSequence       uint64
-	videoReady          map[int]bool
-	videoPrefetch       segmentLookahead
-	videoWindow         *fileVideoWindow
-	videoInit           []byte
-	audioPrefetch       segmentLookahead
-	audioPrefetchID     string
-	audioTS             map[string]tsContinuityState
-	videoChanged        chan struct{}
-	startupZero         bool
-	listedAsset         *Asset
-	listedMaster        *HLS
-	listedVariant       *playlist.MultivariantVariant
-	listedVix           []Track
-	listedEnglish       *Track
-	listedReady         chan struct{}
-	ctx                 context.Context
-	cancel              context.CancelFunc
+	mu                 sync.Mutex
+	ID                 string `json:"id"`
+	Key                string `json:"-"`
+	lookupKey          string
+	ticket             string
+	Content            Content `json:"content"`
+	Name               string  `json:"name"`
+	ContentName        string
+	Order              int
+	Playing            bool
+	PlaybackAt         time.Time
+	RequestAt          time.Time
+	RequestMethod      string
+	SampleIndex        int
+	SampleTotal        int
+	SamplePhase        string
+	Passthrough        bool
+	FallbackReason     string
+	Created            time.Time `json:"created"`
+	LastUsed           time.Time `json:"lastUsed"`
+	Status             string    `json:"status"`
+	Errors             []string  `json:"errors"`
+	Position           float64   `json:"position"`
+	PositionAt         time.Time `json:"positionAt"`
+	positionFromVideo  bool
+	Duration           float64 `json:"duration"`
+	videoDownload      videoDownload
+	Aligning           bool `json:"aligning"`
+	Revision           int  `json:"revision"`
+	stream             Stream
+	prepare            sync.Once
+	preparationStarted bool
+	ready              chan struct{}
+	prepareErr         error
+	video              *Asset
+	variant            *playlist.MultivariantVariant
+	clockBase          float64
+	tracks             []Track
+	sourceEnglish      *Track
+	vixEnglish         *Track
+	boundaries         []float64
+	resources          map[string]resource
+	masterLoaded       bool
+	alignDone          chan struct{}
+	firstAligned       chan struct{}
+	videoBase          int
+	videoHighest       int
+	videoSequence      uint64
+	videoReady         map[int]bool
+	videoPrefetch      segmentLookahead
+	videoWindow        *fileVideoWindow
+	videoInit          []byte
+	audioPrefetch      segmentLookahead
+	audioPrefetchID    string
+	audioTS            map[string]tsContinuityState
+	videoChanged       chan struct{}
+	startupZero        bool
+	listedVix          []Track
+	listedEnglish      *Track
+	listedReady        chan struct{}
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 type resource struct {
 	Origin   Origin
@@ -234,11 +230,13 @@ func (s *Server) prepareSession(ctx context.Context, v *Session) error {
 		v.mu.Unlock()
 		go func() {
 			defer close(v.ready)
+			work, cancel := context.WithTimeout(v.ctx, time.Duration(s.Config.Get().PreparationTimeoutSeconds)*time.Second)
+			defer cancel()
 			if v.listedReady != nil {
 				select {
 				case <-v.listedReady:
-				case <-v.ctx.Done():
-					v.prepareErr = v.ctx.Err()
+				case <-work.Done():
+					v.prepareErr = work.Err()
 					return
 				}
 			}
@@ -246,15 +244,13 @@ func (s *Server) prepareSession(ctx context.Context, v *Session) error {
 				v.prepareErr = errors.New(v.FallbackReason)
 				return
 			}
-			work, cancel := context.WithTimeout(v.ctx, 2*time.Minute)
-			defer cancel()
 			v.prepareErr = s.prepareMedia(work, v)
-			v.mu.Lock()
-			v.SourceCheckDeferred = false
-			v.mu.Unlock()
+			if v.prepareErr == nil {
+				v.prepareErr = work.Err()
+			}
 			if v.prepareErr != nil {
 				v.note(v.prepareErr)
-				v.state("Source unavailable")
+				v.state("Preparation failed")
 			}
 		}()
 	})
@@ -301,16 +297,10 @@ func (s *Server) loadSubtitle(ctx context.Context, o Origin) (*Asset, error) {
 	return &Asset{ID: identity(o.URL), Origin: h.Origin, HLS: h}, nil
 }
 func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
-	v.state("Inspecting source")
-	a, originalMaster, variant := v.listedAsset, v.listedMaster, v.listedVariant
-	var err error
-	if a == nil {
-		check, done := context.WithTimeout(ctx, time.Duration(s.Config.Get().SourceCheckTimeoutSeconds)*time.Second)
-		a, originalMaster, variant, err = s.inspectSource(check, v.stream)
-		done()
-		if err != nil {
-			return err
-		}
+	v.state("Preparing playback")
+	a, originalMaster, variant, err := s.inspectSource(ctx, v.stream)
+	if err != nil {
+		return err
 	}
 	if variant != nil {
 		copyVariant := *variant
@@ -433,6 +423,9 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 		}
 		v.tracks = append(v.tracks, bundle.tracks...)
 		v.vixEnglish = bundle.english
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if v.vixEnglish == nil || v.sourceEnglish == nil {
 		v.note(errors.New("English reference missing: using offset 0; manual synchronization remains available"))
