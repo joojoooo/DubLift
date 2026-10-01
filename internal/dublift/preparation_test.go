@@ -103,14 +103,13 @@ func TestDevelopmentRedirectIsTemporaryAndSkipsPreparation(t *testing.T) {
 	}
 }
 
-func TestPreparationTimeoutIncludesInspectionAndProbe(t *testing.T) {
+func TestPreparationDeadlineIncludesInspectionAndProbe(t *testing.T) {
 	s := lifecycleServer(t)
 	probe := filepath.Join(t.TempDir(), "ffprobe")
 	if err := os.WriteFile(probe, []byte("#!/bin/sh\nexec sleep 10\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	cfg := s.Config.Get()
-	cfg.PreparationTimeoutSeconds = 1
 	cfg.FFprobe = probe
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
@@ -133,6 +132,11 @@ func TestPreparationTimeoutIncludesInspectionAndProbe(t *testing.T) {
 	}))
 	defer origin.Close()
 	v := s.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{URL: origin.URL + "/source.m3u8"})
+	// A shorter session deadline exercises cancellation without waiting for
+	// the fixed two-minute preparation limit.
+	ctx, cancel := context.WithTimeout(v.ctx, time.Second)
+	defer cancel()
+	v.ctx = ctx
 	started := time.Now()
 	err := s.prepareSession(context.Background(), v)
 	elapsed := time.Since(started)

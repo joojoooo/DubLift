@@ -3,7 +3,6 @@ package dublift
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -426,52 +425,6 @@ func TestCacheBoundAndSingleFlight(t *testing.T) {
 		t.Fatal("cache grew without bound")
 	}
 }
-func TestPreparationTimeoutSettings(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
-	c, err := OpenConfig(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	settings := c.Get()
-	if settings.PreparationTimeoutSeconds != 120 {
-		t.Fatal("unexpected preparation timeout", settings.PreparationTimeoutSeconds)
-	}
-	settings.PreparationTimeoutSeconds = 240
-	if err := c.Save(settings); err != nil {
-		t.Fatal(err)
-	}
-	c, err = OpenConfig(path)
-	if err != nil || c.Get().PreparationTimeoutSeconds != 240 {
-		t.Fatalf("timeout did not persist: %v", err)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var legacy map[string]json.RawMessage
-	if err := json.Unmarshal(b, &legacy); err != nil {
-		t.Fatal(err)
-	}
-	delete(legacy, "preparationTimeoutSeconds")
-	b, err = json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, b, 0600); err != nil {
-		t.Fatal(err)
-	}
-	c, err = OpenConfig(path)
-	if err != nil || c.Get().PreparationTimeoutSeconds != 120 {
-		t.Fatalf("existing config did not receive timeout default: %v", err)
-	}
-	for _, timeout := range []int{0, 601} {
-		settings.PreparationTimeoutSeconds = timeout
-		if settings.Validate() == nil {
-			t.Fatalf("accepted timeout %d", timeout)
-		}
-	}
-}
-
 func TestPrivateConfigAndIDs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "private", "config.json")
 	c, e := OpenConfig(path)

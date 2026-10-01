@@ -389,57 +389,36 @@ func TestPlaybackDetectionAndAutomaticCleanup(t *testing.T) {
 	}
 }
 
-func TestStartupReleasesAtFirstSampleAndUpdatesOffset(t *testing.T) {
+func TestDashboardPreparationWaitsForAlignmentAndOffsetsApplyAsAvailable(t *testing.T) {
 	s := lifecycleServer(t)
 	v := s.newSession(Content{}, Stream{})
 	v.Aligning = true
-	v.firstAligned = make(chan struct{})
 	v.alignDone = make(chan struct{})
-	// Immediate startup must not wait on any sample or anonymous-access check.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	s.awaitStartupAlignment(ctx, v)
-	if ctx.Err() != nil {
-		t.Fatal("immediate startup waited")
-	}
-	cfg := s.Config.Get()
-	cfg.StartImmediately = false
-	if err := s.Config.Save(cfg); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	go func() { s.awaitStartupAlignment(ctx, v); close(done) }()
+	done := make(chan error, 1)
+	go func() { done <- s.awaitPreparedAlignment(ctx, v) }()
 	select {
 	case <-done:
-		t.Fatal("started before first sample")
+		t.Fatal("dashboard preparation completed before alignment")
 	case <-time.After(20 * time.Millisecond):
-	}
-	close(v.firstAligned)
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatal("waited for all samples")
-	}
-	select {
-	case <-v.alignDone:
-		t.Fatal("test unexpectedly completed all samples")
-	default:
 	}
 	if err := s.Alignments.Update(v.Key, func(a *Alignment) { a.Offset = 1.25; a.Confidence = .9 }); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.playbackOffset(v, 30); got != 1.25 {
-		t.Fatal("first offset unavailable", got)
+		t.Fatal("calculated offset unavailable before remaining samples finish", got)
 	}
-	v.startupZero = true
-	if got := s.playbackOffset(v, 30); got != 0 {
-		t.Fatal("immediate startup must hold zero", got)
+	close(v.alignDone)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("dashboard preparation did not finish")
 	}
-	s.Alignments.Update(v.Key, func(a *Alignment) { a.AutoComplete = true })
-	if got := s.playbackOffset(v, 30); got != 1.25 {
-		t.Fatal("finished alignment did not apply", got)
-	}
-	s.Alignments.Update(v.Key, func(a *Alignment) { a.AutoComplete = false; x := -.5; a.Manual = &x })
+	s.Alignments.Update(v.Key, func(a *Alignment) { x := -.5; a.Manual = &x })
 	if got := s.playbackOffset(v, 30); got != -.5 {
 		t.Fatal("manual offset ignored", got)
 	}
@@ -447,7 +426,7 @@ func TestStartupReleasesAtFirstSampleAndUpdatesOffset(t *testing.T) {
 
 func TestShortAlignmentSettingsAndSampleCoverage(t *testing.T) {
 	cfg := DefaultSettings()
-	if cfg.SearchRadius != 10 || cfg.AlignmentSampleSeconds != 5 || cfg.AlignmentSamples != 1 || !cfg.StartImmediately {
+	if cfg.SearchRadius != 10 || cfg.AlignmentSampleSeconds != 5 || cfg.AlignmentSamples != 1 {
 		t.Fatal("incorrect startup defaults")
 	}
 	for _, window := range []float64{5, 8, 16, 40} {
@@ -472,12 +451,11 @@ func TestShortAlignmentSettingsAndSampleCoverage(t *testing.T) {
 	cfg = s.Config.Get()
 	cfg.AlignmentSamples = 5
 	cfg.AlignmentSampleSeconds = 24
-	cfg.StartImmediately = false
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err := OpenConfig(s.Config.path)
-	if err != nil || fresh.Get().AlignmentSamples != 5 || fresh.Get().AlignmentSampleSeconds != 24 || fresh.Get().StartImmediately {
+	if err != nil || fresh.Get().AlignmentSamples != 5 || fresh.Get().AlignmentSampleSeconds != 24 {
 		t.Fatal("settings did not persist", err)
 	}
 	for _, invalid := range []int{0, 13} {

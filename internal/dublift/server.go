@@ -172,7 +172,7 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(405)
 			return
 		}
-		var cfg Settings
+		cfg := DefaultSettings()
 		if err := decodeRequest(w, r, &cfg); err != nil {
 			failure(w, 400, err)
 			return
@@ -285,7 +285,7 @@ func (s *Server) status(r *http.Request) map[string]any {
 	snapshots := []map[string]any{}
 	for _, v := range sessions {
 		v.mu.Lock()
-		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, nil), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "startupZero": v.startupZero, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
+		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, nil), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
 		if v.Passthrough {
 			view["url"] = v.stream.URL
 		}
@@ -517,7 +517,11 @@ func (s *Server) sessionAction(w http.ResponseWriter, r *http.Request) {
 	}
 	switch p[3] {
 	case "prepare":
-		jsonResponse(w, 200, map[string]bool{"ok": true})
+		if err := s.awaitPreparedAlignment(r.Context(), v); err != nil {
+			failure(w, 502, err)
+			return
+		}
+		jsonResponse(w, 200, map[string]bool{"ok": true, "aligned": s.Alignments.Get(v.Key).reusable(s.Config.Get()), "retryAlignment": v.sourceEnglish != nil && v.vixEnglish != nil})
 	case "offset":
 		var req struct {
 			Offset *float64 `json:"offset"`

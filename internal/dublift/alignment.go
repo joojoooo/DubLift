@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/bits"
 	"os"
@@ -62,6 +63,11 @@ func (a Alignment) At(t float64, minConfidence float64) float64 {
 		}
 	}
 	return off
+}
+
+func (a Alignment) reusable(cfg Settings) bool {
+	return a.Manual != nil || (a.AutoComplete && a.Confidence > 0 && a.Confidence >= cfg.MinConfidence &&
+		a.AutoExpected == cfg.AlignmentSamples && a.AutoWindow == cfg.AlignmentSampleSeconds && a.AutoRadius == cfg.SearchRadius)
 }
 func (a *Alignment) Choose(threshold float64) {
 	good := []Anchor{}
@@ -319,17 +325,26 @@ func pcmScore(a, b []int16, lag int) float64 {
 	return math.Abs(xy / math.Sqrt(xx*yy))
 }
 func MatchPCM(ctx context.Context, needle, hay []int16) (lag, confidence float64, err error) {
+	if e := ctx.Err(); e != nil {
+		return 0, 0, e
+	}
 	nf, step, e := fingerprint(needle)
 	if e != nil {
+		return 0, 0, e
+	}
+	if e := ctx.Err(); e != nil {
 		return 0, 0, e
 	}
 	hf, _, e := fingerprint(hay)
 	if e != nil {
 		return 0, 0, e
 	}
+	if e := ctx.Err(); e != nil {
+		return 0, 0, e
+	}
 	cs := fingerprints(nf, hf)
 	if len(cs) == 0 {
-		return 0, 0, errors.New("no distinctive English fingerprint")
+		return 0, 0, errors.New("the English clip has no distinctive sound to match; try another position or a longer sample")
 	}
 	ne, he := spectral(needle), spectral(hay)
 	best, bestLag, runner := 0.0, 0.0, 0.0
@@ -343,6 +358,9 @@ func MatchPCM(ctx context.Context, needle, hay []int16) (lag, confidence float64
 		center := int(float64(c.lag) * step * pcmRate / 110)
 		score, at := 0.0, 0
 		for j := center - 45; j <= center+45; j++ {
+			if e := ctx.Err(); e != nil {
+				return 0, 0, e
+			}
 			s := spectralScore(ne, he, j)
 			if s > score {
 				score = s
@@ -362,7 +380,7 @@ func MatchPCM(ctx context.Context, needle, hay []int16) (lag, confidence float64
 		}
 	}
 	if best == 0 {
-		return 0, 0, errors.New("fingerprint candidates failed spectral verification")
+		return 0, 0, errors.New("the downloaded English clips did not pass audio verification; try another position or a wider search radius")
 	}
 	if runner > best-.04 {
 		best *= .65
@@ -372,6 +390,9 @@ func MatchPCM(ctx context.Context, needle, hay []int16) (lag, confidence float64
 	sampleLag := int(math.Round(bestLag * pcmRate))
 	wave, bestSample := 0.0, sampleLag
 	for d := -220; d <= 220; d++ {
+		if e := ctx.Err(); e != nil {
+			return 0, 0, e
+		}
 		s := pcmScore(needle, hay, sampleLag+d)
 		if s > wave {
 			wave = s
@@ -388,6 +409,49 @@ func MatchPCM(ctx context.Context, needle, hay []int16) (lag, confidence float64
 type PCMExtractor func(context.Context, float64, float64) ([]int16, error)
 
 func FindAnchor(ctx context.Context, source, vix PCMExtractor, vixAt, expectedOffset, radius, duration, window float64) (Anchor, error) {
+	return findAnchor(ctx, source, vix, vixAt, expectedOffset, radius, duration, window, alignmentOptions{
+		DownloadTimeout: alignmentDownloadTimeout, CalculationTimeout: alignmentCalculationTimeout,
+	})
+}
+
+type alignmentOptions struct {
+	DownloadTimeout    time.Duration
+	CalculationTimeout time.Duration
+	Phase              func(string)
+}
+
+type alignmentStageError struct {
+	stage       string
+	limit       time.Duration
+	cause       error
+	calculation bool
+}
+
+func (e *alignmentStageError) Error() string {
+	if e.limit > 0 {
+		if e.calculation {
+			return fmt.Sprintf("alignment calculations timed out after %s; both English clips were already downloaded and decoded", e.limit)
+		}
+		return fmt.Sprintf("%s timed out after %s; alignment calculations had not started", e.stage, e.limit)
+	}
+	return fmt.Sprintf("%s failed: %v", e.stage, e.cause)
+}
+func (e *alignmentStageError) Unwrap() error { return e.cause }
+
+func alignmentStageFailure(ctx context.Context, stage string, limit time.Duration, err error, calculation bool) error {
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		limit = 0
+	}
+	return &alignmentStageError{stage: stage, limit: limit, cause: err, calculation: calculation}
+}
+
+func findAnchor(ctx context.Context, source, vix PCMExtractor, vixAt, expectedOffset, radius, duration, window float64, options alignmentOptions) (Anchor, error) {
 	// The source file is expensive because its audio is interleaved with video.
 	// Match its short clip inside a longer Vixsrc-only audio search window.
 	sourceAt := max(0, min(vixAt+expectedOffset, duration-window))
@@ -396,17 +460,39 @@ func FindAnchor(ctx context.Context, source, vix PCMExtractor, vixAt, expectedOf
 	if vixDuration < window {
 		return Anchor{}, errors.New("not enough English audio at this position")
 	}
-	hay, e := vix(ctx, vixSearchAt, vixDuration)
+	extract := func(extractor PCMExtractor, at, length float64, name string) ([]int16, error) {
+		stage := "Downloading and decoding " + name
+		if options.Phase != nil {
+			options.Phase(fmt.Sprintf("%s near %.0fs · limit %s", stage, at, options.DownloadTimeout))
+		}
+		work, cancel := context.WithTimeout(ctx, options.DownloadTimeout)
+		defer cancel()
+		pcm, err := extractor(work, at, length)
+		if err != nil || work.Err() != nil {
+			return nil, alignmentStageFailure(work, stage, options.DownloadTimeout, err, false)
+		}
+		if len(pcm) < int(length*pcmRate)-pcmRate/10 {
+			return nil, fmt.Errorf("%s returned only %.1fs of the %.1fs English clip; the media may be incomplete", stage, float64(len(pcm))/pcmRate, length)
+		}
+		return pcm, nil
+	}
+	hay, e := extract(vix, vixSearchAt, vixDuration, "Vixsrc English audio")
 	if e != nil {
 		return Anchor{}, e
 	}
-	needle, e := source(ctx, sourceAt, window)
+	needle, e := extract(source, sourceAt, window, "the upstream English clip (audio from the source video)")
 	if e != nil {
 		return Anchor{}, e
 	}
-	lag, confidence, e := MatchPCM(ctx, needle, hay)
-	if e != nil {
-		return Anchor{}, e
+	if options.Phase != nil {
+		options.Phase(fmt.Sprintf("Calculating English audio alignment · limit %s", options.CalculationTimeout))
+	}
+	// Network and decoder time never consume the calculation deadline.
+	work, cancel := context.WithTimeout(ctx, options.CalculationTimeout)
+	defer cancel()
+	lag, confidence, e := MatchPCM(work, needle, hay)
+	if e != nil || work.Err() != nil {
+		return Anchor{}, alignmentStageFailure(work, "Alignment calculations", options.CalculationTimeout, e, true)
 	}
 	vixMatchAt := vixSearchAt + lag
 	return Anchor{VixTime: vixMatchAt + window/2, SourceTime: sourceAt + window/2, Offset: sourceAt - vixMatchAt, Confidence: confidence}, nil

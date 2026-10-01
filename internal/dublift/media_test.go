@@ -413,8 +413,13 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	command(t, "ffmpeg", "-nostdin", "-v", "error", "-i", filepath.Join(dir, "english.wav"), "-c:a", "aac", "-hls_time", "6", "-hls_playlist_type", "vod", "-hls_segment_filename", filepath.Join(dir, "en-%03d.ts"), filepath.Join(dir, "en.m3u8"))
 	os.WriteFile(filepath.Join(dir, "sub.m3u8"), []byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:84\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:84,\nsub.vtt\n#EXT-X-ENDLIST\n"), 0600)
 	os.WriteFile(filepath.Join(dir, "sub.vtt"), []byte("WEBVTT\n\n00:00:42.000 --> 00:00:45.000\nCiao, mondo.\n"), 0600)
+	var rejectEarlyEnglish atomic.Bool
 	var origin *httptest.Server
 	origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rejectEarlyEnglish.Load() && r.URL.Path == "/en-000.ts" {
+			http.Error(w, "early clip unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		switch r.URL.Path {
 		case "/manifest.json":
 			io.WriteString(w, `{"id":"fixture","resources":["stream"],"types":["movie","series"]}`)
@@ -506,6 +511,13 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 				for n := 7; n < 14; n++ {
 					getBytes(t, local.URL+"/media/"+id+"/video/"+strconv.Itoa(n)+"/segment.m4s")
 				}
+			} else {
+				video := getBytes(t, local.URL+"/media/"+id+"/video.m3u8")
+				var media playlist.Media
+				if err := media.Unmarshal(video); err != nil {
+					t.Fatal(err)
+				}
+				getBytes(t, local.URL+media.Segments[7].URI)
 			}
 			deadline := time.Now().Add(25 * time.Second)
 			for time.Now().Before(deadline) {
@@ -674,7 +686,6 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	}
 	t.Run("MKV_first_sample_from_zero_before_playback", func(t *testing.T) {
 		gated := cfg.Get()
-		gated.StartImmediately = false
 		gated.AlignmentSampleSeconds = 8 // changing length must start a fresh run
 		if err := cfg.Save(gated); err != nil {
 			t.Fatal(err)
@@ -688,15 +699,84 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			Streams []Stream `json:"streams"`
 		}
 		getJSON(t, local.URL+"/stream/movie/tmdb:603.json", &fresh)
+		id := strings.Split(strings.TrimPrefix(fresh.Streams[0].URL, local.URL+"/media/"), "/")[0]
+		resp, err := http.Post(local.URL+"/api/sessions/"+id+"/prepare", "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || !bytes.Contains(body, []byte(`"aligned":true`)) {
+			t.Fatalf("manual preparation: %s", body)
+		}
+		session := server.getSession(id)
+		if session.Playing || session.Aligning {
+			t.Fatal("manual preparation did not finish before playback")
+		}
+		alignment := server.Alignments.Get(session.Key)
+		if alignment.Confidence < .68 || math.Abs(server.playbackOffset(session, 0)-2.4) > .12 {
+			t.Fatal("prepared offset unavailable", alignment)
+		}
 		master := getBytes(t, fresh.Streams[0].URL)
 		if !bytes.Contains(master, []byte("Italian · Vixsrc")) {
 			t.Fatal("Italian master missing")
 		}
-		id := strings.Split(strings.TrimPrefix(fresh.Streams[0].URL, local.URL+"/media/"), "/")[0]
-		session := server.getSession(id)
-		alignment := server.Alignments.Get(session.Key)
+		if server.playbackOffset(session, 0) != alignment.Offset {
+			t.Fatal("playback lost prepared synchronization")
+		}
 		if len(alignment.AutoSamples) == 0 || alignment.AutoWindow != 8 || math.Abs(alignment.AutoSamples[0].SourceTime-14) > .15 {
 			t.Fatalf("first source sample did not start at 00:00: %+v; errors: %+v", alignment, session.Errors)
+		}
+	})
+	t.Run("failed_preparation_aligns_after_playback_seeks", func(t *testing.T) {
+		cfgValue := cfg.Get()
+		cfgValue.AlignmentSampleSeconds = 8
+		if err := cfg.Save(cfgValue); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := cfg.Save(settings); err != nil {
+				t.Error(err)
+			}
+		}()
+		var fresh struct {
+			Streams []Stream `json:"streams"`
+		}
+		getJSON(t, local.URL+"/stream/movie/tmdb:603.json", &fresh)
+		id := strings.Split(strings.TrimPrefix(fresh.Streams[0].URL, local.URL+"/media/"), "/")[0]
+		// Force reanalysis even if a preceding subtest aligned this edition.
+		session := server.getSession(id)
+		if err := server.prepareSession(context.Background(), session); err != nil {
+			t.Fatal(err)
+		}
+		if err := server.awaitPreparedAlignment(context.Background(), session); err != nil {
+			t.Fatal(err)
+		}
+		rejectEarlyEnglish.Store(true)
+		defer rejectEarlyEnglish.Store(false)
+		server.Engine.Cache.Clear()
+		if !server.startAlignment(session, nil) {
+			t.Fatal("manual reanalysis did not start")
+		}
+		resp, err := http.Post(local.URL+"/api/sessions/"+id+"/prepare", "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || !bytes.Contains(body, []byte(`"aligned":false`)) {
+			t.Fatalf("failed manual alignment was reported successful: %s", body)
+		}
+		getBytes(t, fresh.Streams[0].URL)
+		for n := 7; n < 14; n++ {
+			getBytes(t, local.URL+"/media/"+id+"/video/"+strconv.Itoa(n)+"/segment.m4s")
+		}
+		if err := server.awaitPreparedAlignment(context.Background(), session); err != nil {
+			t.Fatal(err)
+		}
+		aligned := server.Alignments.Get(session.Key)
+		if aligned.Confidence < .68 || math.Abs(aligned.Offset-2.4) > .12 || len(aligned.AutoSamples) != 1 || aligned.AutoSamples[0].SourceTime < 42 {
+			t.Fatalf("playback retry did not align at the seeked area: %+v; errors: %+v", aligned, session.Errors)
 		}
 	})
 	var series struct {

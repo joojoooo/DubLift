@@ -229,7 +229,6 @@ const fields = {
   searchRadius: "search-radius",
   alignmentSampleSeconds: "alignment-sample-seconds",
   alignmentSamples: "alignment-samples",
-  preparationTimeoutSeconds: "preparation-timeout",
   cacheMB: "cache-mb",
   ffmpeg: "ffmpeg",
   ffprobe: "ffprobe",
@@ -240,7 +239,6 @@ async function loadSettings() {
   settings = await api("/api/settings");
   for (const [key, id] of Object.entries(fields))
     $(id).value = settings[key] ?? "";
-  $("start-immediately").checked = settings.startImmediately;
   $("confidence").value = settings.minConfidence;
   confidenceLabel();
   $("addons").replaceChildren();
@@ -249,7 +247,6 @@ async function loadSettings() {
   $("wizard-addons").replaceChildren();
   settings.addons.forEach((addon) => addonRow(addon, $("wizard-addons")));
   if (!settings.addons.length) addonRow(undefined, $("wizard-addons"));
-  $("wizard-timeout").value = settings.preparationTimeoutSeconds;
   $("wizard-samples").value = settings.alignmentSamples;
   $("wizard-sample-seconds").value = settings.alignmentSampleSeconds;
 }
@@ -268,10 +265,9 @@ $("settings-form").onsubmit = async (e) => {
   e.preventDefault();
   const cfg = { ...settings };
   for (const [key, id] of Object.entries(fields))
-    cfg[key] = ["searchRadius", "alignmentSampleSeconds", "alignmentSamples", "preparationTimeoutSeconds", "cacheMB"].includes(key)
+    cfg[key] = ["searchRadius", "alignmentSampleSeconds", "alignmentSamples", "cacheMB"].includes(key)
       ? Number($(id).value)
       : $(id).value.trim();
-  cfg.startImmediately = $("start-immediately").checked;
   cfg.minConfidence = Number($("confidence").value);
   cfg.addons = readAddons($("addons"));
   try {
@@ -349,7 +345,6 @@ $("wizard-next").onclick = async () => {
       if (!inputs.every((input) => input.reportValidity())) return;
       await saveConfig({
         ...settings,
-        preparationTimeoutSeconds: Number($("wizard-timeout").value),
         alignmentSamples: Number($("wizard-samples").value),
         alignmentSampleSeconds: Number($("wizard-sample-seconds").value),
       });
@@ -396,15 +391,19 @@ function createCard(session) {
       const btn = card.querySelector(selector);
       btn.disabled = true;
       try {
-        await api(`/api/sessions/${id}/${route}`, body);
-        toast(message);
+        const result = await api(`/api/sessions/${id}/${route}`, body);
+        toast(typeof message === "function" ? message(result) : message);
       } catch (err) {
         toast(err.message);
       } finally {
         btn.disabled = false;
       }
     });
-  action(".prepare", "prepare", {}, "Playback is ready");
+  action(".prepare", "prepare", {}, (result) => result.aligned
+    ? "Playback prepared with synchronization"
+    : result.retryAlignment
+      ? "Playback prepared with offset 0. Alignment will retry when playback starts."
+      : "Playback prepared with offset 0. An English reference is missing; manual synchronization is available.");
   action(
     ".realign",
     "realign",
@@ -439,6 +438,8 @@ function playbackBadge(v) {
   if (v.playing) return "▶ Playback detected";
   if (v.preparationStarted) {
     if (!v.preparationDone) return "Preparing playback";
+    if (v.aligning) return "Preparing synchronization";
+    if (v.ready && (v.alignment?.confidence || 0) < (settings?.minConfidence ?? 0.68) && v.alignment?.manual == null) return "Prepared · synchronization unavailable";
     return v.ready ? "Ready for playback" : "Preparation failed";
   }
   if (v.requestMethod === "HEAD") return "Player checked stream";
@@ -466,7 +467,7 @@ function updateCard(v) {
     a.confidence ? Math.round(a.confidence * 100) + "%" : "Not matched",
   );
   const minimum = settings?.minConfidence ?? 0.68;
-  let offset = a.manual ?? (v.startupZero && !a.automaticComplete ? 0 : a.confidence >= minimum ? a.offset : 0) ?? 0;
+  let offset = a.manual ?? (a.confidence >= minimum ? a.offset : 0) ?? 0;
   if (a.manual == null) {
     for (const b of a.boundaries || []) {
       if (b.sourceTime <= v.position && b.confidence >= minimum) offset = b.offset;
@@ -501,7 +502,7 @@ function updateCard(v) {
         : "",
       ...(a.anchors || []).map(
         (x) =>
-          `Sample ${clock(x.vixTime)} → ${clock(x.sourceTime)} · ${x.offset.toFixed(3)} s · ${Math.round(x.confidence * 100)}%`,
+          `Upstream ${clock(x.sourceTime)} ↔ Vixsrc ${clock(x.vixTime)} · ${x.offset >= 0 ? "+" : ""}${x.offset.toFixed(3)} s · ${Math.round(x.confidence * 100)}%${x.confidence < minimum ? " · below required confidence" : ""}`,
       ),
       ...(a.boundaries || []).map(
         (x) =>

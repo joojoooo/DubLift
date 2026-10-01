@@ -20,25 +20,23 @@ type Addon struct {
 }
 
 type Settings struct {
-	Listen                    string  `json:"listen"`
-	PublicURL                 string  `json:"publicURL"`
-	MinConfidence             float64 `json:"minConfidence"`
-	SearchRadius              float64 `json:"searchRadius"`
-	AlignmentSampleSeconds    int     `json:"alignmentSampleSeconds"`
-	AlignmentSamples          int     `json:"alignmentSamples"`
-	PreparationTimeoutSeconds int     `json:"preparationTimeoutSeconds"`
-	StartImmediately          bool    `json:"startImmediately"`
-	CacheMB                   int     `json:"cacheMB"`
-	FFmpeg                    string  `json:"ffmpeg"`
-	FFprobe                   string  `json:"ffprobe"`
-	VixBaseURL                string  `json:"vixBaseURL"`
-	TMDBToken                 string  `json:"tmdbToken"`
-	Addons                    []Addon `json:"addons"`
-	SetupCompleted            bool    `json:"setupCompleted"`
+	Listen                 string  `json:"listen"`
+	PublicURL              string  `json:"publicURL"`
+	MinConfidence          float64 `json:"minConfidence"`
+	SearchRadius           float64 `json:"searchRadius"`
+	AlignmentSampleSeconds int     `json:"alignmentSampleSeconds"`
+	AlignmentSamples       int     `json:"alignmentSamples"`
+	CacheMB                int     `json:"cacheMB"`
+	FFmpeg                 string  `json:"ffmpeg"`
+	FFprobe                string  `json:"ffprobe"`
+	VixBaseURL             string  `json:"vixBaseURL"`
+	TMDBToken              string  `json:"tmdbToken"`
+	Addons                 []Addon `json:"addons"`
+	SetupCompleted         bool    `json:"setupCompleted"`
 }
 
 func DefaultSettings() Settings {
-	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, PreparationTimeoutSeconds: 120, StartImmediately: true, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
+	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
 }
 
 func defaultPublicURL() string {
@@ -86,9 +84,6 @@ func (c Settings) Validate() error {
 	}
 	if c.AlignmentSamples < 1 || c.AlignmentSamples > 12 {
 		return errors.New("alignment samples must be between 1 and 12")
-	}
-	if c.PreparationTimeoutSeconds < 1 || c.PreparationTimeoutSeconds > 600 {
-		return errors.New("preparation timeout must be between 1 and 600 seconds")
 	}
 	if math.IsNaN(c.MinConfidence) || c.MinConfidence < 0 || c.MinConfidence > 1 {
 		return errors.New("minimum confidence must be between 0 and 1")

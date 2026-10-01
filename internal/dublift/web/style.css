@@ -505,7 +505,9 @@ input[type="range"] {
   font-size: 11px;
   white-space: pre-wrap;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
+.anchors:empty { display: none; }
 .events {
   color: var(--muted);
   font-size: 12px;

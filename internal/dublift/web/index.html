@@ -49,7 +49,6 @@
           <h3>Choose your playback defaults</h3>
           <p class="help">These can be changed any time in Settings.</p>
           <div class="wizard-fields">
-            <label>Preparation timeout (seconds)<input id="wizard-timeout" type="number" min="1" max="600" required /></label>
             <label>Alignment samples<input id="wizard-samples" type="number" min="1" max="12" required /></label>
             <label>Sample length (seconds)<input id="wizard-sample-seconds" type="number" min="5" max="40" required /></label>
           </div>
@@ -198,8 +197,6 @@
             <button id="add-addon" type="button" class="text-button">
               + Add upstream addon
             </button>
-            <label>Preparation timeout (seconds)<input id="preparation-timeout" type="number" min="1" max="600" step="1" required /></label>
-            <p class="help">The total time allowed to prepare a selected stream for playback, including source inspection. Listing never reads source media; prepare or play any stream to try it.</p>
             <hr />
             <h3>Audio alignment</h3>
             <label
@@ -233,7 +230,7 @@
             <p class="help">How far earlier or later the matching Vixsrc audio may be. With a 5-second sample and radius 10, DubLift searches about 25 seconds of Vixsrc audio for a 5-second upstream clip. A larger radius uses more Vixsrc audio; it does not lengthen the upstream clip. With immediate MKV/MP4 playback, DubLift waits until the player has downloaded the part containing that clip, about 15 seconds from the chosen playback position by default.</p>
             <label>Alignment samples<input id="alignment-samples" type="number" min="1" max="12" required /></label>
             <p class="help">How many places in the movie DubLift checks. One finishes sooner. Two or more also check later in the movie, helping catch audio that goes out of sync. DubLift needs at least two matching checks before it can send Italian audio to the player unchanged.</p>
-            <label class="switch-row"><input id="start-immediately" type="checkbox"><span><strong>Start immediately with offset 0</strong><small>Play as soon as essential source preparation finishes. For MKV/MP4, align near the requested video position after enough video data has downloaded. Apply the calculated offset to new audio segments when analysis finishes. Off: wait for the first sample starting at 00:00, then play while remaining samples run.</small></span></label>
+            <p class="help">Playing a stream starts as soon as source preparation finishes, while alignment runs in the background. Use Prepare playback on the dashboard to align in advance. If that alignment fails, playback retries near the player's selected position.</p>
             <details>
               <summary>Advanced settings</summary>
               <label
@@ -300,6 +297,7 @@
         </div>
         <div class="confidence-bar"><span></span></div>
         <p class="tracks help"></p>
+        <pre class="anchors" aria-label="Alignment results"></pre>
         <div class="actions">
           <button class="button primary prepare">Prepare playback</button
           ><button class="button secondary realign">
@@ -334,7 +332,6 @@
               Reset saved synchronization
             </button>
           </div>
-          <pre class="anchors"></pre>
         </details>
         <ul class="errors"></ul></article
     ></template>

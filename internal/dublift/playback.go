@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,23 +21,23 @@ func sendPlaylist(w http.ResponseWriter, b []byte) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Write(b)
 }
-func (s *Server) awaitStartupAlignment(ctx context.Context, v *Session) {
-	if s.Config.Get().StartImmediately {
-		return
-	}
+func (s *Server) awaitPreparedAlignment(ctx context.Context, v *Session) error {
 	v.mu.Lock()
-	done := v.firstAligned
+	done := v.alignDone
 	running := v.Aligning
 	v.mu.Unlock()
 	if !running || done == nil {
-		return
+		return nil
 	}
-	// The first attempted sample gates startup. A failed attempt releases the
-	// player with offset zero; later samples never delay the selected stream.
+	// Only the dashboard's Prepare action waits for alignment. Player requests
+	// always return as soon as essential media preparation finishes.
 	select {
 	case <-done:
+		return nil
 	case <-ctx.Done():
+		return ctx.Err()
 	case <-v.ctx.Done():
+		return v.ctx.Err()
 	}
 }
 func (s *Server) media(w http.ResponseWriter, r *http.Request) {
@@ -106,12 +107,12 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case p[1] == "master.m3u8":
 		v.mu.Lock()
-		if !v.masterLoaded {
-			v.startupZero = s.Config.Get().StartImmediately && v.Aligning
-			v.masterLoaded = true
-		}
+		first := !v.masterLoaded
+		v.masterLoaded = true
 		v.mu.Unlock()
-		s.awaitStartupAlignment(r.Context(), v)
+		if first {
+			s.ensurePlaybackAlignment(v)
+		}
 		b, err := s.master(v)
 		if err != nil {
 			failure(w, 500, err)
@@ -320,12 +321,6 @@ func (s *Server) prefetchAudio(v *Session, track Track, n int) {
 
 func (s *Server) playbackOffset(v *Session, at float64) float64 {
 	a := s.Alignments.Get(v.Key)
-	v.mu.Lock()
-	zero := v.startupZero
-	v.mu.Unlock()
-	if zero && !a.AutoComplete && a.Manual == nil {
-		return 0
-	}
 	return a.At(at, s.Config.Get().MinConfidence)
 }
 func serveBytes(w http.ResponseWriter, r *http.Request, kind string, data []byte) {
@@ -524,8 +519,11 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 		http.NotFound(w, r)
 		return
 	}
-	if res.Track && res.Video {
+	if res.Track && res.Video && r.Method == "GET" {
 		v.position(res.Position)
+		if v.video != nil && v.video.HLS != nil {
+			v.videoSegmentRequested(sort.SearchFloat64s(v.boundaries, res.Position))
+		}
 	} else if res.Track {
 		v.audioPosition(res.Position)
 	}

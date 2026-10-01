@@ -134,6 +134,29 @@ func (e *Engine) waitForFileRead(ctx context.Context, id string) error {
 type backgroundWorkKey struct{}
 type cacheOnlyFileKey struct{}
 type cacheMissKey struct{}
+type mediaInputFailureKey struct{}
+type mediaInputFailure struct {
+	mu  sync.Mutex
+	err error
+}
+
+func recordMediaInputFailure(ctx context.Context, err error) {
+	failure, _ := ctx.Value(mediaInputFailureKey{}).(*mediaInputFailure)
+	if failure == nil || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, errRangeNotCached) {
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = errors.New("the origin download timed out before the English clip was available")
+	} else if errors.Is(err, io.ErrUnexpectedEOF) {
+		err = errors.New("the origin closed the download before the full English clip arrived")
+	}
+	failure.mu.Lock()
+	if failure.err == nil {
+		failure.err = err
+	}
+	failure.mu.Unlock()
+}
+
 type mediaJob struct {
 	asset     *Asset
 	playlist  string
@@ -278,6 +301,10 @@ func (e *Engine) serveJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expired extraction", 410)
 		return
 	}
+	ctx, cancel := context.WithCancel(j.ctx)
+	stop := context.AfterFunc(r.Context(), cancel)
+	defer func() { stop(); cancel() }()
+	r = r.WithContext(ctx)
 	if parts[1] == "input.m3u8" {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		io.WriteString(w, j.playlist)
@@ -302,6 +329,10 @@ func (e *Engine) serveJob(w http.ResponseWriter, r *http.Request) {
 		// and provide correct local Range semantics ourselves.
 		b, _, err := e.Net.Fetch(r.Context(), o, 16)
 		if err != nil || len(b) != 16 {
+			if err == nil {
+				err = errors.New("HLS encryption key did not contain 16 bytes")
+			}
+			recordMediaInputFailure(j.ctx, err)
 			http.Error(w, "unable to read the 16-byte HLS key", 502)
 			return
 		}
@@ -312,16 +343,19 @@ func (e *Engine) serveJob(w http.ResponseWriter, r *http.Request) {
 	defer beginVideoDownload(j.ctx)()
 	resp, err := e.Net.request(r.Context(), o, "GET", r.Header.Get("Range"))
 	if err != nil {
+		recordMediaInputFailure(j.ctx, err)
 		http.Error(w, err.Error(), 502)
 		return
 	}
 	defer resp.Body.Close()
 	if err = validateMediaResponse(resp, r.Header.Get("Range")); err != nil {
+		recordMediaInputFailure(j.ctx, err)
 		http.Error(w, err.Error(), 502)
 		return
 	}
 	limit := int64(segmentLimit)
 	if resp.ContentLength > limit {
+		recordMediaInputFailure(j.ctx, errors.New("origin segment exceeds the 96 MiB limit"))
 		http.Error(w, "segment exceeds byte budget", 502)
 		return
 	}
@@ -335,6 +369,7 @@ func (e *Engine) copyBudget(w io.Writer, r io.Reader, j *mediaJob, limit int64) 
 		n, err := r.Read(buf[:min(int64(len(buf)), limit)])
 		if n > 0 {
 			if j.budget.Add(-int64(n)) < 0 {
+				recordMediaInputFailure(j.ctx, errors.New("media download exceeds the 256 MiB extraction limit"))
 				return
 			}
 			e.Net.Bytes.Add(int64(n))
@@ -345,6 +380,9 @@ func (e *Engine) copyBudget(w io.Writer, r io.Reader, j *mediaJob, limit int64) 
 			limit -= int64(n)
 		}
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				recordMediaInputFailure(j.ctx, err)
+			}
 			return
 		}
 	}
@@ -445,6 +483,7 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 		size := min(int64(1<<20), b-off+1)
 		if pinned, n := f.pinnedAt(off, size); len(pinned) != 0 {
 			if j.budget.Add(-n) < 0 {
+				recordMediaInputFailure(j.ctx, errors.New("media download exceeds the 256 MiB extraction limit"))
 				return
 			}
 			if _, err := w.Write(pinned); err != nil {
@@ -459,6 +498,7 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 			size = n
 		}
 		if j.budget.Add(-size) < 0 {
+			recordMediaInputFailure(j.ctx, errors.New("media download exceeds the 256 MiB extraction limit"))
 			return
 		}
 		miss, cacheOnly := j.ctx.Value(cacheMissKey{}).(*atomic.Bool)
@@ -501,6 +541,7 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 			off += int64(len(buf))
 		}
 		if err != nil {
+			recordMediaInputFailure(j.ctx, err)
 			return
 		}
 	}
@@ -697,11 +738,12 @@ func (e *Engine) pcm(ctx context.Context, t Track, start, duration float64, from
 	}
 	key := fmt.Sprintf("pcm:%s:%s:%.3f:%.3f:%t", t.Asset.ID, t.Selector, start, duration, fromZero)
 	b, err := e.Cache.Get(ctx, key, func() ([]byte, error) {
-		fileCtx := ctx
+		failure := &mediaInputFailure{}
+		fileCtx := context.WithValue(ctx, mediaInputFailureKey{}, failure)
 		var miss *atomic.Bool
 		if t.Asset.File != nil && ctx.Value(cacheOnlyFileKey{}) == true {
 			miss = &atomic.Bool{}
-			fileCtx = context.WithValue(ctx, cacheMissKey{}, miss)
+			fileCtx = context.WithValue(fileCtx, cacheMissKey{}, miss)
 		}
 		inputStart, inputDuration := start, duration+1
 		if fromZero {
@@ -729,6 +771,12 @@ func (e *Engine) pcm(ctx context.Context, t Track, start, duration float64, from
 		out, err := e.run(fileCtx, e.Config.Get().FFmpeg, args, int(math.Ceil(duration*pcmRate*2))+65536)
 		if miss != nil && miss.Load() {
 			return nil, errRangeNotCached
+		}
+		failure.mu.Lock()
+		inputErr := failure.err
+		failure.mu.Unlock()
+		if inputErr != nil {
+			return nil, fmt.Errorf("English reference download failed: %w", inputErr)
 		}
 		return out, err
 	})

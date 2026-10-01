@@ -93,68 +93,67 @@ func (s Stream) Origin() Origin {
 }
 
 type Session struct {
-	mu                 sync.Mutex
-	ID                 string `json:"id"`
-	Key                string `json:"-"`
-	lookupKey          string
-	ticket             string
-	Content            Content `json:"content"`
-	Name               string  `json:"name"`
-	ContentName        string
-	Order              int
-	Playing            bool
-	PlaybackAt         time.Time
-	RequestAt          time.Time
-	RequestMethod      string
-	SampleIndex        int
-	SampleTotal        int
-	SamplePhase        string
-	Passthrough        bool
-	FallbackReason     string
-	Created            time.Time `json:"created"`
-	LastUsed           time.Time `json:"lastUsed"`
-	Status             string    `json:"status"`
-	Errors             []string  `json:"errors"`
-	Position           float64   `json:"position"`
-	PositionAt         time.Time `json:"positionAt"`
-	positionFromVideo  bool
-	Duration           float64 `json:"duration"`
-	videoDownload      videoDownload
-	Aligning           bool `json:"aligning"`
-	Revision           int  `json:"revision"`
-	stream             Stream
-	prepare            sync.Once
-	preparationStarted bool
-	ready              chan struct{}
-	prepareErr         error
-	video              *Asset
-	variant            *playlist.MultivariantVariant
-	clockBase          float64
-	tracks             []Track
-	sourceEnglish      *Track
-	vixEnglish         *Track
-	boundaries         []float64
-	resources          map[string]resource
-	masterLoaded       bool
-	alignDone          chan struct{}
-	firstAligned       chan struct{}
-	videoBase          int
-	videoHighest       int
-	videoSequence      uint64
-	videoReady         map[int]bool
-	videoPrefetch      segmentLookahead
-	videoWindow        *fileVideoWindow
-	videoInit          []byte
-	audioPrefetch      segmentLookahead
-	audioPrefetchID    string
-	audioTS            map[string]tsContinuityState
-	videoChanged       chan struct{}
-	startupZero        bool
-	listedVix          []Track
-	listedEnglish      *Track
-	listedReady        chan struct{}
-	ctx                context.Context
-	cancel             context.CancelFunc
+	mu                       sync.Mutex
+	ID                       string `json:"id"`
+	Key                      string `json:"-"`
+	lookupKey                string
+	ticket                   string
+	Content                  Content `json:"content"`
+	Name                     string  `json:"name"`
+	ContentName              string
+	Order                    int
+	Playing                  bool
+	PlaybackAt               time.Time
+	RequestAt                time.Time
+	RequestMethod            string
+	SampleIndex              int
+	SampleTotal              int
+	SamplePhase              string
+	Passthrough              bool
+	FallbackReason           string
+	Created                  time.Time `json:"created"`
+	LastUsed                 time.Time `json:"lastUsed"`
+	Status                   string    `json:"status"`
+	Errors                   []string  `json:"errors"`
+	Position                 float64   `json:"position"`
+	PositionAt               time.Time `json:"positionAt"`
+	positionFromVideo        bool
+	Duration                 float64 `json:"duration"`
+	videoDownload            videoDownload
+	Aligning                 bool `json:"aligning"`
+	Revision                 int  `json:"revision"`
+	stream                   Stream
+	prepare                  sync.Once
+	preparationStarted       bool
+	ready                    chan struct{}
+	prepareErr               error
+	video                    *Asset
+	variant                  *playlist.MultivariantVariant
+	clockBase                float64
+	tracks                   []Track
+	sourceEnglish            *Track
+	vixEnglish               *Track
+	boundaries               []float64
+	resources                map[string]resource
+	masterLoaded             bool
+	playbackAlignmentStarted bool
+	alignDone                chan struct{}
+	videoBase                int
+	videoHighest             int
+	videoSequence            uint64
+	videoReady               map[int]bool
+	videoPrefetch            segmentLookahead
+	videoWindow              *fileVideoWindow
+	videoInit                []byte
+	audioPrefetch            segmentLookahead
+	audioPrefetchID          string
+	audioTS                  map[string]tsContinuityState
+	videoChanged             chan struct{}
+	listedVix                []Track
+	listedEnglish            *Track
+	listedReady              chan struct{}
+	ctx                      context.Context
+	cancel                   context.CancelFunc
 }
 type resource struct {
 	Origin   Origin
@@ -230,7 +229,7 @@ func (s *Server) prepareSession(ctx context.Context, v *Session) error {
 		v.mu.Unlock()
 		go func() {
 			defer close(v.ready)
-			work, cancel := context.WithTimeout(v.ctx, time.Duration(s.Config.Get().PreparationTimeoutSeconds)*time.Second)
+			work, cancel := context.WithTimeout(v.ctx, preparationTimeout)
 			defer cancel()
 			if v.listedReady != nil {
 				select {
@@ -432,7 +431,7 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 		v.state("Ready · offset 0 fallback")
 	} else {
 		cached := s.Alignments.Get(v.Key)
-		if !cached.Updated.IsZero() && ((cached.AutoComplete && cached.AutoExpected == cfg.AlignmentSamples && cached.AutoWindow == cfg.AlignmentSampleSeconds && cached.AutoRadius == cfg.SearchRadius) || cached.Manual != nil) {
+		if cached.reusable(cfg) {
 			v.state("Ready · cached alignment")
 		} else {
 			v.state("Ready · analyzing English audio")
@@ -527,33 +526,60 @@ func vixTrackName(lang string) string {
 	return "English · Vixsrc"
 }
 func (s *Server) startAlignment(v *Session, from *float64) bool {
+	return s.startAlignmentMode(v, from, false)
+}
+
+func (s *Server) ensurePlaybackAlignment(v *Session) {
+	if !s.Alignments.Get(v.Key).reusable(s.Config.Get()) {
+		s.startAlignmentMode(v, nil, true)
+	}
+}
+
+func (s *Server) startAlignmentMode(v *Session, from *float64, playbackOnly bool) bool {
 	v.mu.Lock()
-	if v.Aligning || v.vixEnglish == nil || v.sourceEnglish == nil {
+	if v.ctx.Err() != nil || v.Aligning || v.vixEnglish == nil || v.sourceEnglish == nil ||
+		(playbackOnly && (!v.Playing || v.playbackAlignmentStarted)) {
 		v.mu.Unlock()
 		return false
 	}
+	playbackRun := from == nil && v.Playing
+	if playbackRun {
+		v.playbackAlignmentStarted = true
+	}
 	v.Aligning = true
+	if from == nil && !playbackRun {
+		v.Status = "Preparing synchronization"
+	} else {
+		v.Status = "Aligning English audio"
+	}
 	v.alignDone = make(chan struct{})
-	v.firstAligned = make(chan struct{})
 	done := v.alignDone
-	first := v.firstAligned
 	v.mu.Unlock()
 	go func() {
-		var firstOnce sync.Once
-		finishFirst := func() { firstOnce.Do(func() { close(first) }) }
-		defer finishFirst()
-		defer func() { v.mu.Lock(); v.Aligning = false; v.Revision++; close(done); v.mu.Unlock() }()
+		defer func() {
+			v.mu.Lock()
+			v.Aligning = false
+			v.Revision++
+			close(done)
+			retry := from == nil && !playbackRun && v.Playing && !v.playbackAlignmentStarted
+			v.mu.Unlock()
+			// Playback can begin while dashboard preparation is still aligning.
+			// If that attempt failed, retry against the player's selected area.
+			if retry {
+				s.ensurePlaybackAlignment(v)
+			}
+		}()
 		cfg := s.Config.Get()
 		window := float64(cfg.AlignmentSampleSeconds)
 		current := s.Alignments.Get(v.Key)
 		duration := min(v.video.Duration(), v.vixEnglish.Asset.Duration())
 		samples := alignmentPositions(duration, cfg.AlignmentSamples, window, cfg.SearchRadius)
-		immediateFile := from == nil && cfg.StartImmediately && v.video.File != nil
+		immediateFile := playbackRun && v.video.File != nil
 		if from != nil {
 			samples = []float64{max(0, *from-current.At(*from, cfg.MinConfidence)-10)}
-		} else if immediateFile {
+		} else if playbackRun {
 			v.mu.Lock()
-			v.SamplePhase = "Waiting for downloaded video playback data"
+			v.SamplePhase = "Waiting for the player's selected video position"
 			v.mu.Unlock()
 		}
 		if from == nil {
@@ -580,6 +606,7 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 		}
 		previousAt := 0.0
 		previousSequence := uint64(0)
+		accepted, failed := 0, 0
 		for i, at := range samples {
 			if v.ctx.Err() != nil {
 				return
@@ -589,25 +616,33 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 			lastEnd := -1
 			allowSourceRead := false
 			sourceExtractor := source
-			if from == nil && i == 0 && !cfg.StartImmediately {
-				// The gated first check primes the beginning of the source file
-				// for playback, then matches a short clip after the radius.
+			if from == nil && i == 0 && !playbackRun {
+				// Dashboard preparation can fetch the first clip before any
+				// player requests. Prime the source prefix from time zero.
 				sourceExtractor = func(ctx context.Context, t, d float64) ([]int16, error) {
 					return s.Engine.PCMFromZero(ctx, *v.sourceEnglish, t, d)
 				}
 			}
 			for {
-				if immediateFile {
+				if playbackRun {
 					v.mu.Lock()
 					v.SampleIndex = i + 1
 					v.SampleTotal = len(samples)
-					v.SamplePhase = fmt.Sprintf("Waiting for about %.0fs of downloaded video", window+cfg.SearchRadius)
+					if immediateFile {
+						v.SamplePhase = fmt.Sprintf("Waiting for about %.0fs of downloaded video near the player's position", window+cfg.SearchRadius)
+					} else {
+						v.SamplePhase = "Waiting for the player's selected video position"
+					}
 					v.mu.Unlock()
 					minAt := 0.0
 					if i > 0 {
 						minAt = max(samples[i], previousAt+window)
 					}
-					at, lastEnd, previousSequence, err = v.playbackSample(v.ctx, minAt, cfg.SearchRadius, duration, window, current.At(minAt, cfg.MinConfidence), lastEnd, previousSequence)
+					if immediateFile {
+						at, lastEnd, previousSequence, err = v.playbackSample(v.ctx, minAt, cfg.SearchRadius, duration, window, current.At(minAt, cfg.MinConfidence), lastEnd, previousSequence)
+					} else {
+						at, previousSequence, err = v.requestedPlaybackSample(v.ctx, minAt, cfg.SearchRadius, duration, window, previousSequence)
+					}
 					if err != nil {
 						break
 					}
@@ -617,13 +652,16 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 				v.SampleTotal = len(samples)
 				v.SamplePhase = fmt.Sprintf("Matching English audio near %.0fs", at)
 				v.mu.Unlock()
-				ctx, cancel := context.WithTimeout(context.WithValue(v.ctx, backgroundWorkKey{}, true), 30*time.Second)
+				ctx := context.WithValue(v.ctx, backgroundWorkKey{}, true)
 				radius := cfg.SearchRadius
 				if immediateFile && !allowSourceRead {
 					ctx = context.WithValue(ctx, cacheOnlyFileKey{}, true)
 				}
-				anchor, err = FindAnchor(ctx, sourceExtractor, vix, at, current.At(at, cfg.MinConfidence), radius, duration, window)
-				cancel()
+				anchor, err = findAnchor(ctx, sourceExtractor, vix, at, current.At(at, cfg.MinConfidence), radius, duration, window, alignmentOptions{
+					DownloadTimeout:    alignmentDownloadTimeout,
+					CalculationTimeout: alignmentCalculationTimeout,
+					Phase:              func(phase string) { v.mu.Lock(); v.SamplePhase = phase; v.mu.Unlock() },
+				})
 				if immediateFile && !allowSourceRead && errors.Is(err, errRangeNotCached) {
 					// Video remuxes need not read every interleaved audio byte.
 					// Retry this completed playback area with a lower-priority
@@ -632,7 +670,7 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 					lastEnd = -1
 					continue
 				}
-				if immediateFile {
+				if playbackRun {
 					v.mu.Lock()
 					seeked := v.videoSequence != previousSequence
 					v.mu.Unlock()
@@ -648,14 +686,15 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 				return
 			}
 			if err != nil {
-				if errors.Is(err, context.DeadlineExceeded) {
-					err = errors.New("30-second analysis limit exceeded; source may be too slow")
-				}
+				failed++
 				v.note(fmt.Errorf("alignment sample at %.0fs: %w", at, err))
-				if i == 0 {
-					finishFirst()
-				}
 				continue
+			}
+			if anchor.Confidence < cfg.MinConfidence {
+				failed++
+				v.note(fmt.Errorf("alignment sample at %.0fs: English audio match confidence %.0f%% is below the required %.0f%%; this match was not applied. Try a longer sample or another position", at, anchor.Confidence*100, cfg.MinConfidence*100))
+			} else {
+				accepted++
 			}
 			err = s.Alignments.UpdateContext(v.ctx, v.Key, func(a *Alignment) {
 				a.Anchors = append(a.Anchors, anchor)
@@ -679,9 +718,6 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 			}
 			current = s.Alignments.Get(v.Key)
 			previousAt = at
-			if i == 0 {
-				finishFirst()
-			}
 			v.mu.Lock()
 			v.Revision++
 			v.mu.Unlock()
@@ -696,23 +732,69 @@ func (s *Server) startAlignment(v *Session, from *float64) bool {
 		}
 		current = s.Alignments.Get(v.Key)
 		v.mu.Lock()
-		v.SamplePhase = "Analysis complete · new audio segments use the calculated offset"
-		v.mu.Unlock()
-		if current.Confidence < cfg.MinConfidence {
-			v.state("Ready · offset 0 fallback")
-		} else if current.DifferentEdit {
-			v.state("Ready · editions differ; earliest reliable offset")
+		if from != nil && accepted == 0 {
+			v.SamplePhase = "Realignment failed · keeping the existing offset. Try another position or a longer sample."
+			v.Status = "Ready · previous synchronization retained"
+		} else if from != nil {
+			v.SamplePhase = "Realignment complete · new audio segments use the saved offset at this position"
+			v.Status = "Ready · realigned"
+		} else if current.Manual != nil {
+			v.SamplePhase = "Analysis complete · using the manual offset"
+			if accepted == 0 {
+				v.SamplePhase = "Alignment failed · keeping the manual offset"
+			}
+			v.Status = "Ready · manual offset"
+		} else if current.Confidence < cfg.MinConfidence || current.Confidence == 0 {
+			v.SamplePhase = "Alignment failed · using offset 0. Try realigning from another position."
+			if from == nil && !playbackRun && !v.Playing {
+				v.SamplePhase = "Alignment failed · using offset 0. Alignment will retry at the selected position when playback starts."
+			}
+			v.Status = "Ready · offset 0 fallback"
 		} else {
-			v.state("Ready · aligned")
+			v.SamplePhase = "Alignment complete · new audio segments use the calculated offset"
+			if failed > 0 {
+				v.SamplePhase = fmt.Sprintf("Alignment finished · %d of %d samples matched; using the reliable offset", accepted, len(samples))
+			}
+			v.Status = "Ready · aligned"
+			if current.DifferentEdit {
+				v.Status = "Ready · editions differ; earliest reliable offset"
+			}
 		}
+		v.mu.Unlock()
 	}()
 	return true
 }
 
 func alignmentPositions(duration float64, count int, window, radius float64) []float64 {
 	// A source clip after the radius lets Vixsrc be searched in both
-	// directions; gated startup reads the source prefix from time zero.
+	// directions; dashboard preparation reads the source prefix from time zero.
 	return alignmentPositionsFrom(duration, count, radius, window)
+}
+
+// HLS audio can be extracted directly near the requested video area. Unlike
+// file extraction, it does not need a completed remux window in the byte cache.
+func (v *Session) requestedPlaybackSample(ctx context.Context, minAt, radius, duration, window float64, previousSequence uint64) (float64, uint64, error) {
+	for {
+		v.mu.Lock()
+		changed := v.videoChanged
+		base, sequence := v.videoHighest, v.videoSequence
+		if sequence != previousSequence {
+			minAt = 0
+		}
+		if v.videoBase >= 0 && base >= 0 && base < len(v.boundaries)-1 {
+			at := min(v.boundaries[base]+radius, max(0, duration-window))
+			if at >= minAt {
+				v.mu.Unlock()
+				return at, sequence, nil
+			}
+		}
+		v.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return 0, 0, ctx.Err()
+		}
+	}
 }
 func alignmentPositionsFrom(duration float64, count int, first, window float64) []float64 {
 	first = max(0, min(first, duration-window))
