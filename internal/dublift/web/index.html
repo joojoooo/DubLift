@@ -89,7 +89,11 @@
             <span class="pill">VIDEO · STREAM COPY</span>
           </div>
           <p id="lookup-status" class="help" role="status"></p>
-          <p class="help">New lookups replace these results while keeping current playback. Selecting another stream replaces the current playback. Inactive sessions and their caches expire after one hour.</p>
+          <p class="help">Choose a stream below to prepare it, or open its DubLift URL in your player.</p>
+          <details class="results-help">
+            <summary>How stream results work</summary>
+            <p class="help">New lookups replace these results while keeping current playback. Selecting another stream replaces the current playback. Inactive sessions and their caches expire after one hour.</p>
+          </details>
           <div id="stream-filters" class="stream-filters" role="group" aria-label="Filter streams">
             <span class="small">FILTER STREAMS</span>
             <button id="filter-italian" type="button" aria-pressed="false">Italian</button>
@@ -182,7 +186,7 @@
               </div>
             </div>
             <p class="help">
-              Saved on this server. Changes to sources apply to new streams.
+              Addon changes apply to new stream lookups.
             </p>
             <div id="addons"></div>
             <button id="add-addon" type="button" class="text-button">
@@ -201,7 +205,9 @@
                   step="0.01"
                 /><output id="confidence-value">68%</output>
               </div></label
-            ><label
+            >
+            <p class="help">Only matches at or above this confidence are used. Higher values reject more uncertain matches.</p>
+            <label
               >Sample length (seconds)<input
                 id="alignment-sample-seconds"
                 type="number"
@@ -209,7 +215,7 @@
                 max="40"
                 required
             /></label>
-            <p class="help">Length of the short English clip taken from the upstream video. DubLift looks for that clip in a longer Vixsrc audio section. A longer clip can improve matching but needs more upstream video data. Default: 5 seconds.</p>
+            <p class="help">Length of the English clip used to match audio. Longer clips may improve accuracy but take more time and data. Default: 5 seconds.</p>
             <label
               >Search radius (seconds)<input
                 id="search-radius"
@@ -218,10 +224,9 @@
                 max="180"
                 required
             /></label>
-            <p class="help">How far earlier or later the matching Vixsrc audio may be. With a 5-second sample and radius 10, DubLift searches about 25 seconds of Vixsrc audio for a 5-second upstream clip. A larger radius uses more Vixsrc audio; it does not lengthen the upstream clip. With immediate MKV/MP4 playback, DubLift waits until the player has downloaded the part containing that clip, about 15 seconds from the chosen playback position by default.</p>
+            <p class="help">How far before and after the expected timing to search Vixsrc audio. Increase this if audio is further out of sync. Default: 10 seconds.</p>
             <label>Alignment samples<input id="alignment-samples" type="number" min="1" max="12" required /></label>
-            <p class="help">How many places in the movie DubLift checks. One finishes sooner. Two or more also check later in the movie, helping catch audio that goes out of sync. DubLift needs at least two matching checks before it can send Italian audio to the player unchanged.</p>
-            <p class="help">Playing a stream starts as soon as source preparation finishes, while alignment runs in the background. Use Prepare playback on the dashboard to align in advance. If that alignment fails, playback retries near the player's selected position.</p>
+            <p class="help">Number of audio checks across the video. One is fastest; more samples check later positions too. Reliable matches update timing as they finish.</p>
             <details>
               <summary>Advanced settings</summary>
               <label
@@ -248,13 +253,12 @@
                   required /></label
               ><label
                 >TMDB API read token
-                <small>Optional IMDb mapping fallback</small
+                <small>Optional title names and IMDb lookup</small
                 ><input id="tmdb-token" type="password" autocomplete="off"
               /></label>
             </details>
             <button class="button primary save" type="submit">
-              Save settings</button
-            ><span id="save-state" role="status"></span>
+              Save settings</button>
           </form>
       </section>
     </main>
@@ -264,67 +268,78 @@
     <div id="toast" role="status" aria-live="polite"></div>
     <template id="session-template"
       ><article class="panel session">
-        <div class="session-top"><span class="eyebrow content"></span><span class="playback-badge"></span></div>
+        <div class="session-top"><span class="eyebrow content-kind"></span><span class="content"></span></div>
         <h3 class="content-name"></h3>
-        <strong class="name"></strong>
-        <p class="stream-title"></p>
-        <p class="description"></p>
-        <p class="file-details help"></p>
-        <p class="status" role="status"></p>
-        <p class="sample-progress help" role="status"></p>
+        <div class="stream-info" aria-label="Upstream stream information">
+          <strong class="name"></strong>
+          <p class="stream-title"></p>
+          <p class="description"></p>
+        </div>
+        <div class="session-state" role="status">
+          <p class="status"></p>
+          <p class="sample-progress help"></p>
+        </div>
+        <ul class="errors" aria-label="Stream issues"></ul>
         <div class="session-metrics">
-          <div>
+          <div class="position-metric" title="Latest video area requested by the player, not its playback clock.">
             <span class="small">LAST REQUESTED AREA</span
             ><strong class="position">—</strong>
           </div>
           <div>
-            <span class="small">CONFIDENCE</span
+            <span class="small" title="How closely the English audio samples matched.">CONFIDENCE</span
             ><strong class="confidence">—</strong>
           </div>
           <div>
-            <span class="small">OFFSET</span
+            <span class="small">AUDIO DELAY</span
             ><strong class="offset">0.000 s</strong>
           </div>
         </div>
-        <div class="confidence-bar"><span></span></div>
-        <p class="tracks help"></p>
-        <pre class="anchors" aria-label="Alignment results"></pre>
         <div class="actions">
-          <button class="button primary prepare">Prepare playback</button
-          ><button class="button secondary realign">
-            Realign from current position</button
-          ><button class="text-button copy">Copy DubLift URL</button
-          ><button class="text-button copy-original">Copy original upstream URL</button>
+          <button type="button" class="button primary prepare">Prepare playback</button>
+          <button type="button" class="button secondary copy">Copy DubLift URL</button>
+          <button type="button" class="button secondary copy-original">Copy original upstream URL</button>
         </div>
-        <details>
-          <summary>Fine-tune synchronization</summary>
+        <details class="sync-controls">
+          <summary>Adjust audio timing</summary>
           <p class="help">
-            Positive offset plays Vixsrc audio later. Changes apply to upcoming
-            segments; seek or reopen playback to clear the player’s buffered
-            audio.
+            If the Italian audio is ahead of the picture, use a positive delay
+            (for example, +0.5 seconds). If it is behind, use a negative delay.
+            After changing timing, seek or reopen playback to hear the change.
           </p>
           <form class="offset-form">
             <label
-              >Manual offset (seconds)<input
+              >Audio delay in seconds<input
                 class="manual"
                 type="number"
                 step="0.001"
                 min="-3600"
                 max="3600"
                 placeholder="Automatic" /></label
-            ><button class="button secondary">Apply</button
-            ><button type="button" class="text-button automatic">
-              Use automatic
+            ><button type="submit" class="button secondary apply-offset">Apply delay</button
+            ><button type="button" class="button secondary automatic">
+              Remove manual delay
             </button>
           </form>
-          <div class="actions">
-            <button class="text-button analyze">Analyze again</button
-            ><button class="text-button reset">
-              Reset saved synchronization
-            </button>
+          <p class="help">A manual delay replaces the calculated timing. Remove it to use the saved automatic timing again.</p>
+          <div class="sync-action">
+            <button type="button" class="button secondary realign">Match audio at playback position</button>
+            <p class="help">Checks the latest video area requested by your player and saves timing for that point. A successful match removes your manual delay. Start playback first.</p>
+          </div>
+          <div class="sync-action">
+            <button type="button" class="button secondary analyze">Recheck automatic timing</button>
+            <p class="help">Replaces the automatic audio matches with a new check. Keeps your manual delay and timing saved at individual playback positions.</p>
+          </div>
+          <div class="sync-action">
+            <button type="button" class="button secondary reset">Clear saved timing and recheck</button>
+            <p class="help">Removes your manual delay and all saved matches for this stream, then starts a fresh check.</p>
           </div>
         </details>
-        <ul class="errors"></ul></article
+        <details class="technical-details">
+          <summary>Technical details</summary>
+          <div class="file-info"><h4>Source file</h4><p class="file-details help"></p></div>
+          <div class="track-info"><h4>Audio and subtitle tracks</h4><p class="tracks help"></p></div>
+          <div class="alignment-info"><h4>Audio matching results</h4><pre class="anchors" aria-label="Alignment results"></pre></div>
+        </details></article
     ></template>
   </body>
 </html>

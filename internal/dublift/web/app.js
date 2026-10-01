@@ -270,7 +270,6 @@ $("settings-form").onsubmit = async (e) => {
   cfg.addons = readAddons($("addons"));
   try {
     await saveConfig(cfg);
-    $("save-state").textContent = "Saved on this server.";
     toast("Settings saved");
   } catch (err) {
     toast(err.message);
@@ -377,14 +376,20 @@ function createCard(session) {
   const action = (selector, route, body = {}, message = "Request accepted") =>
     (card.querySelector(selector).onclick = async () => {
       const btn = card.querySelector(selector);
+      btn.dataset.pending = "true";
       btn.disabled = true;
+      btn.setAttribute("aria-busy", "true");
       try {
         const result = await api(`/api/sessions/${id}/${route}`, body);
         toast(typeof message === "function" ? message(result) : message);
       } catch (err) {
         toast(err.message);
       } finally {
-        btn.disabled = false;
+        delete btn.dataset.pending;
+        btn.removeAttribute("aria-busy");
+        const current = latestStatus?.sessions.find((v) => v.id === id);
+        if (current) updateCard(current);
+        else btn.disabled = false;
       }
     });
   action(".prepare", "prepare", {}, (result) => result.aligned
@@ -396,90 +401,167 @@ function createCard(session) {
     ".realign",
     "realign",
     {},
-    "Matching English audio around the latest requested segment",
+    "Checking audio timing at the latest requested video position",
   );
-  action(".analyze", "analyze", {}, "Alignment analysis started");
+  action(".analyze", "analyze", {}, "Automatic audio timing check started");
   action(
     ".automatic",
     "offset",
     { offset: null },
-    "Automatic synchronization restored",
+    "Manual delay removed. Using saved automatic timing; seek or reopen playback to hear the change.",
   );
-  action(".reset", "reset", {}, "Saved offsets and boundaries reset");
+  action(".reset", "reset", {}, "Saved timing cleared. A fresh audio check was requested.");
   card.querySelector(".offset-form").onsubmit = async (e) => {
     e.preventDefault();
     const input = card.querySelector(".manual");
     if (input.value === "") return;
+    const button = card.querySelector(".apply-offset");
+    button.dataset.pending = "true";
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
     try {
       await api(`/api/sessions/${id}/offset`, { offset: Number(input.value) });
-      toast("Offset updated. Seek to refresh buffered audio.");
+      toast("Audio delay updated. Seek or reopen playback to hear the change.");
     } catch (err) {
       toast(err.message);
+    } finally {
+      delete button.dataset.pending;
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
     }
   };
   $(inPlaybackSection(session) ? "playing-sessions" : "sessions").append(card);
   cards.set(id, card);
   return card;
 }
-function playbackBadge(v) {
-  if (v.passthrough) return "Original";
-  if (v.playing) return "▶ Playback detected";
-  if (v.preparationStarted) {
-    if (!v.preparationDone) return "Preparing playback";
-    if (v.aligning) return "Preparing synchronization";
-    if (v.ready && (v.alignment?.confidence || 0) < (settings?.minConfidence ?? 0.68) && v.alignment?.manual == null) return "Prepared · synchronization unavailable";
-    return v.ready ? "Ready for playback" : "Preparation failed";
+const normalizedLine = (text) => String(text || "").trim().replace(/\s+/g, " ").toLowerCase();
+function streamText(v, heading) {
+  // Only remove whole, identical lines. Addon text has no fixed schema;
+  // retain unfamiliar formatting and all additional stream information.
+  const seen = new Set([normalizedLine(heading)]);
+  // Metadata adds this episode suffix to series headings. Also recognize
+  // the same series name without that suffix as a duplicate whole line.
+  if (v.contentType === "series") seen.add(normalizedLine(String(heading).replace(/ · S\d+E\d+$/, "")));
+  return [v.name || "Upstream stream", v.title, v.description].map((text) =>
+    String(text || "").split(/\r?\n/).filter((line) => {
+      const key = normalizedLine(line);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).join("\n"),
+  );
+}
+function updateContentLink(card, v) {
+  const el = card.querySelector(".content");
+  const key = `${v.contentType}:${v.content}`;
+  if (el.dataset.value === key) return;
+  el.dataset.value = key;
+  el.replaceChildren();
+  const id = String(v.content || "").replace(/^tmdb:/, "").split(":")[0];
+  const imdb = /^tt\d+$/.test(id);
+  const tmdb = /^\d+$/.test(id) && ["movie", "series"].includes(v.contentType);
+  if (!imdb && !tmdb) {
+    el.textContent = v.content || "";
+    return;
   }
-  if (v.requestMethod === "HEAD") return "Player checked stream";
-  return "Ready to prepare";
+  const link = document.createElement("a");
+  link.className = "inline-link";
+  link.href = imdb ? `https://www.imdb.com/title/${id}/` :
+    `https://www.themoviedb.org/${v.contentType === "series" ? "tv" : "movie"}/${id}`;
+  link.textContent = `${imdb ? "IMDb" : "TMDB"} ${id} ↗`;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.setAttribute("aria-label", `View ${id} on ${imdb ? "IMDb" : "TMDB"} (opens in a new tab)`);
+  el.append(link);
+}
+function sessionMessages(v) {
+  let status = v.status || "Waiting for playback";
+  let progress = "";
+  if (v.passthrough) {
+    status = "Original stream · Italian audio was not added";
+    progress = `${v.fallbackReason || "DubLift unavailable"}. Playback through the original link cannot be tracked here.`;
+  } else if (v.aligning) {
+    progress = `Sample ${v.sampleIndex || 1} of ${v.sampleTotal || settings?.alignmentSamples || 1} · ${v.samplePhase || "Checking audio timing"}`;
+  } else if (v.ready) {
+    const a = v.alignment || {};
+    const minimum = settings?.minConfidence ?? 0.68;
+    const matched = a.confidence > 0 && a.confidence >= minimum;
+    const savedAtPosition = (a.boundaries || []).some((b) => b.sourceTime <= v.position && b.confidence >= minimum);
+    if (a.manual != null) status = "Ready · manual audio delay";
+    else if (matched || savedAtPosition) {
+      status = "Ready · audio timing matched";
+      if (a.differentEdit) progress = "Different editions detected. Using the earliest reliable audio match.";
+    } else {
+      status = "Ready · automatic audio timing unavailable";
+      progress = v.samplePhase || "";
+    }
+  } else if (v.samplePhase && !/^Alignment complete ·|^Analysis complete ·/.test(v.samplePhase)) {
+    status = v.samplePhase;
+  }
+  if (v.playing && !v.passthrough) status = `Playback detected · ${status}`;
+  const seen = new Set([normalizedLine(status), normalizedLine(progress)].filter(Boolean));
+  const errors = (v.errors || []).filter((message) => {
+    const key = normalizedLine(message);
+    if (!key || seen.has(key) || normalizedLine(status).includes(key) || normalizedLine(progress).includes(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return { status, progress: normalizedLine(status).includes(normalizedLine(progress)) ? "" : progress, errors };
 }
 function updateCard(v) {
   const card = cards.get(v.id) || createCard(v);
   card.dataset.url = v.url;
   card.dataset.originalUrl = v.originalUrl || "";
   const set = (sel, value) => setText(card.querySelector(sel), value);
-  set(".content", v.content);
-  set(".content-name", v.contentName || v.title || v.content);
-  set(".stream-title", v.title || "");
-  set(".description", v.description || "");
+  updateContentLink(card, v);
+  const format = ["hls", "mkv", "mp4"].includes(v.sourceFormat) ? v.sourceFormat.toUpperCase() : "";
+  set(".content-kind", [v.contentType === "series" ? "Series" : v.contentType === "movie" ? "Movie" : "Stream", format].filter(Boolean).join(" · "));
+  const heading = v.contentName || v.title?.split(/\r?\n/)[0] || v.content;
+  set(".content-name", heading);
+  const [name, title, description] = streamText(v, heading);
+  set(".name", name);
+  set(".stream-title", title);
+  set(".description", description);
   set(".file-details", v.filename || "");
-  set(".playback-badge", playbackBadge(v));
   card.classList.toggle("playing", !!v.playing);
-  set(".sample-progress", v.aligning ? `Sample ${v.sampleIndex || 1} of ${v.sampleTotal || settings?.alignmentSamples || 3} · ${v.samplePhase || "Starting analysis"}` : v.samplePhase || "");
-  set(".name", v.name || "Upstream stream");
-  set(".status", v.status + (v.aligning ? " · analysis running" : ""));
-  set(".position", clock(v.position) + " / " + clock(v.duration));
+  const messages = sessionMessages(v);
+  set(".status", messages.status);
+  set(".sample-progress", messages.progress);
+  const positionKnown = v.positionAt && !v.positionAt.startsWith("0001-");
+  set(".position", `${positionKnown ? clock(v.position) : "—"} / ${clock(v.duration)}`);
   const a = v.alignment || {};
-  set(
-    ".confidence",
-    a.confidence ? Math.round(a.confidence * 100) + "%" : "Not matched",
-  );
   const minimum = settings?.minConfidence ?? 0.68;
+  let confidence = a.confidence || 0;
   let offset = a.manual ?? (a.confidence >= minimum ? a.offset : 0) ?? 0;
   if (a.manual == null) {
     for (const b of a.boundaries || []) {
-      if (b.sourceTime <= v.position && b.confidence >= minimum) offset = b.offset;
+      if (b.sourceTime <= v.position && b.confidence >= minimum) {
+        offset = b.offset;
+        confidence = b.confidence;
+      }
     }
   }
+  set(".confidence", confidence ? Math.round(confidence * 100) + "%" : "Not matched");
   set(
     ".offset",
     `${offset >= 0 ? "+" : ""}${Number(offset).toFixed(3)} s${a.manual != null ? " · manual" : ""}`,
   );
-  card.querySelector(".confidence-bar span").style.width =
-    (a.confidence || 0) * 100 + "%";
   set(".tracks", (v.tracks || []).map((t) => t.name).join(" · "));
   card.querySelector(".prepare").textContent = "Prepare playback";
   card.querySelector(".prepare").hidden = !!v.preparationStarted || !!v.ready || !!v.passthrough;
-  card.querySelector(".prepare").disabled = v.listed === false;
+  const disable = (selector, disabled) => {
+    const button = card.querySelector(selector);
+    button.disabled = !!disabled || button.dataset.pending === "true";
+  };
+  disable(".prepare", v.listed === false);
   card.querySelector(".session-metrics").hidden = !v.ready;
-  card.querySelector(".confidence-bar").hidden = !v.ready;
-  card.querySelector("details").hidden = !v.ready;
-  card.querySelector(".realign").hidden = !v.ready;
+  card.querySelector(".sync-controls").hidden = !v.ready;
   card.querySelector(".copy").textContent = v.passthrough ? "Copy original upstream URL" : "Copy DubLift URL";
   card.querySelector(".copy-original").hidden = v.passthrough || !v.originalUrl;
-  if (v.passthrough) set(".sample-progress", `${v.fallbackReason || "DubLift unavailable"}. Original link returned to Stremio; DubLift cannot track its playback.`);
-  card.querySelector(".realign").disabled = v.aligning || !v.ready;
-  card.querySelector(".analyze").disabled = v.aligning || !v.ready;
+  disable(".realign", v.aligning || !v.ready || !positionKnown);
+  disable(".analyze", v.aligning || !v.ready);
+  disable(".reset", v.aligning || !v.ready);
+  disable(".automatic", a.manual == null || !v.ready);
   const input = card.querySelector(".manual");
   if (document.activeElement !== input) input.value = a.manual ?? "";
   set(
@@ -500,12 +582,16 @@ function updateCard(v) {
       .filter(Boolean)
       .join("\n"),
   );
+  card.querySelector(".file-info").hidden = !v.filename;
+  card.querySelector(".track-info").hidden = !v.tracks?.length;
+  card.querySelector(".alignment-info").hidden = !card.querySelector(".anchors").textContent;
+  card.querySelector(".technical-details").hidden = !v.filename && !v.tracks?.length && !card.querySelector(".anchors").textContent;
   const errors = card.querySelector(".errors");
-  const errorKey = JSON.stringify(v.errors || []);
+  const errorKey = JSON.stringify(messages.errors);
   if (errors.dataset.value !== errorKey) {
     errors.dataset.value = errorKey;
     errors.replaceChildren();
-    for (const text of v.errors || []) {
+    for (const text of messages.errors) {
       const li = document.createElement("li");
       li.textContent = text;
       errors.append(li);

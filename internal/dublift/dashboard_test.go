@@ -147,6 +147,9 @@ func TestStatusReportsPreparationBeforeMediaIsReady(t *testing.T) {
 	if snapshot()["originalUrl"] != originalURL {
 		t.Fatal("status lost the upstream stream URL")
 	}
+	if snapshot()["contentType"] != "movie" {
+		t.Fatal("status lost the content type needed for dashboard metadata links")
+	}
 	if snapshot()["url"] == originalURL {
 		t.Fatal("DubLift and upstream URLs were not distinguished")
 	}
