@@ -11,7 +11,7 @@ go build -trimpath -o bin/dublift ./cmd/dublift
 ./bin/dublift
 ```
 
-Open **http://localhost:7000**. The guided setup helps install DubLift in Stremio and connect upstream addons; it reads addon names from their manifests. The Public base URL defaults to the machine's LAN IPv4 address when one is available, so the manifest and playback links work on other devices. If no LAN address is found, set the URL in Settings. The wizard can be rerun from Settings. VLC can open a session's HLS URL from the Streams view.
+Open **http://localhost:7000**. The two-step guided setup helps install DubLift in Stremio and connect upstream addons; it reads addon names from their manifests. Configure audio alignment and other playback defaults in Settings. The Public base URL defaults to the machine's LAN IPv4 address when one is available, so the manifest and playback links work on other devices. If no LAN address is found, set the URL in Settings. The wizard can be rerun from Settings. VLC can open a session's HLS URL from the Streams view.
 
 Streams and Settings have separate dashboard views. Live playback and cache diagnostics arrive through a server-sent event stream, so the page does not repeatedly reload status while you select or copy text. The Streams view shows the Italian result count and can filter results to Italian links, HLS, MKV, or MP4; filter choices are saved in that browser.
 

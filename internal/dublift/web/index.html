@@ -29,7 +29,7 @@
           <div><span class="eyebrow">GET STARTED</span><h2>Set up DubLift</h2></div>
           <span id="wizard-progress" class="small"></span>
         </div>
-        <div class="wizard-steps" aria-hidden="true"><span>Install</span><span>Sources</span><span>Playback</span></div>
+        <div class="wizard-steps" aria-hidden="true"><span>Install</span><span>Sources</span></div>
         <div class="wizard-step" data-step="0">
           <h3>Install DubLift on Nuvio/Stremio</h3>
           <div class="copy-row">
@@ -44,15 +44,6 @@
           <p class="help">Paste an upstream addon manifest URL to get started. Need one? <a class="inline-link" href="https://pengu.uk/" target="_blank" rel="noopener noreferrer">PenguPlay</a> is a recommended option.</p>
           <div id="wizard-addons"></div>
           <button id="wizard-add-addon" type="button" class="text-button">+ Add upstream addon</button>
-        </div>
-        <div class="wizard-step" data-step="2" hidden>
-          <h3>Choose your playback defaults</h3>
-          <p class="help">These can be changed any time in Settings.</p>
-          <div class="wizard-fields">
-            <label>Alignment samples<input id="wizard-samples" type="number" min="1" max="12" required /></label>
-            <label>Sample length (seconds)<input id="wizard-sample-seconds" type="number" min="5" max="40" required /></label>
-          </div>
-          <p class="help">One check is fastest. More checks compare audio at different points in the movie. A longer sample may match more reliably but takes more data.</p>
         </div>
         <div class="wizard-actions">
           <button id="wizard-back" class="button secondary" type="button" hidden>Back</button>

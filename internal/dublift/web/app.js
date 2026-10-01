@@ -247,8 +247,6 @@ async function loadSettings() {
   $("wizard-addons").replaceChildren();
   settings.addons.forEach((addon) => addonRow(addon, $("wizard-addons")));
   if (!settings.addons.length) addonRow(undefined, $("wizard-addons"));
-  $("wizard-samples").value = settings.alignmentSamples;
-  $("wizard-sample-seconds").value = settings.alignmentSampleSeconds;
 }
 function confidenceLabel() {
   $("confidence-value").textContent =
@@ -296,13 +294,13 @@ function renderWizard() {
   $("wizard").hidden = setupStep < 0;
   document.body.classList.toggle("setting-up", setupStep >= 0);
   if (setupStep < 0) return;
-  $("wizard-progress").textContent = `Step ${setupStep + 1} of 3`;
+  $("wizard-progress").textContent = `Step ${setupStep + 1} of 2`;
   for (const section of document.querySelectorAll(".wizard-step"))
     section.hidden = Number(section.dataset.step) !== setupStep;
   for (const [index, label] of [...document.querySelectorAll(".wizard-steps span")].entries())
     label.classList.toggle("active", index === setupStep);
   $("wizard-back").hidden = setupStep === 0;
-  $("wizard-next").textContent = setupStep === 2 ? "Finish setup" : "Continue";
+  $("wizard-next").textContent = setupStep === 1 ? "Finish setup" : "Continue";
   $("wizard-error").textContent = "";
 }
 function startWizard() {
@@ -320,7 +318,7 @@ async function finishWizard() {
     setupStep = -1;
     renderWizard();
     showView("streams");
-    toast("Setup complete. You can run it again from Settings.");
+    toast("Setup complete. Adjust playback defaults or run setup again in Settings.");
   } catch (err) { $("wizard-error").textContent = err.message; }
 }
 $("wizard-next").onclick = async () => {
@@ -338,16 +336,6 @@ $("wizard-next").onclick = async () => {
         return;
       }
       await saveConfig({ ...settings, addons: readAddons($("wizard-addons")) });
-      setupStep = 2;
-      renderWizard();
-    } else if (setupStep === 2) {
-      const inputs = [...document.querySelectorAll(".wizard-fields input")];
-      if (!inputs.every((input) => input.reportValidity())) return;
-      await saveConfig({
-        ...settings,
-        alignmentSamples: Number($("wizard-samples").value),
-        alignmentSampleSeconds: Number($("wizard-sample-seconds").value),
-      });
       await finishWizard();
     }
   } catch (err) {

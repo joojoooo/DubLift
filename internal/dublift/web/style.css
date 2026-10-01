@@ -103,11 +103,10 @@ header {
 .wizard { max-width: 820px; margin: 48px auto 80px; border-top: 3px solid var(--accent); padding: 32px; }
 .wizard-heading, .wizard-actions, .settings-intro { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .wizard-heading h2 { font-size: 28px; margin: 4px 0 20px; }
-.wizard-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 32px; }
+.wizard-steps { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 0 0 32px; }
 .wizard-steps span { border-top: 3px solid var(--line); padding-top: 8px; color: var(--muted); font-size: 12px; }
 .wizard-steps span.active { border-color: var(--accent); color: var(--text); }
 .wizard-step h3 { font-size: 21px; }
-.wizard-fields { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 20px; }
 .wizard-actions { justify-content: flex-end; margin-top: 28px; }
 .wizard-actions #wizard-back { margin-right: auto; }
 #wizard-error { color: var(--warm); min-height: 1em; }
@@ -571,7 +570,6 @@ code {
   }
   .settings-intro { align-items: center; }
   .wizard { padding: 20px; margin-top: 24px; }
-  .wizard-fields { grid-template-columns: 1fr; }
   .stats {
     grid-template-columns: 1fr 1fr;
     row-gap: 22px;
