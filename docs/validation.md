@@ -1,4 +1,4 @@
-# Validation — through 30 September 2026
+# Validation — through 3 October 2026
 
 ## Deterministic checks
 
@@ -104,3 +104,15 @@ For an origin-independent seek check, a sparse local copy containing the source 
 The full race suite intermittently left the MKV fixture's automatic alignment waiting after all requested video segments had completed. A trace found the source audio probe repeatedly requesting the same uncached 1 MiB range. Video remuxing had not needed that interleaved audio range, so waiting for another video request could not fill it. Alignment now tries cached bytes first, then fills a missing range through the existing lower-priority file-read path and retries the same completed playback area. The full race suite passed three consecutive runs after this change.
 
 Matroska cue parsing now completes before optional EOF pinning. A failed read of unrelated trailing bytes does not reject an otherwise indexed file, and optional pin reads have a short deadline that leaves time for the preparation to finish. A regression test covers both a nearby and a distant unavailable tail. `go test ./...`, `go vet ./...`, and `git diff --check` passed.
+
+## 3 October — Interstellar origin HTTP 403
+
+The supplied 7.63 GB Interstellar AV1/Opus stream reproduced HTTP 403 responses during both initial inspection and later range reads. The CDN returned Google Drive JSON identifying a shared request-per-minute quota (`rateLimitExceeded` / `RATE_LIMIT_EXCEEDED`). Identical bounded reads also succeeded, including with Go's default user agent. Switching user agents, HTTP versions, or cache headers did not eliminate the intermittent failures. Immediate retries could hit the same quota again. Google documents these 403 responses as temporary rate limits and recommends [exponential backoff](https://developers.google.com/workspace/drive/api/guides/handle-errors#ratelimitexceeded).
+
+Origin requests now identify those structured quota errors and HTTP 429, retry with bounded exponential backoff and jitter, honor `Retry-After`, and remain cancelable. Error-body inspection is limited to 16 KiB and two seconds. Exhausted retries return a sanitized provider-rate-limit error without exposing the response, signed URLs, or credentials. The file reader does not restart an exhausted quota retry loop. Ordinary permission errors remain distinct.
+
+The live VLC run also exposed unnecessary startup reads: FFmpeg's zero-frame init command still waited for a marked key packet in this AV1 file. It downloaded more than 100 MiB while scanning for one. Adding `-copyinkf` to initialization lets that command stop without publishing media packets. A separate live check returned the 900-byte init in 0.977 seconds, with 3.91 MB of total origin reads including file indexing.
+
+With both fixes in the rebuilt ordinary server, VLC decoded AV1 video and selected Italian Vixsrc audio. Startup took 59.23 seconds during provider throttling; a seek to four minutes advanced through 245 seconds with 623 new video frames and 1,296 new audio blocks. The session recorded no errors. These are bounded startup and seek checks, not full-title validation, and persistent upstream quotas can still exhaust a playback deadline. Private traces and VLC counters remain under ignored `.local/403-check/` files.
+
+New regressions cover quota recovery across redirects and file preparation/remuxing, preserved range and origin headers, ordinary permission responses, bounded retries and private errors, cancellation during backoff, `Retry-After`, and the independence of quota backoff from the file header timer. The AV1 regression now decodes remuxed segments using the separately generated initialization map. The full race suite, `go vet`, module verification, Linux/Android builds, and VLC playback/seek tests for Matroska, MPEG-TS HLS, and fMP4 HLS passed.

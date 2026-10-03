@@ -443,6 +443,9 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 					if ctx.Err() != nil {
 						return data[:read], ctx.Err()
 					}
+					if errors.Is(err, errOriginRateLimited) {
+						return data[:read], err
+					}
 					readErr = err
 					continue
 				}
@@ -869,7 +872,10 @@ func (e *Engine) VideoInit(ctx context.Context, a *Asset) ([]byte, error) {
 	defer cleanup()
 	args := []string{"-nostdin", "-v", "error", "-threads", "1", "-discard:a", "all", "-discard:s", "all", "-discard:d", "all"}
 	args = append(args, ffInput(u)...)
-	args = append(args, "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-frames:v", "0", "-copytb", "1", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
+	// Even with zero output frames, stream copy waits for an accepted input
+	// packet before it stops. Files without marked key packets would otherwise
+	// scan media until the download budget or deadline instead of returning init.
+	args = append(args, "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-copyinkf", "-frames:v", "0", "-copytb", "1", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
 	init, err := e.run(ctx, e.Config.Get().FFmpeg, args, 1<<20)
 	if err != nil {
 		return nil, err

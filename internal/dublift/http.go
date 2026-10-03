@@ -25,6 +25,7 @@ type Network struct {
 	Client             *http.Client
 	Bytes              atomic.Int64
 	rangeHeaderTimeout time.Duration
+	rateLimitWait      func(context.Context, time.Duration) error
 }
 
 // Video bytes are counted on each origin read, including while a range
@@ -76,7 +77,7 @@ func NewNetwork() *Network {
 	}}}
 }
 func (n *Network) request(ctx context.Context, o Origin, method, byteRange string) (*http.Response, error) {
-	return n.requestWithClient(ctx, o, method, byteRange, n.Client)
+	return n.requestWithRetry(ctx, o, method, byteRange, n.Client, false)
 }
 
 func (n *Network) requestWithClient(ctx context.Context, o Origin, method, byteRange string, client *http.Client) (*http.Response, error) {
@@ -115,10 +116,16 @@ func (n *Network) requestFileRange(ctx context.Context, o Origin, byteRange stri
 	// deadlines, plus the caller's job context, still bound this request.
 	client := *n.Client
 	client.Timeout = 0
+	return n.requestWithRetry(ctx, o, "GET", byteRange, &client, true)
+}
+
+func (n *Network) requestWithRetry(ctx context.Context, o Origin, method, byteRange string, client *http.Client, fileRange bool) (*http.Response, error) {
+	workerRetried, rateRetries := false, 0
+	var rateDeadline time.Time
 	for attempt := 0; ; attempt++ {
 		requestCtx, cancel := context.WithCancel(ctx)
 		var timer *time.Timer
-		if attempt == 0 {
+		if fileRange && attempt == 0 {
 			timeout := n.rangeHeaderTimeout
 			if timeout <= 0 {
 				timeout = 3 * time.Second
@@ -128,26 +135,49 @@ func (n *Network) requestFileRange(ctx context.Context, o Origin, byteRange stri
 			// Stop this timer at the headers, not at the end of a large body.
 			timer = time.AfterFunc(timeout, cancel)
 		}
-		resp, err := n.requestWithClient(requestCtx, o, "GET", byteRange, &client)
+		resp, err := n.requestWithClient(requestCtx, o, method, byteRange, client)
 		if timer != nil && !timer.Stop() && err == nil {
 			resp.Body.Close()
 			err = context.DeadlineExceeded
 		}
 		if err != nil {
 			cancel()
-			if attempt == 0 && ctx.Err() == nil {
+			if fileRange && !workerRetried && ctx.Err() == nil {
+				workerRetried = true
 				continue
 			}
 			return nil, err
 		}
 		resp.Body = &cancelReadCloser{ReadCloser: resp.Body, cancel: cancel}
+		// Drive can report a temporary per-minute quota as HTTP 403. Retrying
+		// immediately through another CDN worker can hit the same shared quota.
+		if originRateLimited(resp, cancel) {
+			if rateDeadline.IsZero() {
+				rateDeadline = time.Now().Add(originRateRetryBudget)
+			}
+			delay := originRateRetryDelay(resp.Header.Get("Retry-After"), rateRetries)
+			resp.Body.Close()
+			if rateRetries >= originRateRetries || delay > time.Until(rateDeadline) {
+				return nil, fmt.Errorf("%w: %w", &HTTPError{resp.StatusCode}, errOriginRateLimited)
+			}
+			wait := waitOriginRetry
+			if n.rateLimitWait != nil {
+				wait = n.rateLimitWait
+			}
+			if err := wait(ctx, delay); err != nil {
+				return nil, fmt.Errorf("origin retry failed: %s: %w", networkError(err), err)
+			}
+			rateRetries++
+			continue
+		}
 		// A redirector can send consecutive ranges to different workers. A
 		// single bad worker must not fail a seek; close its response without
 		// reading a whole-file body before trying the entry URL once more.
-		if attempt > 0 || !retryableRangeStatus(resp.StatusCode) {
+		if !fileRange || workerRetried || !retryableRangeStatus(resp.StatusCode) {
 			return resp, nil
 		}
 		resp.Body.Close()
+		workerRetried = true
 	}
 }
 

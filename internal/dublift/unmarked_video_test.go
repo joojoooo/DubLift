@@ -86,6 +86,10 @@ func TestUnmarkedAV1VideoRemux(t *testing.T) {
 	if len(asset.Index.Boundaries) < 3 {
 		t.Fatalf("too few indexed boundaries: %v", asset.Index.Boundaries)
 	}
+	init, err := engine.VideoInit(ctx, asset)
+	if err != nil || len(init) == 0 || len(mp4Child(init, "moov", "trak", "mdia", "minf", "stbl", "stsd")) == 0 {
+		t.Fatalf("unmarked AV1 init: bytes=%d error=%v", len(init), err)
+	}
 	bounds := asset.Index.Boundaries[:3]
 	// FFmpeg may recover the key flag from a synthetic AV1 key OBU even when
 	// the container omits it. Force the fallback to exercise its exact packet
@@ -103,7 +107,11 @@ func TestUnmarkedAV1VideoRemux(t *testing.T) {
 	}
 	for n, segment := range segments {
 		out := filepath.Join(dir, fmt.Sprintf("segment-%d.mp4", n))
-		if err := os.WriteFile(out, segment, 0600); err != nil {
+		_, media, err := splitFMP4(segment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(out, append(bytes.Clone(init), media...), 0600); err != nil {
 			t.Fatal(err)
 		}
 		lo, hi := packetTimes(t, out, "v:0")
