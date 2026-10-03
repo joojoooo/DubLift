@@ -588,7 +588,7 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			// HLS -ss has upstream bug #7359 even on unmodified fMP4 playlists.
 			// A selected window still reads/decode-checks the actual late URLs.
 			seeked := filepath.Join(dir, "seeked-"+id+".mkv")
-			if session.video.File != nil || strings.Contains(session.video.HLS.Raw, "#EXT-X-MAP:") {
+			if strings.Contains(string(playlist), "#EXT-X-MAP:") {
 				windowMaster := filepath.Join(dir, "window-"+id+".m3u8")
 				for _, rendition := range []struct{ name, route string }{{"video", "video.m3u8"}, {"audio", "track/" + it.ID + ".m3u8"}} {
 					url := local.URL + "/media/" + id + "/" + rendition.route

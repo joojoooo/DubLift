@@ -136,25 +136,47 @@ type cacheOnlyFileKey struct{}
 type cacheMissKey struct{}
 type mediaInputFailureKey struct{}
 type mediaInputFailure struct {
-	mu  sync.Mutex
-	err error
+	mu       sync.Mutex
+	err      error
+	metadata bool
+	video    bool
 }
 
 func recordMediaInputFailure(ctx context.Context, err error) {
+	recordMediaInputFailureKind(ctx, err, false)
+}
+
+func recordMediaInputFailureKind(ctx context.Context, err error, metadata bool) {
 	failure, _ := ctx.Value(mediaInputFailureKey{}).(*mediaInputFailure)
 	if failure == nil || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, errRangeNotCached) {
 		return
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		err = errors.New("the origin download timed out before the English clip was available")
+		if failure.video {
+			err = errors.New("the upstream video download timed out")
+		} else {
+			err = errors.New("the origin download timed out before the English clip was available")
+		}
 	} else if errors.Is(err, io.ErrUnexpectedEOF) {
-		err = errors.New("the origin closed the download before the full English clip arrived")
+		if failure.video {
+			err = errors.New("the upstream closed the download before the full video segment arrived")
+		} else {
+			err = errors.New("the origin closed the download before the full English clip arrived")
+		}
 	}
 	failure.mu.Lock()
-	if failure.err == nil {
+	// A recoverable metadata read must not hide a later media read failure.
+	if failure.err == nil || (failure.metadata && !metadata) {
 		failure.err = err
+		failure.metadata = metadata
 	}
 	failure.mu.Unlock()
+}
+
+func (f *mediaInputFailure) failure() (error, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err, f.metadata
 }
 
 type mediaJob struct {
@@ -436,6 +458,15 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 				// each real origin request finite, but reuse its connection while
 				// delivering and caching successive 1 MiB chunks.
 				span := min(int64(32<<20), b-offset+1)
+				if f.cueEnd > f.cueStart {
+					if offset < f.cueStart {
+						span = min(span, f.cueStart-offset)
+					} else if offset < f.cueEnd {
+						span = min(span, f.cueEnd-offset)
+					} else if offset < f.metadataEnd {
+						span = min(span, f.metadataEnd-offset)
+					}
+				}
 				streamCtx, streamCancel := context.WithCancel(ctx)
 				resp, err := f.openRange(streamCtx, offset, span)
 				if err != nil {
@@ -500,6 +531,17 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 		} else {
 			size = n
 		}
+		// Keep cache reads on one side of each metadata boundary so an origin
+		// failure can be classified as metadata or media, never both.
+		if f.cueEnd > f.cueStart {
+			if off < f.cueStart && off+size > f.cueStart {
+				size = f.cueStart - off
+			} else if off >= f.cueStart && off < f.cueEnd {
+				size = min(size, f.cueEnd-off)
+			} else if off >= f.cueEnd && off < f.metadataEnd {
+				size = min(size, f.metadataEnd-off)
+			}
+		}
 		if j.budget.Add(-size) < 0 {
 			recordMediaInputFailure(j.ctx, errors.New("media download exceeds the 256 MiB extraction limit"))
 			return
@@ -530,6 +572,11 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 				}
 			}
 		}
+		// Only reads wholly inside validated non-media elements are metadata.
+		// Reads that include any media bytes still invalidate final segments,
+		// whose video may naturally end before the container's audio duration.
+		metadata := f.cueEnd > 0 && (off >= f.cueStart && off+size <= f.cueEnd ||
+			off >= f.cueEnd && off+size <= f.metadataEnd)
 		buf, err := e.Cache.ReadRange(ctx, j.asset.ID, off, size, fetch)
 		if errors.Is(err, errRangeNotCached) {
 			miss.Store(true)
@@ -544,7 +591,7 @@ func (e *Engine) serveFileJob(w http.ResponseWriter, r *http.Request, j *mediaJo
 			off += int64(len(buf))
 		}
 		if err != nil {
-			recordMediaInputFailure(j.ctx, err)
+			recordMediaInputFailureKind(j.ctx, err, metadata)
 			return
 		}
 	}
@@ -708,7 +755,18 @@ func (e *Engine) Probe(ctx context.Context, a *Asset) (Probe, error) {
 }
 func (e *Engine) ProbeAt(ctx context.Context, a *Asset, at float64) (Probe, error) {
 	var p Probe
-	u, _, cleanup, err := e.job(ctx, a, at, min(8, a.Duration()-at), false)
+	duration := min(8, a.Duration()-at)
+	if a.HLS != nil {
+		// Later sections may use a different codec or clock. Keep stream
+		// discovery within the section containing the requested position.
+		for _, seg := range a.HLS.Segments {
+			if seg.Discontinuity && seg.Start > at {
+				duration = min(duration, seg.Start-at)
+				break
+			}
+		}
+	}
+	u, _, cleanup, err := e.job(ctx, a, at, duration, false)
 	if err != nil {
 		return p, err
 	}
@@ -865,6 +923,8 @@ func (e *Engine) Video(ctx context.Context, a *Asset, start, duration float64) (
 func (e *Engine) VideoInit(ctx context.Context, a *Asset) ([]byte, error) {
 	finish := e.foregroundFile(a)
 	defer finish()
+	inputFailure := &mediaInputFailure{video: true}
+	ctx = context.WithValue(ctx, mediaInputFailureKey{}, inputFailure)
 	u, _, cleanup, err := e.job(ctx, a, 0, 1, true)
 	if err != nil {
 		return nil, err
@@ -877,13 +937,18 @@ func (e *Engine) VideoInit(ctx context.Context, a *Asset) ([]byte, error) {
 	// scan media until the download budget or deadline instead of returning init.
 	args = append(args, "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-copyinkf", "-frames:v", "0", "-copytb", "1", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
 	init, err := e.run(ctx, e.Config.Get().FFmpeg, args, 1<<20)
+	// The init contains no media packets. FFmpeg can finish it successfully
+	// even if a later, unnecessary read-ahead range fails.
+	if err == nil && len(mp4Child(init, "moov", "trak", "mdia", "mdhd")) != 0 && len(mp4Child(init, "moov", "trak", "mdia", "minf", "stbl", "stsd")) != 0 {
+		return init, nil
+	}
+	if originErr, _ := inputFailure.failure(); originErr != nil {
+		return nil, fmt.Errorf("upstream video download failed: %w", originErr)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if len(mp4Child(init, "moov", "trak", "mdia", "mdhd")) == 0 || len(mp4Child(init, "moov", "trak", "mdia", "minf", "stbl", "stsd")) == 0 {
-		return nil, errors.New("FFmpeg did not produce a video init segment")
-	}
-	return init, nil
+	return nil, errors.New("FFmpeg did not produce a video init segment")
 }
 
 func (e *Engine) videoAttempt(ctx context.Context, a *Asset, start, duration float64) ([]byte, error) {

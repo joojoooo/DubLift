@@ -263,6 +263,8 @@ type RemoteFile struct {
 	prefix  []byte
 	tailOff int64
 	tail    []byte
+	// Cues and any adjacent, validated top-level metadata contain no media packets.
+	cueStart, cueEnd, metadataEnd int64
 }
 
 // Matroska seek tables commonly live at EOF. Retain that small region after

@@ -3,7 +3,9 @@ package dublift
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -130,5 +132,45 @@ func TestMappedSubtitlesUseRelativeAudioClockAndCache(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("subtitle text fetched %d times instead of cached", requests)
+	}
+}
+
+func TestOriginalSubtitlesUseSourceSectionClock(t *testing.T) {
+	for _, clockBase := range []float64{1.4, 12} {
+		for _, mapped := range []bool{false, true} {
+			for _, vixEnglish := range []bool{false, true} {
+				t.Run(fmt.Sprintf("clock=%g/mapped=%t/vix=%t", clockBase, mapped, vixEnglish), func(t *testing.T) {
+					raw := "WEBVTT\n"
+					if mapped {
+						raw += fmt.Sprintf("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:%d\n", int64(math.Round(clockBase*90000)))
+					}
+					raw += "\n00:00:09.000 --> 00:00:13.000\nOriginal cue.\n"
+					origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						io.WriteString(w, raw)
+					}))
+					defer origin.Close()
+					h, err := ParseHLS([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:20\n#EXTINF:20,\nsub.vtt\n#EXT-X-ENDLIST\n"), Origin{URL: origin.URL + "/sub.m3u8"})
+					if err != nil {
+						t.Fatal(err)
+					}
+					cache := NewByteCache(1 << 20)
+					ctx := context.Background()
+					server := &Server{Net: NewNetwork(), Engine: &Engine{Cache: cache}}
+					v := &Session{}
+					if vixEnglish {
+						v.vixEnglish = &Track{Asset: &Asset{ID: "vix-english"}}
+						cache.Put(ctx, "subtitle-clock:vix-english", []byte("100"))
+					}
+					track := Track{Original: true, Subtitle: true, Asset: &Asset{ID: "original-subtitles", HLS: h}}
+					data, err := server.subtitles(ctx, v, track, 10, 6, 0, clockBase)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Contains(data, []byte("00:00:10.000 --> 00:00:13.000\nOriginal cue.")) || !bytes.Contains(data, fmt.Appendf(nil, "MPEGTS:%d", int64(math.Round(clockBase*90000)))) {
+						t.Fatalf("original cue did not retain the source clock: %s", data)
+					}
+				})
+			}
+		}
 	}
 }

@@ -116,6 +116,8 @@ func (e *Engine) VideoWindow(ctx context.Context, a *Asset, bounds []float64, pu
 
 func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []float64, publish func(int, []byte) error) error {
 	start, end := bounds[0], bounds[len(bounds)-1]
+	inputFailure := &mediaInputFailure{video: true}
+	ctx = context.WithValue(ctx, mediaInputFailureKey{}, inputFailure)
 	u, skip, cleanup, err := e.job(ctx, a, start, end-start+1, true)
 	if err != nil {
 		return err
@@ -123,7 +125,21 @@ func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []floa
 	defer cleanup()
 	unmarked := a.unmarkedVideo.Load()
 	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), sequence: videoSequence(a, start), unmarked: unmarked, clock: &windowClock{}, publish: publish}
-	if err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgsMode(u, skip, start, end-start, unmarked), w, w.clock); err != nil {
+	err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgsMode(u, skip, start, end-start, unmarked), w, w.clock)
+	if originErr, metadata := inputFailure.failure(); originErr != nil {
+		// Missing key flags can exhaust the read budget before any packet is
+		// emitted. Preserve the -copyinkf retry before reporting that failure.
+		if err == nil && !unmarked && !w.clock.known {
+			return w.flush(true)
+		}
+		// FFmpeg can recover from unavailable seek metadata by reading media
+		// directly. Let a successful remux validate and flush its output, but
+		// keep media read failures fatal even for the shorter final video GOP.
+		if !metadata || err != nil || !w.clock.known {
+			return fmt.Errorf("upstream video download failed: %w", originErr)
+		}
+	}
+	if err != nil {
 		return err
 	}
 	return w.flush(true)

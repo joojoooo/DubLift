@@ -289,8 +289,8 @@ func TestListingDefersPreparationAndRequiresItalian(t *testing.T) {
 	}
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "/media/"+state.Sessions[1].ID+"/master.m3u8", nil))
-	if w.Code != http.StatusBadGateway || w.Header().Get("Location") != "" || sourceRequests.Load() != 2 {
-		t.Fatal("unavailable source unexpectedly redirected:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "error.m3u8") || w.Header().Get("Location") != "" || sourceRequests.Load() != 2 {
+		t.Fatal("unavailable source did not produce an error playlist:", w.Code, w.Header().Get("Location"), sourceRequests.Load())
 	}
 	italian.Store(false)
 	w = httptest.NewRecorder()

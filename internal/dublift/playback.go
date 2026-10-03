@@ -100,12 +100,18 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.prepareSession(r.Context(), v); err != nil {
-		v.note(err)
-		failure(w, 502, err)
+		s.servePreparationError(w, r, v, p, err)
 		return
 	}
 	switch {
 	case p[1] == "master.m3u8":
+		b, err := s.master(v)
+		if err != nil {
+			v.note(err)
+			failure(w, 500, err)
+			return
+		}
+		sendPlaylist(w, b)
 		v.mu.Lock()
 		first := !v.masterLoaded
 		v.masterLoaded = true
@@ -113,12 +119,6 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		if first {
 			s.ensurePlaybackAlignment(v)
 		}
-		b, err := s.master(v)
-		if err != nil {
-			failure(w, 500, err)
-			return
-		}
-		sendPlaylist(w, b)
 	case p[1] == "video.m3u8":
 		if v.video.HLS != nil {
 			sendPlaylist(w, []byte(s.proxyPlaylist(v, v.video, true)))
@@ -548,7 +548,9 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 		return
 	}
 	if resp.ContentLength > segmentLimit {
-		failure(w, 502, errors.New("media segment exceeds the 96 MiB limit"))
+		err := errors.New("media segment exceeds the 96 MiB limit")
+		v.note(err)
+		failure(w, 502, err)
 		return
 	}
 	copyMediaHeaders(w.Header(), resp.Header)
@@ -561,6 +563,9 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 	if res.Video {
 		body = io.TeeReader(body, videoByteWriter{context.WithValue(r.Context(), videoBytesKey{}, &v.videoDownload)})
 	}
-	n, _ := io.Copy(w, io.LimitReader(body, segmentLimit))
+	n, err := io.Copy(w, io.LimitReader(body, segmentLimit))
 	s.Net.Bytes.Add(n)
+	if r.Context().Err() == nil {
+		v.note(err)
+	}
 }

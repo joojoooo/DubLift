@@ -177,6 +177,37 @@ func ebmlFloat(b []byte) float64 {
 	}
 	return 0
 }
+
+// Use only headers already present in the bounded Cues read. A failed optional
+// tail fetch must not turn a healthy file into a preparation failure.
+func trailingMKVMetadataEnd(f *RemoteFile, cacheOff int64, cache []byte) int64 {
+	end := f.cueEnd
+	for count := 0; count < 32 && end < f.Size; count++ {
+		if end < cacheOff || end >= cacheOff+int64(len(cache)) {
+			break
+		}
+		v, err := ebmlHeader(cache[end-cacheOff:], end)
+		if err != nil || v.end <= end || v.end > f.Size {
+			break
+		}
+		switch v.id {
+		case 0xec, // Void
+			0xbf,       // CRC-32
+			0x114d9b74, // SeekHead
+			0x1549a966, // Info
+			0x1654ae6b, // Tracks
+			0x1043a770, // Chapters
+			0x1941a469, // Attachments
+			0x1254c367, // Tags
+			0x1c53bb6b: // Cues
+			end = v.end
+		default:
+			return end
+		}
+	}
+	return end
+}
+
 func indexMKV(r *metadataReader) (FileIndex, error) {
 	first, e := r.element(0)
 	if e != nil {
@@ -250,7 +281,11 @@ func indexMKV(r *metadataReader) (FileIndex, error) {
 		if e != nil {
 			return nil, e
 		}
-		return ebmlFields(b)
+		fields, e := ebmlFields(b)
+		if e == nil && id == 0x1c53bb6b {
+			r.f.cueStart, r.f.cueEnd = o, v.end
+		}
+		return fields, e
 	}
 	info, e := readFields(0x1549a966)
 	if e != nil {
@@ -338,6 +373,7 @@ func indexMKV(r *metadataReader) (FileIndex, error) {
 	if e != nil {
 		return FileIndex{}, e
 	}
+	r.f.metadataEnd = trailingMKVMetadataEnd(r.f, r.cacheOff, r.cache)
 	// FFmpeg revisits cues near EOF for every short extraction. Retain that
 	// region when available, but a failed read of unrelated trailing bytes
 	// must not invalidate the cue table we have already parsed.

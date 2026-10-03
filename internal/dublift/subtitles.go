@@ -126,7 +126,11 @@ func (s *Server) subtitles(ctx context.Context, v *Session, t Track, start, dura
 			return nil, err
 		}
 		nativeBase := 0.0
-		if mapRE.Match(data) && v.vixEnglish != nil && s.Engine != nil {
+		if mapRE.Match(data) && t.Original {
+			// Original cues share the video's presentation clock, including
+			// resets at source discontinuities. Unmapped cues are VOD-relative.
+			nativeBase = clockBase
+		} else if mapRE.Match(data) && v.vixEnglish != nil && s.Engine != nil {
 			b, e := s.Engine.Cache.Get(ctx, "subtitle-clock:"+v.vixEnglish.Asset.ID, func() ([]byte, error) {
 				p, e := s.Engine.Probe(ctx, v.vixEnglish.Asset)
 				if e != nil {
