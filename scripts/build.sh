@@ -2,7 +2,7 @@
 set -eu
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 mkdir -p bin
-for target in linux/amd64 linux/arm64 android/arm64; do
+for target in linux/amd64 linux/arm64; do
   target_os=${target%/*}
   target_arch=${target#*/}
   CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" \

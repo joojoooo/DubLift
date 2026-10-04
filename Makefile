@@ -17,4 +17,4 @@ release:
 	./scripts/build.sh
 
 clean:
-	rm -f bin/dublift bin/dublift-linux-amd64 bin/dublift-linux-arm64 bin/dublift-android-arm64
+	rm -f bin/dublift bin/dublift-linux-amd64 bin/dublift-linux-arm64

@@ -1,118 +1,73 @@
-# Validation — through 3 October 2026
+# Validation
 
-## Deterministic checks
+Run commands from the repository root. Use the Go version required by
+`go.mod` (currently 1.26.2 or newer). Install FFmpeg and ffprobe for media
+integration tests; `-race` also requires a working C toolchain.
 
-- Go tests, including the race detector; `go vet`; Go module checksum verification.
-- Synthetic indexed MP4 and Matroska, including chaptered MKV and HEVC with open GOPs: ranged indexing, late video remux, compressed video stream copy, fragment presentation clocks, preserved keyframe flags and decoded frames.
-- Synthetic MPEG-TS and fMP4 HLS, nonzero media sequences, byte ranges, AES-128 keys, header forwarding, source failures and bounded caching.
-- English fingerprint matching plus correlation; configurable sample positions; manual overrides; persisted realignment boundaries; offset-zero fallback; immediate startup and first-sample startup gates; applying completed alignment to upcoming segments.
-- Complete upstream JSON preservation for missing Italian, torrents, external links and non-seekable sources; emoji-only name changes; configured-addon/response ordering; full dashboard text.
-- Playback detection before preparation completes; harmless HEAD checks; replacement of unselected results while preserving active playback; cancellation and cache collection; one-hour expiry of memory and disk alignment data; canceled work cannot restore deleted entries. Encrypted links recreate discarded sessions, including after a server restart; expired or tampered tickets are rejected.
-- Requested file ranges share the bounded cache. Foreground reads can complete while analysis is paused, including when both request the same range; canceled analysis does not poison subsequent playback reads.
-- Headless Chromium: desktop and 390-pixel mobile layouts, settings save/reload, upstream editing, episode presets, manual offset/reset and realignment requests. New sample-count and startup controls were saved and reloaded. Full multiline stream details, original result order, selected-session removal, sample progress and zero-to-calculated offset updates were checked. No JavaScript errors or horizontal overflow.
-- Linux amd64, Linux arm64 and Android arm64 builds. Android binary execution has not been tested on a physical device.
+## Canonical checks
 
-## Live provider checks
+```sh
+go test -race ./...
+go vet ./...
+go mod verify
+test -z "$(gofmt -l cmd internal)"
+git diff --check
+make build
+make release
+```
 
-These are development observations, not availability guarantees. The private upstream configuration and raw local reports remain in ignored `.local/` files. No credentials are included here.
+- **Tests:** local mock servers and synthetic media check discovery,
+  upstream preservation/order, HTTP ranges and retries, HLS proxying, file
+  remuxing/timing, generated audio, alignment, dashboard APIs, and
+  session/cache lifecycle. The race detector checks executed Go code for data
+  races.
+- **Vet / module verification:** static Go diagnostics and cached dependency
+  integrity. These do not prove playback or provider availability.
+- **Formatting / diff:** Go formatting and patch whitespace. Review Markdown
+  links and commands when changing docs; there is no checked-in docs linter.
+- **Builds:** `make build` compiles the local server; `make release` uses
+  `scripts/build.sh` to build Linux amd64/arm64 binaries with CGO disabled.
+  Cross-compilation does not prove execution on the target hardware.
 
-On 26 September, the development checker resolved upstream HTTP streams for all ten supplied titles. It inspected Vixsrc manifests only; it did not fetch complete videos. The following manifest results were observed:
+Media tests skip when FFmpeg/ffprobe are missing. Fixtures also need the
+encoders used by the tests, including `libx264` and AAC; HEVC/AV1 tests skip
+without `libx265`/`libsvtav1`. Error-clip tests need `lavfi`, `drawtext`, and a
+usable font. Inspect skip messages before claiming media coverage.
 
-| Title / TMDB ID | Vixsrc manifest observation |
-| --- | --- |
-| Devs / 81349, S1E1 | Media playlist; no separate rendition languages in the master-only report |
-| Monster: The Lizzie Borden Story / 299939, S1E1 | Italian and English |
-| Lanterns / 95350, S1E1 | Italian and English |
-| House of the Dragon / 94997, S1E1 | Italian and English |
-| Arcane / 94605, S1E1 | Italian and English |
-| Project Hail Mary / 687163 | Italian and English |
-| Coyote vs. Acme / 1204680 | Italian and English |
-| The Matrix / 603 | Italian and English |
-| Inception / 27205 | Italian and English |
-| Interstellar / 157336 | Italian and English |
+## Optional playback and provider checks
 
-On 27 September, a Matrix 4K HLS source produced three verified anchors: +1.110 s, +1.124 s and +1.118 s, with confidence approximately 92%, 94% and 78%. The selected global offset was +1.118 s. Late video and Italian-audio segments were fetched and decoded. The source required media headers, which DubLift forwarded through its local media endpoints.
+With VLC installed, run:
 
-A separate 37.7 GB indexed Matrix Matroska source passed strict range probing and exposed its original audio tracks. Its origin transferred a 4 MiB range in about 5.2 seconds, below the source's average media bitrate. After the fixes below, VLC decoded 4K HEVC video and Italian audio, but could not sustain playback or complete the seek within the test deadline. Requested video remuxes exceeded their 60-second limit. This source remains unsuitable on that measured connection; successful playlist generation is not counted as a playback pass.
+```sh
+DUBLIFT_VLC_TESTS=1 go test ./internal/dublift -run '^TestVirtualHLSEndToEnd$' -count=1 -v
+```
 
-The installed FFmpeg 6.1 HLS client reproduced its upstream fMP4 seek defect. Saved late fMP4 fragments decoded without errors. This client limitation is distinct from the server's bounded window extraction; the tests do not treat an empty successful FFmpeg exit as successful playback.
+This uses synthetic MKV, MPEG-TS HLS, and fMP4 HLS sources. It requires VLC
+to decode video and select Italian audio both before and after a seek.
 
-VLC 3.0.24 was exercised with dummy audio/video outputs through the ordinary local master URL. Its status reported decoded 3840×2160 H.264 video and Italian AAC audio while playback advanced past ten minutes. A seek to twenty minutes then produced 297 new decoded video frames and increased the decoded-audio counter by 832, with playback advancing past 20:02. DubLift reported no session errors. The private `.local/vlc-*-status.json` files contain the detailed playback counters.
+With upstream addons configured in a private config, run:
 
-Stremio ExoPlayer and Nuvio device playback, and Android/Termux runtime behavior, still need hardware validation.
+```sh
+go run ./cmd/dublift-check -config .local/config.json -out .local/live-report.json
+```
 
-## Startup changes — live recheck
+The checker fetches stream lists and Vixsrc manifests for its built-in title
+set (S1E1 for series). It reports availability and errors; it does not assert
+success, decode playback, or download complete titles. Keep reports private.
 
-With immediate startup enabled, three samples and the existing custom 10-second search radius, a Matrix 4K HLS source returned its local master in **1.428 seconds** while the first alignment sample was still running. The dashboard marked playback before preparation finished and retained only the selected result. All three samples completed **33.85 seconds** after selection: offsets **+1.098**, **+1.142** and **+1.111 seconds**, with confidence approximately **88%**, **89%** and **79%**. The resulting offset was +1.111 seconds. A requested Italian segment returned 197,024 bytes in approximately 0.39 seconds and ffprobe identified AAC audio. This check fetched bounded manifests/audio windows and a requested segment; it did not download the title.
+## Manual checks and gaps
 
-The stream lookup returned 25 entries in 12.43 seconds: 13 eligible transformations and 12 original fallback entries. Header/index/time-limit failures remained visible as original streams. These timings depend on provider/network conditions and verify server startup and bounded audio delivery. An earlier source with failed video probes incorrectly returned an audio-only master; the playback investigation below found and fixed that bug. Failed English alignment still permits offset-zero playback, but failed video probing no longer produces a transformed master.
+- Start `./bin/dublift` with a private test config. Check `/healthz`, guided
+  setup, settings save/reload, upstream editing, and manifest installation.
+- Check desktop and narrow mobile dashboard layouts, browser errors,
+  stream ordering/filtering, preparation, and manual timing/reset controls.
+- Play through Stremio/Nuvio and VLC: verify video and Italian audio at
+  startup, after forward/backward seeks, and after timing changes. Refresh
+  results during playback and select a different stream to check lifecycle.
+- Test from another LAN device with a reachable Public base URL. Check real
+  codecs/HDR, long playback, and slow or failing providers on target players.
 
-## Playback failure investigation and VLC recheck
-
-The installed `vlc` command was used to decode both tracks and seek, with dummy outputs and its HTTP interface reporting frame counters. Fixes included:
-
-- Rejecting failed initial HLS video/init resources before advertising a transformed entry. One live Cinejoy/Lisbon source returned HTTP 502 for both video and initialization resources, reproducing audio-only playback. It now remains an unmodified upstream entry. A child-playlist error shadowing bug was also corrected.
-- Preserving active playback during stream-result refreshes and restoring discarded sessions from encrypted playback links. A saved live stream URL played and sought after restarting the server.
-- Excluding synthesized chapter text tracks from remuxed MP4, preserving `trun.first_sample_flags` for HEVC keyframes, and retaining actual packet timestamps so seek preroll is discarded rather than shifted into the requested segment.
-- Sharing requested ranged file reads, avoiding unnecessary full stream-info scans for indexed file metadata, shortening the first video segment when possible, and prioritizing playback over file alignment reads.
-
-Live Matrix checks: the final fresh-list 4K VidFast/vRapid HLS run decoded video and Italian audio in 6.13 seconds and passed a seek to ten minutes, producing 320 new video frames and 898 audio blocks. The 1080p HEVC PixelDrain file decoded both tracks in about 15–22 seconds across repeated runs; the final run passed the same seek with 287 new video frames and 678 audio blocks. Its inspected seek fragment covered 598.388–607.063 seconds against a declared clock of 598.388–607.064, with the first keyframe flag preserved. Session errors were empty on these successful checks. The large 4K MKV limitation above remains.
-
-`DUBLIFT_VLC_TESTS=1 go test ./internal/dublift -run TestVirtualHLSEndToEnd -v` passed MKV, MPEG-TS HLS and fMP4 HLS playback, each requiring new video frames and Italian audio after a seek to 54 seconds. The complete race suite, `go vet`, module verification, and Linux/Android cross-builds passed. These are VLC and server checks; physical Stremio/Nuvio/Android player validation remains outstanding.
-
-## 29 September — Lizzie Borden R2 playback
-
-The 2.91 GB PenguPlay 1080p Matroska source for *Monster: The Lizzie Borden Story* S1E1 exposed an intermittent incomplete remux: one segment advertised 6.006 seconds but contained only about two seconds of video packets. A fresh remux of the same source produced all 144 expected frames. Italian audio timestamps were continuous. VLC on the live DubLift URL stalled and sometimes showed its time moving backward; the same generated video and Italian audio segments, served locally, advanced smoothly through 66 seconds.
-
-File video range reads now keep a finite origin response open for up to 8 MiB while delivering and caching each 1 MiB chunk immediately. DubLift checks packet coverage, retries incomplete video output, publishes one stable fMP4 initialization map, and prepares at most three upcoming video segments with one bounded worker. The final live VLC run advanced from startup through 60 seconds in 63 seconds of wall time, with 2,920 decoded video frames, 5,784 decoded audio blocks, and no backward time jump. This checks the first minute, not the full episode. A synthetic truncated-fragment test, streaming-range test, and VLC playback/seek tests for MKV, MPEG-TS HLS and fMP4 HLS passed.
-
-## 29 September — sustained file playback follow-up
-
-The one-minute check above missed recurring stalls. An extended R2 run reproduced video requests taking 13–22 seconds: repeated six-second remuxes and origin reconnects eventually exhausted the player's buffer. Increasing lookahead alone did not resolve this. Audio and video requests also overwrote the same dashboard position, causing misleading backward movements.
-
-File video now uses sequential remux windows of up to 30 seconds, sized toward 24 MiB of source data, publishing each complete segment while FFmpeg is still working. Finite origin requests stream up to 32 MiB in 1 MiB cache chunks. Indexed metadata avoids repeated stream-info scans. Rolling workers prepare video and the selected audio, retry failures, revisit evicted entries, and cancel obsolete reads/remuxes on seeks. The initialization map survives media-cache eviction. The dashboard follows video requests when visible and otherwise uses audio requests.
-
-An extended VLC run of the same 2.91 GB R2 source reached **479 seconds**. After playback began, its clock advanced **478 seconds in 478.21 seconds** of wall time, with **zero backward clock or requested-area jumps** and no observed rebuffering. The maximum unchanged-clock interval in one-second samples was 1.03 seconds. After the first 20 seconds, all 79 video responses completed within **5 ms** and all 80 selected Italian audio responses within **1 ms**. VLC reported 22,990 decoded video frames and 45,306 decoded audio blocks. Cache use stayed below its configured 512 MiB limit while old entries were evicted; the server process recorded zero disk writes. This is an eight-minute check, not a full-episode guarantee.
-
-Regression checks cover progressive segment publication before the entire remux finishes, truncated output rejection, packet clocks and decoding for MP4/Matroska/chaptered Matroska/HEVC windows, bounded lookahead and retries, cancellation of abandoned origin reads, backward-seek state, and dashboard position arbitration. The full race suite, `go vet`, and VLC playback/seek tests for MKV, MPEG-TS HLS, and fMP4 HLS passed.
-
-
-## 29 September — 4K HEVC S1E2 at five minutes
-
-The supplied 8 GB PenguPlay / 4KHDHub R2 source for *Monster: The Lizzie Borden Story* S1E2 exposed errors missed by the prior S1E1 H.264 checks:
-
-- The last commit disabled FFmpeg stream analysis for file video. With this HEVC source, decode timestamps collapsed onto presentation timestamps, and the muxer clamped reordered frames to times only 1 ms apart. The fragment at 299.299 seconds contained 218 packets, but decoding it reported repeated non-monotonic timestamps. Restoring bounded stream analysis and explicitly copying the demuxer timebase preserves B-frame timing. Video remains stream-copied.
-- Every generated segment restarted its MP4 fragment counter at 1. VLC logged fragment-sequence discontinuities at ordinary segment boundaries. Each HLS segment now contains one MP4 fragment numbered by its absolute segment index, including across independently generated windows and seeks.
-- VLC probes original audio renditions at a seek target before requesting video. Those interleaved file reads now stream bounded origin responses, and early audio seek requests cancel obsolete video reads. Stalled range headers get one earlier retry; stalled or broken bodies resume from the first unread byte without truncating the demuxer's input.
-
-A new 10-bit HEVC regression compares every remuxed packet's SHA-256 and presentation timestamp with the original Matroska at startup and after independent seeks. It also checks absolute fragment sequencing across windows containing multiple GOPs. Additional tests cover audio-first seek cancellation, streamed original-audio reads, stalled headers, and a partially delivered body that resumes byte-for-byte. Existing incomplete-output and progressive-publication tests continue to pass with the consolidated fragments.
-
-## 30 September — AV1 Matroska without marked key packets
-
-The supplied 7.63 GB *Interstellar* AV1/Opus Matroska has video cues at 0, 8.967, and 17.935 seconds, but FFmpeg reports its sampled video packets as non-key. The normal copy command discarded them all and emitted only a 900-byte MP4 initialization header, reproducing `remux produced no video packet timestamps`. DubLift now retries with FFmpeg's `-copyinkf`, fragments at each frame, and assembles complete segments at the indexed cue times. The fallback keeps compressed video packets unchanged.
-
-The saved first 12 MiB of that source, served through DubLift's ranged file path, produced two segments with packet coverage of 1.000–9.968 and 9.967–18.935 seconds on DubLift's one-second video clock. FFmpeg decoded both and a separate seeked remux. VLC opened the video decoder and output for the resulting local two-segment fMP4 HLS playlist. A synthetic AV1 test checks the fallback's segmentation and packet coverage, and `go test ./...` passed. The live link intermittently returned HTTP 403 and inconsistent range responses during repeat checks, so this does not verify a complete live title session or Vixsrc audio with that link.
-
-### Later segment and seek follow-up
-
-The first-prefix check missed failures reported at 44.9 seconds and on a four-minute seek. FFmpeg can exit after receiving a truncated ranged file, leaving one or zero video packets; the coverage check correctly rejects those segments. A cold-range trace caught an advertised `206` for the file's tail metadata with zero body bytes. Without that seek data, FFmpeg scanned earlier media and produced one packet far before the requested segment. DubLift now retains the header and a bounded tail containing the Matroska cue table after indexing, so later remuxes do not reread them from the CDN. The supplied file's cue table and trailing metadata fit in about 1.3 MiB, already fetched during indexing. File chunks can reopen the entry URL on additional failed workers. The general HTTP client timeout also canceled a finite CDN range after 45 seconds even if its body was still progressing through the 1 MiB cache chunks. File ranges now keep the existing header deadline, per-chunk timeout, and remux job limit without that whole-response cutoff. The default per-chunk read allowance was increased from five to fifteen seconds.
-
-For an origin-independent seek check, a sparse local copy containing the source header, cue table, and 233.650–248.540 second media bytes produced complete 2.95 MB and 3.34 MB remuxed segments. VLC opened video output for each independently and saved six decoded frames from the first. A live ranged-source check returned complete two-segment windows at both 44.878–62.854 and 233.650–248.540 seconds. Regression tests cover a progressing response beyond the general HTTP client timeout, playback after the origin stops serving the indexed MKV tail, and recovery through an additional CDN worker. These sampled checks do not establish uninterrupted playback of the full live title or Vixsrc audio at the seek.
-
-## 30 September — merge review fixes
-
-The full race suite intermittently left the MKV fixture's automatic alignment waiting after all requested video segments had completed. A trace found the source audio probe repeatedly requesting the same uncached 1 MiB range. Video remuxing had not needed that interleaved audio range, so waiting for another video request could not fill it. Alignment now tries cached bytes first, then fills a missing range through the existing lower-priority file-read path and retries the same completed playback area. The full race suite passed three consecutive runs after this change.
-
-Matroska cue parsing now completes before optional EOF pinning. A failed read of unrelated trailing bytes does not reject an otherwise indexed file, and optional pin reads have a short deadline that leaves time for the preparation to finish. A regression test covers both a nearby and a distant unavailable tail. `go test ./...`, `go vet ./...`, and `git diff --check` passed.
-
-## 3 October — Interstellar origin HTTP 403
-
-The supplied 7.63 GB Interstellar AV1/Opus stream reproduced HTTP 403 responses during both initial inspection and later range reads. The CDN returned Google Drive JSON identifying a shared request-per-minute quota (`rateLimitExceeded` / `RATE_LIMIT_EXCEEDED`). Identical bounded reads also succeeded, including with Go's default user agent. Switching user agents, HTTP versions, or cache headers did not eliminate the intermittent failures. Immediate retries could hit the same quota again. Google documents these 403 responses as temporary rate limits and recommends [exponential backoff](https://developers.google.com/workspace/drive/api/guides/handle-errors#ratelimitexceeded).
-
-Origin requests now identify those structured quota errors and HTTP 429, retry with bounded exponential backoff and jitter, honor `Retry-After`, and remain cancelable. Error-body inspection is limited to 16 KiB and two seconds. Exhausted retries return a sanitized provider-rate-limit error without exposing the response, signed URLs, or credentials. The file reader does not restart an exhausted quota retry loop. Ordinary permission errors remain distinct.
-
-The live VLC run also exposed unnecessary startup reads: FFmpeg's zero-frame init command still waited for a marked key packet in this AV1 file. It downloaded more than 100 MiB while scanning for one. Adding `-copyinkf` to initialization lets that command stop without publishing media packets. A separate live check returned the 900-byte init in 0.977 seconds, with 3.91 MB of total origin reads including file indexing.
-
-With both fixes in the rebuilt ordinary server, VLC decoded AV1 video and selected Italian Vixsrc audio. Startup took 59.23 seconds during provider throttling; a seek to four minutes advanced through 245 seconds with 623 new video frames and 1,296 new audio blocks. The session recorded no errors. These are bounded startup and seek checks, not full-title validation, and persistent upstream quotas can still exhaust a playback deadline. Private traces and VLC counters remain under ignored `.local/403-check/` files.
-
-New regressions cover quota recovery across redirects and file preparation/remuxing, preserved range and origin headers, ordinary permission responses, bounded retries and private errors, cancellation during backoff, `Retry-After`, and the independence of quota backoff from the file header timer. The AV1 regression now decodes remuxed segments using the separately generated initialization map. The full race suite, `go vet`, module verification, Linux/Android builds, and VLC playback/seek tests for Matroska, MPEG-TS HLS, and fMP4 HLS passed.
+Automated tests do not cover browser rendering, physical Stremio/Nuvio
+players, full-title playback, or third-party uptime. There is no CI workflow
+in this repository. Android APK and device validation belongs to
+[DubLiftApp](https://github.com/joojoooo/DubLiftApp).
