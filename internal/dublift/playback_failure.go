@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -80,11 +81,37 @@ func (e *Engine) preparationErrorVideo(ctx context.Context, err error) ([]byte, 
 	if closeErr != nil {
 		return nil, closeErr
 	}
-	filter := fmt.Sprintf("drawtext=font=Sans:textfile=%s:expansion=none:fontcolor=white:fontsize=29:line_spacing=9:x=(w-text_w)/2:y=(h-text_h)/2", escapeDrawtextPath(file.Name()))
+	font := "font=Sans"
+	encoder := "libx264"
+	profile := "baseline"
+	if runtime.GOOS == "android" {
+		// Android has system fonts but no desktop fontconfig database.
+		font = ""
+		for _, name := range []string{"Roboto-Regular.ttf", "RobotoStatic-Regular.ttf", "NotoSans-Regular.ttf", "Roboto-VF.ttf"} {
+			candidate := "/system/fonts/" + name
+			if _, failure := os.Stat(candidate); failure == nil {
+				font = "fontfile='" + candidate + "'"
+				break
+			}
+		}
+		if font == "" {
+			return nil, errors.New("no Android system font found for the error screen")
+		}
+		encoder = "libopenh264"
+		profile = "constrained_baseline"
+	}
+	filter := fmt.Sprintf("drawtext=%s:textfile=%s:expansion=none:fontcolor=white:fontsize=29:line_spacing=9:x=(w-text_w)/2:y=(h-text_h)/2", font, escapeDrawtextPath(file.Name()))
+	encoderArgs := []string{"-c:v", encoder}
+	if runtime.GOOS != "android" {
+		encoderArgs = append(encoderArgs, "-preset", "ultrafast")
+	}
+	// VLC's Android HLS playback can display black for a 1 fps clip.
 	args := []string{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=0x101820:s=1280x720:r=10",
-		"-t", decimal(errorScreenDuration), "-vf", filter, "-an", "-c:v", "libx264", "-preset", "ultrafast",
-		"-threads", "1", "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-g", "20", "-bf", "0",
-		"-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"}
+		"-t", decimal(errorScreenDuration), "-vf", filter, "-an"}
+	args = append(args, encoderArgs...)
+	args = append(args,
+		"-threads", "1", "-pix_fmt", "yuv420p", "-profile:v", profile, "-g", "20", "-bf", "0",
+		"-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
 	return e.run(ctx, e.Config.Get().FFmpeg, args, 4<<20)
 }
 
