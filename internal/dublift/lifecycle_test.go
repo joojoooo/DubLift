@@ -21,12 +21,21 @@ func lifecycleServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg := c.Get()
+	cfg.Sources[1].Disabled = true // Ordinary fixtures never contact Movy.
+	if err := c.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
 	s, err := NewServer(c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+func withMovyDisabled(sources []Source) []Source {
+	return append(sources, Source{Type: "movy", Name: "Movy", BaseURL: "https://www.movy.sx", Disabled: true})
 }
 
 func TestFileVideoLookaheadMovesWithSeek(t *testing.T) {
@@ -122,7 +131,7 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			}
 			s := lifecycleServer(t)
 			cfg := s.Config.Get()
-			cfg.Sources = []Source{{Type: "addon", Name: "Slow", ManifestURL: origin.URL + "/slow/manifest.json"}, {Type: "addon", Name: "Fast", ManifestURL: origin.URL + "/fast/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}}
+			cfg.Sources = withMovyDisabled([]Source{{Type: "addon", Name: "Slow", ManifestURL: origin.URL + "/slow/manifest.json"}, {Type: "addon", Name: "Fast", ManifestURL: origin.URL + "/fast/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}})
 			if err := s.Config.Save(cfg); err != nil {
 				t.Fatal(err)
 			}
@@ -239,7 +248,7 @@ func TestListingDefersPreparationAndRequiresItalian(t *testing.T) {
 	}
 	s := lifecycleServer(t)
 	cfg := s.Config.Get()
-	cfg.Sources = []Source{{Type: "addon", Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}}
+	cfg.Sources = withMovyDisabled([]Source{{Type: "addon", Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}})
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}

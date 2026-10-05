@@ -57,6 +57,8 @@ type ProbeStream struct {
 	Index     int    `json:"index"`
 	CodecType string `json:"codec_type"`
 	CodecName string `json:"codec_name"`
+	CodecTag  string `json:"codec_tag_string"`
+	Extradata string `json:"extradata"`
 	Width     int    `json:"width"`
 	Height    int    `json:"height"`
 	StartTime string `json:"start_time"`
@@ -771,7 +773,7 @@ func (e *Engine) ProbeAt(ctx context.Context, a *Asset, at float64) (Probe, erro
 		return p, err
 	}
 	defer cleanup()
-	args := []string{"-v", "error", "-protocol_whitelist", "http,tcp,crypto", "-probesize", "4000000", "-analyzeduration", "4000000", "-show_streams", "-show_format", "-of", "json"}
+	args := []string{"-v", "error", "-protocol_whitelist", "http,tcp,crypto", "-probesize", "4000000", "-analyzeduration", "4000000", "-show_streams", "-show_data", "-show_format", "-of", "json"}
 	if a.HLS != nil {
 		args = append(args, hlsInputOptions()...)
 	} else {

@@ -30,6 +30,8 @@ type result struct {
 	UpstreamErrors []string `json:"upstreamErrors,omitempty"`
 	VixLanguages   []string `json:"vixLanguages,omitempty"`
 	VixError       string   `json:"vixError,omitempty"`
+	MovyStreams    int      `json:"movyStreams,omitempty"`
+	MovyError      string   `json:"movyError,omitempty"`
 }
 
 func main() {
@@ -86,6 +88,23 @@ func main() {
 					if strings.HasPrefix(s.URL, "https://") || strings.HasPrefix(s.URL, "http://") {
 						r.Streams++
 						if strings.Contains(strings.ToLower(s.URL), ".m3u8") || strings.HasSuffix(strings.ToLower(s.BehaviorHints.Filename), ".m3u8") {
+							r.HLS++
+						}
+					}
+				}
+			}
+			if movy := settings.Source("movy"); !movy.Disabled {
+				content, _ := dublift.ParseContent(t.Type, id)
+				work, done := context.WithTimeout(ctx, 40*time.Second)
+				streams, err := network.ResolveMovy(work, movy.BaseURL, content, t.ID)
+				done()
+				if err != nil {
+					r.MovyError = err.Error()
+				} else {
+					r.MovyStreams = len(streams)
+					r.Streams += len(streams)
+					for _, stream := range streams {
+						if strings.HasSuffix(strings.ToLower(stream.BehaviorHints.Filename), ".m3u8") {
 							r.HLS++
 						}
 					}

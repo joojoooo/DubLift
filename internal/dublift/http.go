@@ -10,6 +10,7 @@ import (
 	"net/http/cookiejar"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -26,6 +27,8 @@ type Network struct {
 	Bytes              atomic.Int64
 	rangeHeaderTimeout time.Duration
 	rateLimitWait      func(context.Context, time.Duration) error
+	movyMu             sync.Mutex
+	movyRegistry       movyRegistry
 }
 
 // Video bytes are counted on each origin read, including while a range

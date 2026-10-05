@@ -421,6 +421,23 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case "/movie/603":
+			io.WriteString(w, movyPage("603", "movie", "Fixture title"))
+		case "/tv/81349/1/1":
+			io.WriteString(w, movyPage("81349", "tv", "Fixture title"))
+		case "/_next/static/chunks/player.js":
+			io.WriteString(w, `/seattle/sources`)
+		case "/movy-api/seed":
+			io.WriteString(w, `{"seed":"fixture-seed"}`)
+		case "/movy-api/seattle/sources":
+			id, _ := strconv.ParseUint(r.URL.Query().Get("tmdbId"), 10, 32)
+			io.WriteString(w, movyEnvelope(t, movyPayload{Sources: []movySource{{URL: origin.URL + "/movy-video.m3u8", Quality: "1080p", Type: "hls"}}}, "fixture-seed", uint32(id)))
+		case "/movy-subtitles/search":
+			io.WriteString(w, `[]`)
+		case "/movy-video.m3u8":
+			// Movy's direct fMP4 playlist has muxed English audio and no master
+			// supplying CODECS, as with the live 2160p series source.
+			http.ServeFile(w, r, filepath.Join(dir, "fmp4.m3u8"))
 		case "/manifest.json":
 			io.WriteString(w, `{"id":"fixture","resources":["stream"],"types":["movie","series"]}`)
 		case "/meta/movie/tmdb:603.json", "/meta/series/tmdb:81349.json":
@@ -444,7 +461,7 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	}
 	settings := cfg.Get()
 	settings.PublicURL = "" // Test clients use the httptest listener, not the host LAN address.
-	settings.Sources = []Source{{Type: "addon", Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}}
+	settings.Sources = []Source{{Type: "addon", Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}, {Type: "movy", BaseURL: origin.URL}}
 	if e = cfg.Save(settings); e != nil {
 		t.Fatal(e)
 	}
@@ -453,13 +470,14 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer server.Close()
+	mockMovyNetwork(server.Net, origin.URL)
 	local := httptest.NewServer(server)
 	defer local.Close()
 	var streams struct {
 		Streams []Stream `json:"streams"`
 	}
 	getJSON(t, local.URL+"/stream/movie/tmdb:603.json", &streams)
-	if len(streams.Streams) != 3 {
+	if len(streams.Streams) != 4 {
 		t.Fatalf("streams: %+v", streams)
 	}
 	for _, stream := range streams.Streams {
@@ -504,6 +522,11 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			}
 			id := strings.Split(strings.TrimPrefix(stream.URL, local.URL+"/media/"), "/")[0]
 			session := server.getSession(id)
+			if session.video.HLS != nil {
+				if len(parsed.Variants[0].Codecs) != 2 || !strings.HasPrefix(parsed.Variants[0].Codecs[0], "avc1.") || parsed.Variants[0].Codecs[1] != "mp4a.40.2" {
+					t.Fatalf("HLS master lacks source video and Italian AAC codecs:\n%s", master)
+				}
+			}
 			// Immediate file alignment uses a complete playback window. Start
 			// with the segment this simulated player watches after seeking.
 			if session.video.File != nil {
@@ -789,7 +812,7 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 		t.Fatal("new lookup retained old session links")
 	}
 	getJSON(t, local.URL+"/stream/series/tmdb:81349:1:1.json", &series)
-	if len(series.Streams) != 3 {
+	if len(series.Streams) != 4 {
 		t.Fatal("episode streams missing")
 	}
 	request, _ := http.NewRequest("GET", local.URL+"/api/settings", nil)

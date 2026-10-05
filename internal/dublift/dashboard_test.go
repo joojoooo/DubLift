@@ -87,7 +87,7 @@ func TestDashboardSetupAndAddonName(t *testing.T) {
 	cfg.AlignmentSampleSeconds = 24
 	response = post("/api/settings", cfg)
 	response.Body.Close()
-	if c.Get().Sources[1].Name != "Fixture Addon" || c.Get().AlignmentSampleSeconds != 24 {
+	if c.Get().Sources[2].Name != "Fixture Addon" || c.Get().AlignmentSampleSeconds != 24 {
 		t.Fatal("settings did not save the upstream name and sample length")
 	}
 	response = post("/api/setup-complete", struct{}{})
@@ -132,11 +132,14 @@ func TestStreamSourceFormatUsesCheckedMedia(t *testing.T) {
 func TestDashboardSourcesKeepDistinctStablePrivateIdentities(t *testing.T) {
 	s := lifecycleServer(t)
 	cfg := s.Config.Get()
+	// Keep the disabled Movy card after the addons for these index checks.
+	cfg.Sources = cfg.Sources[:1]
 	cfg.Sources = append(cfg.Sources,
 		Source{Type: "addon", Name: "Same name", ManifestURL: "https://addon.test/fixture-credential/manifest.json"},
 		Source{Type: "addon", Name: "Same name", ManifestURL: "https://addon.test/other/manifest.json"},
 		Source{Type: "addon", Name: "Hidden", ManifestURL: "https://hidden.test/manifest.json", Disabled: true},
 	)
+	cfg.Sources = withMovyDisabled(cfg.Sources)
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}

@@ -19,7 +19,7 @@ func TestSourceConfigPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Get()
-	cfg.Sources = []Source{{Type: "addon", Name: "First", ManifestURL: "https://first.test/manifest.json"}, {Type: "addon", Name: "Second", ManifestURL: "https://second.test/manifest.json"}, {Type: "vixsrc", Name: "VixSrc", BaseURL: "https://vix.test"}}
+	cfg.Sources = withMovyDisabled([]Source{{Type: "addon", Name: "First", ManifestURL: "https://first.test/manifest.json"}, {Type: "addon", Name: "Second", ManifestURL: "https://second.test/manifest.json"}, {Type: "vixsrc", Name: "VixSrc", BaseURL: "https://vix.test"}})
 	cfg.Sources[0], cfg.Sources[2] = cfg.Sources[2], cfg.Sources[0]
 	cfg.Sources[0].Disabled = true
 	cfg.SetupCompleted = true
@@ -72,7 +72,9 @@ func TestSourceValidation(t *testing.T) {
 		}
 	}
 	cfg := DefaultSettings()
-	cfg.Sources[0].Disabled = true
+	for i := range cfg.Sources {
+		cfg.Sources[i].Disabled = true
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal("all sources may be hidden", err)
 	}
@@ -83,6 +85,7 @@ func TestSourceSettingsAPIAndFixedIcon(t *testing.T) {
 	cfg := s.Config.Get()
 	cfg.Sources[0].Disabled = true
 	cfg.Sources[0].BaseURL = "https://configured.test"
+	cfg.Sources[1].BaseURL = "https://configured-movy.test"
 	data, _ := json.Marshal(cfg)
 	req := httptest.NewRequest("POST", "/api/settings", bytes.NewReader(data))
 	req.Header.Set("Content-Type", "application/json")
@@ -91,7 +94,7 @@ func TestSourceSettingsAPIAndFixedIcon(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
-	if !s.Config.Get().Sources[0].Disabled || s.Config.Get().Sources[0].BaseURL != "https://configured.test" {
+	if !s.Config.Get().Sources[0].Disabled || s.Config.Get().Source("vixsrc").BaseURL != "https://configured.test" || s.Config.Get().Source("movy").BaseURL != "https://configured-movy.test" {
 		t.Fatal("settings did not persist")
 	}
 	w = httptest.NewRecorder()
@@ -101,13 +104,18 @@ func TestSourceSettingsAPIAndFixedIcon(t *testing.T) {
 	}
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "/api/source-types", nil))
-	if w.Code != 200 || !strings.Contains(w.Body.String(), `"urlLabel":"Vixsrc base URL"`) || !strings.Contains(w.Body.String(), `"italianAudio":true`) {
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"urlLabel":"Vixsrc base URL"`) || !strings.Contains(w.Body.String(), `"italianAudio":true`) || !strings.Contains(w.Body.String(), `"type":"movy","name":"Movy","icon":"/movy.png","urlLabel":"Movy base URL"`) || !strings.Contains(w.Body.String(), `"italianAudio":false`) {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "/vixsrc.ico", nil))
 	if w.Code != 200 || w.Body.Len() == 0 {
 		t.Fatal("missing embedded VixSrc icon")
+	}
+	w = httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("GET", "/movy.png", nil))
+	if w.Code != 200 || w.Header().Get("Content-Type") != "image/png" || w.Body.Len() == 0 {
+		t.Fatal("missing embedded Movy icon")
 	}
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "/api/settings", nil))

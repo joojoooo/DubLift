@@ -17,7 +17,8 @@ make release
 ```
 
 - **Tests:** local mock servers and synthetic media check discovery,
-  config version resets, source toggles/order, upstream preservation, VixSrc
+  config version resets, source toggles/order, upstream preservation, Movy
+  metadata decoding/server discovery and VixSrc audio integration, VixSrc
   qualities and native playback across restarts, HTTP ranges and retries,
   HLS proxying, file remuxing/timing, generated audio, alignment, dashboard APIs, and
   session/cache lifecycle. The race detector checks executed Go code for data
@@ -67,6 +68,8 @@ DUBLIFT_VLC_TESTS=1 go test ./internal/dublift -run '^TestVirtualHLSEndToEnd$' -
 
 This uses synthetic MKV, MPEG-TS HLS, and fMP4 HLS sources. It requires VLC
 to decode video and select Italian audio both before and after a seek.
+If VLC's custom HTTP client fails local connections (observed with the Snap
+build), add `DUBLIFT_VLC_USE_ACCESS=1` to test with `--adaptive-use-access`.
 
 With upstream addons configured in a private config, run:
 
@@ -74,7 +77,7 @@ With upstream addons configured in a private config, run:
 go run ./cmd/dublift-check -config .local/config.json -out .local/live-report.json
 ```
 
-The checker fetches stream lists and Vixsrc manifests for its built-in title
+The checker fetches enabled addon/Movy stream lists and Vixsrc manifests for its built-in title
 set (S1E1 for series). It reports availability and errors; it does not assert
 success, decode playback, or download complete titles. Keep reports private.
 
@@ -82,6 +85,7 @@ success, decode playback, or download complete titles. Keep reports private.
 
 - Start `./bin/dublift` with a private test config. Check `/healthz`, guided
   setup, settings save/reload, source toggles/reordering/removal, VixSrc-only setup,
+  Movy URL edits and preparation with VixSrc video disabled,
   and manifest installation.
 - Check desktop and narrow mobile dashboard layouts, browser errors,
   stream ordering/filtering, preparation, and manual timing/reset controls.

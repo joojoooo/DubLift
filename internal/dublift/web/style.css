@@ -396,7 +396,8 @@ input[type="range"] {
 .source:hover, .source:focus-within { border-color: #536542; }
 .source-details { grid-area: details; display: flex; align-items: center; gap: 10px; min-width: 0; }
 .source-icon { width: 34px; height: 34px; flex: 0 0 34px; border-radius: 9px; object-fit: contain; background: #26322c; }
-.source[data-type="vixsrc"] img.source-icon { padding: 5px; }
+.source[data-type="vixsrc"] img.source-icon,
+.source[data-type="movy"] img.source-icon { padding: 5px; }
 .source-icon-fallback { display: grid; place-items: center; color: var(--accent); font-size: 17px; font-weight: 650; }
 .source-loading .source-icon-fallback::after {
   content: "";

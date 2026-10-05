@@ -27,7 +27,7 @@ func (t contentMetadataTransport) RoundTrip(r *http.Request) (*http.Response, er
 }
 
 func TestContentNameConsistentAcrossResolvers(t *testing.T) {
-	const details = "📺 1280×720 · 📶 1.8 Mbps\n🎞️ avc1.640028 / mp4a.40.2"
+	const details = "📺 1280×720 · 📶 1.8 Mbps\n🎞️ H.264 / AAC"
 	const description = "🍿 Inception (2010)\n📺 1080p\n💾 4 GB"
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -72,7 +72,7 @@ func TestContentNameConsistentAcrossResolvers(t *testing.T) {
 			s.Net.Client.Transport = contentMetadataTransport{base: s.Net.Client.Transport, target: target}
 			cfg := s.Config.Get()
 			cfg.FFmpeg, cfg.FFprobe = "/missing/ffmpeg", "/missing/ffprobe"
-			cfg.Sources = []Source{{Type: "vixsrc", BaseURL: origin.URL}}
+			cfg.Sources = withMovyDisabled([]Source{{Type: "vixsrc", BaseURL: origin.URL}})
 			if !tc.nativeOnly {
 				cfg.Sources = append(cfg.Sources, Source{Type: "addon", Name: "PenguPlay", ManifestURL: origin.URL + "/addon/manifest.json"})
 			}
@@ -195,7 +195,7 @@ func TestContentMetadataOnlyUpdatesItsOwnLiveSessions(t *testing.T) {
 			playing := s.newSession(c, Stream{})
 			first.ContentName, playing.ContentName = "Old fallback", "Old fallback"
 			cfg := s.Config.Get()
-			cfg.Sources = []Source{{Type: "addon", ManifestURL: origin.URL + "/manifest.json"}}
+			cfg.Sources = withMovyDisabled([]Source{{Type: "addon", ManifestURL: origin.URL + "/manifest.json"}})
 			done := make(chan struct{})
 			go func() {
 				s.resolveContentName(c, cfg, []*Session{first, playing})

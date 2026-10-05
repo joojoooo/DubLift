@@ -122,7 +122,19 @@ func vixQualityStreams(h *HLS) []sourceQuality {
 			lines = append(lines, strings.Join(details, " · "))
 		}
 		if len(variant.Codecs) > 0 {
-			lines = append(lines, "🎞️ "+strings.Join(variant.Codecs, " / "))
+			labels := make([]string, len(variant.Codecs))
+			for i, codec := range variant.Codecs {
+				name := strings.ToLower(codec)
+				switch {
+				case strings.HasPrefix(name, "avc1."), strings.HasPrefix(name, "avc3."):
+					labels[i] = "H.264"
+				case name == "mp4a.40.2", name == "mp4a.40.5", name == "mp4a.40.29":
+					labels[i] = "AAC"
+				default:
+					labels[i] = codec
+				}
+			}
+			lines = append(lines, "🎞️ "+strings.Join(labels, " / "))
 		}
 		result := create(quality, strings.Join(lines, "\n"), origin.URL, masterHasItalian(h, variant))
 		if label := formatBitrate(bitrate); label != "" {

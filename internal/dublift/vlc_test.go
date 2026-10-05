@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -30,7 +31,11 @@ func checkVLCPlaybackAndSeek(t *testing.T, mediaURL string, seek int) {
 	password := token()
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, vlc, "--ignore-config", "--no-one-instance", "--intf=dummy", "--extraintf=http", "--http-host=127.0.0.1", "--http-port="+strconv.Itoa(port), "--http-password="+password, "--aout=dummy", "--vout=dummy", "--no-video-title-show", mediaURL)
+	args := []string{"--ignore-config", "--no-one-instance", "--intf=dummy", "--extraintf=http", "--http-host=127.0.0.1", "--http-port=" + strconv.Itoa(port), "--http-password=" + password, "--aout=dummy", "--vout=dummy", "--no-video-title-show"}
+	if os.Getenv("DUBLIFT_VLC_USE_ACCESS") == "1" {
+		args = append(args, "--adaptive-use-access")
+	}
+	cmd := exec.CommandContext(ctx, vlc, append(args, mediaURL)...)
 	if err = cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

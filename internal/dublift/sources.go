@@ -19,6 +19,7 @@ type sourceDefinition struct {
 
 var builtinSources = []sourceDefinition{
 	{Type: "vixsrc", Name: "VixSrc", Icon: "/vixsrc.ico", URLLabel: "Vixsrc base URL", DefaultURL: "https://vixsrc.to", ItalianAudio: true},
+	{Type: "movy", Name: "Movy", Icon: "/movy.png", URLLabel: "Movy base URL", DefaultURL: movyDefaultURL},
 }
 
 type dashboardSource struct {

@@ -60,7 +60,7 @@ func (s *Server) inspectSource(ctx context.Context, stream Stream) (*Asset, *HLS
 	var variant *playlist.MultivariantVariant
 	if a.HLS != nil && a.HLS.Master != nil {
 		master = a.HLS
-		variant, err = master.BestVariant()
+		variant, err = nativeVariant(master, stream.variantURL)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -159,18 +159,26 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, 40*time.Second)
 	defer fetchCancel()
 	cfg := s.Config.Get()
-	type addonResult struct {
+	type providerResult struct {
 		streams []Stream
 		err     error
 	}
-	addons := make([]addonResult, len(cfg.Sources))
+	providers := make([]providerResult, len(cfg.Sources))
 	var wg sync.WaitGroup
-	for i, addon := range cfg.Sources {
-		if addon.Type != "addon" || addon.Disabled {
+	for i, source := range cfg.Sources {
+		if source.Disabled || (source.Type != "addon" && source.Type != "movy") {
 			continue
 		}
 		wg.Go(func() {
-			u, _ := url.Parse(addon.ManifestURL)
+			if source.Type == "movy" {
+				id, err := s.Net.ResolveTMDB(fetchCtx, c, cfg.TMDBToken)
+				if err == nil {
+					providers[i].streams, err = s.Net.ResolveMovy(fetchCtx, source.BaseURL, c, id)
+				}
+				providers[i].err = err
+				return
+			}
+			u, _ := url.Parse(source.ManifestURL)
 			id := c.ID
 			if c.TMDB != "" && !strings.HasPrefix(id, "tmdb:") {
 				id = "tmdb:" + id
@@ -184,7 +192,7 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 			if e == nil {
 				e = json.Unmarshal(b, &response)
 			}
-			addons[i] = addonResult{response.Streams, e}
+			providers[i] = providerResult{response.Streams, e}
 		})
 	}
 	bundleReady := make(chan vixBundle, 1)
@@ -213,7 +221,7 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 			}
 			continue
 		}
-		result := addons[i]
+		result := providers[i]
 		if result.err != nil {
 			s.event(source.Name + ": " + result.err.Error())
 		}

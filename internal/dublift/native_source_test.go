@@ -109,7 +109,7 @@ func TestNativePlaybackRestartRecoversCookiesAndSelectedQuality(t *testing.T) {
 			cfg := s.Config.Get()
 			cfg.PublicURL = ""
 			cfg.FFmpeg, cfg.FFprobe = "/missing/ffmpeg", "/missing/ffprobe"
-			cfg.Sources = []Source{{Type: "vixsrc", BaseURL: origin.URL + "/private"}}
+			cfg.Sources = withMovyDisabled([]Source{{Type: "vixsrc", BaseURL: origin.URL + "/private"}})
 			if err := s.Config.Save(cfg); err != nil {
 				t.Fatal(err)
 			}
@@ -255,12 +255,12 @@ func TestVixNativeQualitiesOrderingAndPlayback(t *testing.T) {
 	cfg := s.Config.Get()
 	cfg.PublicURL = ""
 	cfg.FFmpeg, cfg.FFprobe = "/missing/ffmpeg", "/missing/ffprobe"
-	cfg.Sources = []Source{
+	cfg.Sources = withMovyDisabled([]Source{
 		{Type: "addon", Name: "First", ManifestURL: origin.URL + "/first/manifest.json"},
 		{Type: "vixsrc", BaseURL: origin.URL},
 		{Type: "addon", Name: "Disabled", ManifestURL: origin.URL + "/disabled/manifest.json", Disabled: true},
 		{Type: "addon", Name: "Last", ManifestURL: origin.URL + "/last/manifest.json"},
-	}
+	})
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +394,7 @@ func TestVixNativeQualitiesOrderingAndPlayback(t *testing.T) {
 		t.Fatal("resume lost native playback quality", err)
 	}
 	// VixSrc remains useful with no addons configured.
-	cfg.Sources = []Source{{Type: "vixsrc", BaseURL: origin.URL}}
+	cfg.Sources = withMovyDisabled([]Source{{Type: "vixsrc", BaseURL: origin.URL}})
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}

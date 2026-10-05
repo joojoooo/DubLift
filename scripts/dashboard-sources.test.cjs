@@ -14,6 +14,7 @@ const finishCode = app.slice(app.indexOf('async function finishWizard('), app.in
 const nextCode = app.slice(app.indexOf('$("wizard-next").onclick'), app.indexOf('$("preset").onchange'));
 const clone = value => JSON.parse(JSON.stringify(value));
 const vix = { type: 'vixsrc', name: 'VixSrc', baseURL: 'https://vix.test', disabled: false };
+const movy = { type: 'movy', name: 'Movy', baseURL: 'https://movy.test', disabled: false };
 const addon = name => ({ type: 'addon', name, manifestURL: `https://${name.toLowerCase()}.test/manifest.json`, disabled: false });
 
 class Element {
@@ -114,7 +115,7 @@ function fixture(sources = [vix], options = {}) {
     initial: clone(stored),
   });
   vm.runInContext(sourceCode + addCode + configCode + finishCode + nextCode, context);
-  vm.runInContext('settings = initial; sourceTypes = [{ type: "vixsrc", name: "VixSrc", urlLabel: "Vixsrc base URL", icon: "/vixsrc.ico" }]; renderSources($("sources"), settings.sources); renderSources($("wizard-sources"), settings.sources);', context);
+  vm.runInContext('settings = initial; sourceTypes = [{ type: "vixsrc", name: "VixSrc", urlLabel: "Vixsrc base URL", icon: "/vixsrc.ico", italianAudio: true }, { type: "movy", name: "Movy", urlLabel: "Movy base URL", icon: "/movy.png", italianAudio: false }]; renderSources($("sources"), settings.sources); renderSources($("wizard-sources"), settings.sources);', context);
   return {
     id: id => ids.get(id),
     run: code => vm.runInContext(code, context),
@@ -545,4 +546,34 @@ test('finishing setup and pending source changes cannot overwrite each other', a
   assert.equal(h.stored().sources[0].name, 'First');
   assert.equal(h.stored().sources[0].disabled, true);
   assert.equal(h.maxActive(), 1);
+});
+
+test('Movy uses its built-in icon and saves URL, visibility and order in both views', async () => {
+  for (const containerID of ['sources', 'wizard-sources']) {
+    const h = fixture([vix, movy]);
+    const row = h.id(containerID).children[1];
+    assert.equal(row.querySelector('.source-name').textContent, 'Movy');
+    assert.equal(row.querySelector('.source-icon').src, '/movy.png');
+    assert.equal(row.querySelector('.source-icon').hidden, false);
+    assert.equal(row.querySelector('.source-url').textContent, 'Movy base URL');
+    assert.equal(row.querySelector('.source-remove'), null);
+    enterURL(row, 'https://new-movy.test');
+    row.querySelector('[data-source-url]').listeners.change();
+    await h.settle();
+    const toggle = row.querySelector('.source-enabled');
+    toggle.checked = false; toggle.onchange();
+    row.querySelector('.source-up').onclick();
+    await h.settle();
+    assert.deepEqual(h.stored().sources, [{ ...movy, baseURL: 'https://new-movy.test', disabled: true }, vix]);
+    assert.equal(h.manifestRequests.length, 0);
+    const other = h.id(containerID === 'sources' ? 'wizard-sources' : 'sources').children[0];
+    assert.equal(other.querySelector('[data-source-url]').value, 'https://new-movy.test');
+    assert.equal(other.querySelector('.source-icon').src, '/movy.png');
+    assert.equal(other.querySelector('.source-enabled').checked, false);
+    enterURL(row, 'file:///tmp/video');
+    row.querySelector('[data-source-url]').listeners.change();
+    await h.settle();
+    assert.equal(h.stored().sources[0].baseURL, 'https://new-movy.test');
+    assert.match(h.id('toast').textContent, /valid HTTP\(S\) URL/);
+  }
 });

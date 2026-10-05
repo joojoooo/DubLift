@@ -83,6 +83,7 @@ func TestCurrentConfigValidationDoesNotReset(t *testing.T) {
 	for name, sources := range map[string][]Source{
 		"missing sources":  nil,
 		"missing built-in": {},
+		"missing Movy":     {{Type: "vixsrc", Name: "VixSrc", BaseURL: "https://vix.test"}},
 		"invalid URL":      {{Type: "vixsrc", Name: "VixSrc", BaseURL: "file:///old/video"}},
 	} {
 		t.Run(name, func(t *testing.T) {

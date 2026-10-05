@@ -17,7 +17,10 @@ import (
 )
 
 type Stream struct {
-	raw           json.RawMessage
+	raw json.RawMessage
+	// A Movy extensionless HLS master can advertise several qualities. Keep
+	// the master URL (and its audio groups) while selecting one video variant.
+	variantURL    string
 	Name          string            `json:"name,omitempty"`
 	Title         string            `json:"title,omitempty"`
 	Description   string            `json:"description,omitempty"`
@@ -228,6 +231,9 @@ func (s *Server) newSessionLocked(c Content, stream Stream) *Session {
 }
 func (s *Server) newSessionIDLocked(c Content, stream Stream, id string) *Session {
 	key := identity(c.Type, c.ID, stream.URL, fmt.Sprint(stream.Origin().Headers))
+	if stream.variantURL != "" {
+		key = identity(key, stream.variantURL)
+	}
 	ctx, cancel := context.WithCancel(context.WithValue(s.ctx, cacheOwnerKey{}, id))
 	v := &Session{ID: id, Key: key, lookupKey: key, Content: c, Name: stream.Name, Created: time.Now(), LastUsed: time.Now(), Status: "Available · waiting for player", Errors: []string{}, stream: stream, ready: make(chan struct{}), videoBase: -1, videoReady: map[int]bool{}, videoChanged: make(chan struct{}), resources: map[string]resource{}, ctx: ctx, cancel: cancel}
 	s.sessions[v.ID] = v
@@ -345,6 +351,17 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 		return errors.New("source contains no playable video track")
 	}
 	if a.HLS != nil {
+		// Direct media playlists (including Movy's 2160p results) have no
+		// STREAM-INF codec metadata. VLC needs it to distinguish muxed source
+		// audio from the added Italian rendition. Reuse the bounded probe.
+		if v.variant == nil {
+			v.variant = &playlist.MultivariantVariant{Bandwidth: 20000000}
+		}
+		if len(v.variant.Codecs) == 0 {
+			if codec := probeVideoCodec(p); codec != "" {
+				v.variant.Codecs = []string{codec}
+			}
+		}
 		v.clockBase, _ = strconv.ParseFloat(p.Format.StartTime, 64)
 		// Some fMP4 packagers include the initial encoder gap in EXTINF.
 		// The first packet's PTS is then not the origin of the playlist clock.
