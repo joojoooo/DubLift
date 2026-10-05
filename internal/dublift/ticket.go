@@ -17,12 +17,15 @@ import (
 // A small encrypted ticket lets their URL recreate a discarded session without
 // keeping old result lists, credentials or media caches resident on the server.
 type playbackTicket struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Content string `json:"content"`
-	Stream  Stream `json:"stream"`
-	Order   int    `json:"order"`
-	Expires int64  `json:"expires"`
+	ID         string          `json:"id"`
+	Type       string          `json:"type"`
+	Content    string          `json:"content"`
+	Stream     Stream          `json:"stream"`
+	Order      int             `json:"order"`
+	Expires    int64           `json:"expires"`
+	Native     *nativePlayback `json:"native,omitempty"`
+	SourceID   string          `json:"sourceID,omitempty"`
+	SourceName string          `json:"sourceName,omitempty"`
 }
 
 func openPlaybackKey(configPath string) (cipher.AEAD, error) {
@@ -60,7 +63,7 @@ func openPlaybackKey(configPath string) (cipher.AEAD, error) {
 }
 
 func (s *Server) sealPlayback(v *Session) string {
-	b, err := json.Marshal(playbackTicket{v.ID, v.Content.Type, v.Content.ID, v.stream, v.Order, time.Now().Add(time.Hour).Unix()})
+	b, err := json.Marshal(playbackTicket{ID: v.ID, Type: v.Content.Type, Content: v.Content.ID, Stream: v.stream, Order: v.Order, Expires: time.Now().Add(time.Hour).Unix(), Native: v.native, SourceID: v.SourceID, SourceName: v.SourceName})
 	if err != nil || len(b) > 16<<10 {
 		return ""
 	}
@@ -112,7 +115,8 @@ func (s *Server) restorePlayback(id, encoded string) (*Session, error) {
 		return v, nil
 	}
 	v := s.newSessionIDLocked(c, ticket.Stream, id)
-	v.Order, v.ticket = ticket.Order, encoded
+	v.Order, v.ticket, v.native = ticket.Order, encoded, ticket.Native
+	v.SourceID, v.SourceName = ticket.SourceID, ticket.SourceName
 	v.ContentName = fallbackContentName(c, ticket.Stream)
 	return v, nil
 }

@@ -40,10 +40,11 @@
           <p class="help install-warning"><strong>Stremio doesn't allow adding HTTP addons directly.</strong> Use <a class="inline-link" href="https://gateniomer.github.io/stremio-addon-manager/" target="_blank" rel="noopener noreferrer">Stremio Addon Manager ↗</a> to sync the addon to your Stremio account.</p>
         </div>
         <div class="wizard-step" data-step="1" hidden>
-          <h3>Connect upstream addons</h3>
-          <p class="help">Paste an upstream addon manifest URL to get started. Need one? <a class="inline-link" href="https://pengu.uk/" target="_blank" rel="noopener noreferrer">PenguPlay</a> is a recommended option.</p>
-          <div id="wizard-addons"></div>
-          <button id="wizard-add-addon" type="button" class="text-button">+ Add upstream addon</button>
+          <h3>Choose your sources</h3>
+          <p class="help">Built-in sources are included. Add optional upstream addon manifest URLs for more video sources. Need one? <a class="inline-link" href="https://pengu.uk/" target="_blank" rel="noopener noreferrer">PenguPlay</a> is a recommended option.</p>
+          <p class="help">Switch a source on to include its videos in your player. VixSrc still supplies Italian audio when switched off. Use the arrows to set source order.</p>
+          <div id="wizard-sources"></div>
+          <button id="wizard-add-source" type="button" class="text-button">+ Add addon source</button>
         </div>
         <div class="wizard-actions">
           <button id="wizard-back" class="button secondary" type="button" hidden>Back</button>
@@ -90,16 +91,19 @@
           </div>
           <p id="lookup-status" class="help" role="status"></p>
           <p class="help">Choose a stream below to prepare it, or open its DubLift URL in your player.</p>
-          <details class="results-help">
-            <summary>How stream results work</summary>
-            <p class="help">New lookups replace these results while keeping current playback. Selecting another stream replaces the current playback. Inactive sessions and their caches expire after one hour.</p>
-          </details>
-          <div id="stream-filters" class="stream-filters" role="group" aria-label="Filter streams">
-            <span class="small">FILTER STREAMS</span>
-            <button id="filter-italian" type="button" aria-pressed="false">Italian</button>
-            <button id="filter-hls" type="button" aria-pressed="false">HLS</button>
-            <button id="filter-mkv" type="button" aria-pressed="false">MKV</button>
-            <button id="filter-mp4" type="button" aria-pressed="false">MP4</button>
+          <div class="results-filters">
+            <div id="stream-filters" class="stream-filters" role="group" aria-label="Filter by stream type">
+              <span class="small">TYPE</span>
+              <button id="filter-italian" type="button" aria-label="Italian" aria-pressed="false">ITA</button>
+              <button id="filter-hls" type="button" aria-pressed="false">HLS</button>
+              <button id="filter-mkv" type="button" aria-pressed="false">MKV</button>
+              <button id="filter-mp4" type="button" aria-pressed="false">MP4</button>
+            </div>
+            <div id="source-filters" class="stream-filters source-filters" role="group" aria-label="Filter by source">
+              <span class="small">SOURCES</span>
+              <button id="filter-all-sources" type="button" aria-pressed="true">All</button>
+              <div id="source-filter-options" class="source-filter-options"></div>
+            </div>
             <span id="filter-count" class="help" role="status"></span>
           </div>
           <div id="sessions" class="session-list">
@@ -160,7 +164,7 @@
               </div>
               <p class="help">
                 Series IDs include the episode: <code>tmdb:81349:1:1</code>. IDs
-                are forwarded to the configured addon.
+                are sent to the configured sources.
               </p>
               <button class="button secondary" type="submit">
                 Find streams →</button
@@ -181,16 +185,16 @@
           <form id="settings-form" class="panel settings">
             <div class="section-heading">
               <div>
-                <span class="eyebrow">UPSTREAM</span>
+                <span class="eyebrow">SOURCES</span>
                 <h2>Source settings</h2>
               </div>
             </div>
             <p class="help">
-              Addon changes apply to new stream lookups.
+              Switch a source on to include its videos in your player. VixSrc still supplies Italian audio when switched off. Use the arrows to set source order. Changes save automatically for new lookups.
             </p>
-            <div id="addons"></div>
-            <button id="add-addon" type="button" class="text-button">
-              + Add upstream addon
+            <div id="sources"></div>
+            <button id="add-source" type="button" class="text-button">
+              + Add addon source
             </button>
             <hr />
             <h3>Audio alignment</h3>
@@ -246,11 +250,6 @@
                   required /></label
               ><label>FFmpeg executable<input id="ffmpeg" required /></label
               ><label>ffprobe executable<input id="ffprobe" required /></label
-              ><label
-                >Vixsrc base URL<input
-                  id="vix-base"
-                  type="url"
-                  required /></label
               ><label
                 >TMDB API read token
                 <small>Optional title names and IMDb lookup</small

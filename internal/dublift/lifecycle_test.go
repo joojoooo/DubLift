@@ -122,8 +122,7 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			}
 			s := lifecycleServer(t)
 			cfg := s.Config.Get()
-			cfg.VixBaseURL = origin.URL
-			cfg.Addons = []Addon{{"Slow", origin.URL + "/slow/manifest.json"}, {"Fast", origin.URL + "/fast/manifest.json"}}
+			cfg.Sources = []Source{{Type: "addon", Name: "Slow", ManifestURL: origin.URL + "/slow/manifest.json"}, {Type: "addon", Name: "Fast", ManifestURL: origin.URL + "/fast/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}}
 			if err := s.Config.Save(cfg); err != nil {
 				t.Fatal(err)
 			}
@@ -170,9 +169,10 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			s.ServeHTTP(w, httptest.NewRequest("GET", "/api/status", nil))
 			var state struct {
 				Sessions []struct {
-					Name               string
-					Order              int
-					Title, Description string
+					Name                 string
+					Order                int
+					Title, Description   string
+					SourceID, SourceName string
 				}
 			}
 			json.Unmarshal(w.Body.Bytes(), &state)
@@ -182,6 +182,13 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			for i, name := range []string{"Zulu · 4K", "Torrent", "Alpha", "External", "Nearby"} {
 				if state.Sessions[i].Name != name || state.Sessions[i].Order != i {
 					t.Fatal(state)
+				}
+				provider := cfg.Sources[0].dashboardSource()
+				if i >= 2 {
+					provider = cfg.Sources[1].dashboardSource()
+				}
+				if state.Sessions[i].SourceID != provider.ID || state.Sessions[i].SourceName != provider.Name {
+					t.Fatal("dashboard lost the source of an addon or fallback stream")
 				}
 			}
 			if state.Sessions[0].Title != "The Matrix\nFull title and size" || state.Sessions[0].Description != "All provider details\nSecond line" {
@@ -232,8 +239,7 @@ func TestListingDefersPreparationAndRequiresItalian(t *testing.T) {
 	}
 	s := lifecycleServer(t)
 	cfg := s.Config.Get()
-	cfg.VixBaseURL = origin.URL
-	cfg.Addons = []Addon{{Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}}
+	cfg.Sources = []Source{{Type: "addon", Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}}
 	if err := s.Config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}

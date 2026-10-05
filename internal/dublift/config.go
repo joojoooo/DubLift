@@ -14,29 +14,36 @@ import (
 	"sync"
 )
 
-type Addon struct {
+// Bump this when the config format changes. Unsupported versions reset to
+// defaults; there are currently no config migrations.
+const currentConfigVersion = 1
+
+type Source struct {
+	Type        string `json:"type"`
 	Name        string `json:"name"`
-	ManifestURL string `json:"manifestURL"`
+	ManifestURL string `json:"manifestURL,omitempty"`
+	BaseURL     string `json:"baseURL,omitempty"`
+	Disabled    bool   `json:"disabled"`
 }
 
 type Settings struct {
-	Listen                 string  `json:"listen"`
-	PublicURL              string  `json:"publicURL"`
-	MinConfidence          float64 `json:"minConfidence"`
-	SearchRadius           float64 `json:"searchRadius"`
-	AlignmentSampleSeconds int     `json:"alignmentSampleSeconds"`
-	AlignmentSamples       int     `json:"alignmentSamples"`
-	CacheMB                int     `json:"cacheMB"`
-	FFmpeg                 string  `json:"ffmpeg"`
-	FFprobe                string  `json:"ffprobe"`
-	VixBaseURL             string  `json:"vixBaseURL"`
-	TMDBToken              string  `json:"tmdbToken"`
-	Addons                 []Addon `json:"addons"`
-	SetupCompleted         bool    `json:"setupCompleted"`
+	ConfigVersion          int      `json:"configVersion"`
+	Listen                 string   `json:"listen"`
+	PublicURL              string   `json:"publicURL"`
+	MinConfidence          float64  `json:"minConfidence"`
+	SearchRadius           float64  `json:"searchRadius"`
+	AlignmentSampleSeconds int      `json:"alignmentSampleSeconds"`
+	AlignmentSamples       int      `json:"alignmentSamples"`
+	CacheMB                int      `json:"cacheMB"`
+	FFmpeg                 string   `json:"ffmpeg"`
+	FFprobe                string   `json:"ffprobe"`
+	TMDBToken              string   `json:"tmdbToken"`
+	Sources                []Source `json:"sources"`
+	SetupCompleted         bool     `json:"setupCompleted"`
 }
 
 func DefaultSettings() Settings {
-	return Settings{Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", VixBaseURL: "https://vixsrc.to", Addons: []Addon{}}
+	return Settings{ConfigVersion: currentConfigVersion, Listen: "0.0.0.0:7000", PublicURL: defaultPublicURL(), MinConfidence: .68, SearchRadius: 10, AlignmentSampleSeconds: 5, AlignmentSamples: 1, CacheMB: 256, FFmpeg: "ffmpeg", FFprobe: "ffprobe", Sources: defaultSources()}
 }
 
 func defaultPublicURL() string {
@@ -79,6 +86,9 @@ func httpURL(raw string) (*url.URL, error) {
 }
 
 func (c Settings) Validate() error {
+	if c.ConfigVersion != currentConfigVersion {
+		return errors.New("unsupported config version; reload the dashboard")
+	}
 	if c.AlignmentSampleSeconds < 5 || c.AlignmentSampleSeconds > 40 {
 		return errors.New("alignment sample length must be 5–40 seconds")
 	}
@@ -97,26 +107,12 @@ func (c Settings) Validate() error {
 	if c.FFmpeg == "" || c.FFprobe == "" {
 		return errors.New("FFmpeg and ffprobe paths are required")
 	}
-	if _, e := httpURL(c.VixBaseURL); e != nil {
-		return e
-	}
 	if c.PublicURL != "" {
 		if _, e := httpURL(c.PublicURL); e != nil {
 			return e
 		}
 	}
-	if len(c.Addons) > 20 {
-		return errors.New("at most 20 upstream addons")
-	}
-	for _, a := range c.Addons {
-		if _, e := httpURL(a.ManifestURL); e != nil {
-			return e
-		}
-		if !strings.HasSuffix(strings.Split(a.ManifestURL, "?")[0], "/manifest.json") {
-			return errors.New("upstream URL must end with /manifest.json")
-		}
-	}
-	return nil
+	return validateSources(c.Sources)
 }
 
 type Config struct {
@@ -134,9 +130,23 @@ func OpenConfig(path string) (*Config, error) {
 	if e != nil {
 		return nil, e
 	}
+	// Read the version before decoding settings: an unsupported format may use
+	// incompatible field types and must be replaced as a whole.
+	var header struct {
+		ConfigVersion json.RawMessage `json:"configVersion"`
+	}
+	if e = json.Unmarshal(b, &header); e != nil {
+		return nil, e
+	}
+	var version int
+	if e = json.Unmarshal(header.ConfigVersion, &version); e != nil || version != currentConfigVersion {
+		return c, c.Save(c.value)
+	}
+	c.value.Sources = nil
 	if e = json.Unmarshal(b, &c.value); e != nil {
 		return nil, e
 	}
+	c.value = c.value.normalizedSources()
 	if e = c.value.Validate(); e != nil {
 		return nil, e
 	}
@@ -149,10 +159,11 @@ func (c *Config) Get() Settings {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	s := c.value
-	s.Addons = append([]Addon{}, s.Addons...)
+	s.Sources = append([]Source{}, s.Sources...)
 	return s
 }
 func (c *Config) Save(s Settings) error {
+	s = s.normalizedSources()
 	if e := s.Validate(); e != nil {
 		return e
 	}
@@ -161,6 +172,7 @@ func (c *Config) Save(s Settings) error {
 	if e := atomicJSON(c.path, s); e != nil {
 		return e
 	}
+	s.Sources = append([]Source{}, s.Sources...)
 	c.value = s
 	return nil
 }

@@ -20,6 +20,7 @@ func TestCachedPlaybackLinksSurviveCleanupAndRestart(t *testing.T) {
 	json.Unmarshal([]byte(`{"name":"Original name","title":"Devs S01E02","url":"https://origin.test/video.m3u8?private=secret-value","behaviorHints":{"proxyHeaders":{"request":{"Cookie":"session=secret-cookie"}}},"providerData":true}`), &stream)
 	v := s.newSession(c, stream)
 	v.Order = 7
+	v.SourceID, v.SourceName = "fixture-source-id", "Fixture addon"
 	v.ticket = s.sealPlayback(v)
 	url := s.playbackURL(httptest.NewRequest("GET", "http://local.test/", nil), v)
 	if strings.Contains(url, "secret") || v.ticket == "" {
@@ -46,13 +47,20 @@ func TestCachedPlaybackLinksSurviveCleanupAndRestart(t *testing.T) {
 	if restored.ctx.Err() != nil {
 		t.Fatal("restored session inherited canceled work")
 	}
+	if restored.SourceID != v.SourceID || restored.SourceName != v.SourceName {
+		t.Fatal("restored session lost its source filter identity")
+	}
 	s2, err := NewServer(s.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	if _, err = s2.restorePlayback(v.ID, v.ticket); err != nil {
+	restarted, err := s2.restorePlayback(v.ID, v.ticket)
+	if err != nil {
 		t.Fatal("restart invalidated cached stream links", err)
+	}
+	if restarted.SourceID != v.SourceID || restarted.SourceName != v.SourceName {
+		t.Fatal("restart lost the source of a cached playback link")
 	}
 }
 

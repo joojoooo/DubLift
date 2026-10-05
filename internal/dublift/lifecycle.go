@@ -34,7 +34,7 @@ func (s *Server) beginLookup() (uint64, context.Context) {
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	s.lookupCancel = cancel
-	s.lookupStatus = "Fetching upstream streams and checking Italian audio…"
+	s.lookupStatus = "Fetching source streams and checking Italian audio…"
 	return s.generation, ctx
 }
 

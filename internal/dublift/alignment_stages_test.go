@@ -181,7 +181,7 @@ func TestFailedDashboardAlignmentRetriesAtPlaybackPosition(t *testing.T) {
 	}
 }
 
-func TestLegacyStartupAndTimeoutSettingsAreIgnoredAndRemovedOnSave(t *testing.T) {
+func TestLegacyStartupAndTimeoutConfigResetsToDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"startImmediately":false,"preparationTimeoutSeconds":240,"alignmentDownloadTimeoutSeconds":600,"alignmentTimeoutSeconds":1,"alignmentSamples":4}`), 0600); err != nil {
 		t.Fatal(err)
@@ -191,11 +191,8 @@ func TestLegacyStartupAndTimeoutSettingsAreIgnoredAndRemovedOnSave(t *testing.T)
 		t.Fatal(err)
 	}
 	cfg := c.Get()
-	if cfg.AlignmentSamples != 4 {
-		t.Fatal("existing alignment settings lost", cfg)
-	}
-	if err := c.Save(cfg); err != nil {
-		t.Fatal(err)
+	if cfg.AlignmentSamples != DefaultSettings().AlignmentSamples || cfg.ConfigVersion != currentConfigVersion || cfg.SetupCompleted {
+		t.Fatal("legacy settings did not reset to versioned defaults", cfg)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

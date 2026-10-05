@@ -57,10 +57,16 @@ func (s Stream) MarshalJSON() ([]byte, error) {
 	return json.Marshal(plain(s))
 }
 func (s Stream) dubbed(local string) Stream {
+	return s.localPlayback(local, true)
+}
+
+func (s Stream) localPlayback(local string, italian bool) Stream {
 	b, _ := json.Marshal(s)
 	var fields map[string]json.RawMessage
 	json.Unmarshal(b, &fields)
-	fields["name"], _ = json.Marshal("🇮🇹 " + s.Name)
+	if italian {
+		fields["name"], _ = json.Marshal("🇮🇹 " + s.Name)
+	}
 	fields["url"], _ = json.Marshal(local)
 	var hints map[string]json.RawMessage
 	json.Unmarshal(fields["behaviorHints"], &hints)
@@ -101,6 +107,8 @@ type Session struct {
 	Content                  Content `json:"content"`
 	Name                     string  `json:"name"`
 	ContentName              string
+	SourceID                 string
+	SourceName               string
 	Order                    int
 	Playing                  bool
 	PlaybackAt               time.Time
@@ -122,6 +130,8 @@ type Session struct {
 	videoDownload            videoDownload
 	Aligning                 bool `json:"aligning"`
 	Revision                 int  `json:"revision"`
+	native                   *nativePlayback
+	nativeMaster             *HLS
 	stream                   Stream
 	prepare                  sync.Once
 	preparationStarted       bool
@@ -156,10 +166,11 @@ type Session struct {
 	cancel                   context.CancelFunc
 }
 type resource struct {
-	Origin   Origin
-	Position float64
-	Track    bool
-	Video    bool
+	Origin        Origin
+	Position      float64
+	Track         bool
+	Video         bool
+	PlaylistDepth int
 }
 
 func (s *Session) note(err error) {
@@ -203,7 +214,7 @@ func (s *Session) state(status string) { s.mu.Lock(); s.Status = status; s.mu.Un
 func (s *Session) addResource(o Origin, position float64, track, video bool) string {
 	key := identity(o.URL, fmt.Sprint(o.Headers), strconv.FormatBool(track), strconv.FormatBool(video), decimal(position))[:32]
 	s.mu.Lock()
-	s.resources[key] = resource{o, position, track, video}
+	s.resources[key] = resource{Origin: o, Position: position, Track: track, Video: video}
 	s.mu.Unlock()
 	return "/media/" + s.ID + "/resource/" + key
 }
@@ -243,7 +254,11 @@ func (s *Server) prepareSession(ctx context.Context, v *Session) error {
 				v.prepareErr = errors.New(v.FallbackReason)
 				return
 			}
-			v.prepareErr = s.prepareMedia(work, v)
+			if v.native != nil {
+				v.prepareErr = s.prepareNative(work, v)
+			} else {
+				v.prepareErr = s.prepareMedia(work, v)
+			}
 			if v.prepareErr == nil {
 				v.prepareErr = work.Err()
 			}

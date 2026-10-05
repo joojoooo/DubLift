@@ -1,5 +1,8 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
+let sourceTypes = [];
+let settingsWrite = Promise.resolve();
+const sourceWrites = new Map();
 let settings,
   toastTimer,
   latestStatus,
@@ -7,8 +10,12 @@ let settings,
   manifestBaseline = null;
 const cards = new Map();
 const addonDetailsCache = new Map();
+const addonDetailsRequests = new Map();
 const streamFilters = { italian: false, hls: false, mkv: false, mp4: false };
 const streamFilterKey = "dublift.streamFilters.v1";
+const sourceFilters = new Set();
+const sourceFilterKey = "dublift.sourceFilters.v1";
+const sourceFilterButtons = new Map();
 async function api(path, data) {
   const response = await fetch(
     path,
@@ -25,15 +32,21 @@ async function api(path, data) {
   return result;
 }
 function lookupAddonDetails(url) {
-  if (!addonDetailsCache.has(url)) {
-    const request = api("/api/addon-name", { manifestURL: url });
-    addonDetailsCache.set(url, request);
+  if (addonDetailsCache.has(url)) return Promise.resolve(addonDetailsCache.get(url));
+  if (!addonDetailsRequests.has(url)) {
+    const request = api("/api/addon-name", { manifestURL: url }).then((result) => {
+      addonDetailsCache.set(url, result);
+      // Bound successful lookups, including URLs edited during this page visit.
+      if (addonDetailsCache.size > 64) addonDetailsCache.delete(addonDetailsCache.keys().next().value);
+      return result;
+    });
+    addonDetailsRequests.set(url, request);
     const clear = () => {
-      if (addonDetailsCache.get(url) === request) addonDetailsCache.delete(url);
+      if (addonDetailsRequests.get(url) === request) addonDetailsRequests.delete(url);
     };
     request.then(clear, clear);
   }
-  return addonDetailsCache.get(url);
+  return addonDetailsRequests.get(url);
 }
 function toast(message) {
   $("toast").textContent = message;
@@ -73,62 +86,210 @@ function completeAddonURL(input) {
     return ["http:", "https:"].includes(url.protocol) && url.pathname.endsWith("/manifest.json");
   } catch { return false; }
 }
-function syncAddonControls(container) {
-  const rows = [...container.children];
-  const button = container === $("addons") ? $("add-addon") : $("wizard-add-addon");
-  button.disabled = rows.length >= 20 || rows.some((row) => !completeAddonURL(row.querySelector("input")));
-  for (const row of rows) row.querySelector(".remove").hidden = rows.length <= 1;
+function completeSourceURL(row) {
+  const input = row.querySelector("[data-source-url]");
+  if (row.dataset.type === "addon") return completeAddonURL(input);
+  try {
+    return input.checkValidity() && ["http:", "https:"].includes(new URL(input.value.trim()).protocol);
+  } catch { return false; }
 }
-function addonRow(addon = { name: "", manifestURL: "" }, container = $("addons")) {
+function syncSourceControls(container) {
+  const rows = [...container.children];
+  const addons = rows.filter((row) => row.dataset.type === "addon");
+  const button = container === $("sources") ? $("add-source") : $("wizard-add-source");
+  const waiting = !!sourceWrites.get(otherSourceContainer(container));
+  button.disabled = waiting || addons.length >= 20 || addons.some((row) => !completeSourceURL(row));
+  rows.forEach((row, index) => {
+    row.querySelector("[data-source-url]").disabled = waiting;
+    row.querySelector(".source-enabled").disabled = waiting;
+    const remove = row.querySelector(".source-remove");
+    if (remove) remove.disabled = waiting;
+    row.querySelector(".source-up").disabled = waiting || index === 0;
+    row.querySelector(".source-down").disabled = waiting || index === rows.length - 1;
+  });
+}
+function otherSourceContainer(container) {
+  return container === $("sources") ? $("wizard-sources") : $("sources");
+}
+function queueSettingsWrite(write) {
+  const request = settingsWrite.then(write);
+  settingsWrite = request.catch(() => {});
+  return request;
+}
+async function waitSettingsWrites() {
+  let pending;
+  do {
+    pending = settingsWrite;
+    await pending;
+  } while (pending !== settingsWrite);
+}
+function queueSettingsSave(buildConfig) {
+  return queueSettingsWrite(async () => {
+    settings = await api("/api/settings", buildConfig());
+    return settings;
+  });
+}
+function renderSources(container, sources) {
+  container.replaceChildren();
+  sources.forEach((source) => sourceRow(source, container));
+}
+function sourceKey(source) {
+  return source && (source.type === "addon" ? source.manifestURL : source.type);
+}
+function syncSources(container, sources) {
+  // Queued writes own their source order and toggles until they finish.
+  if (sourceWrites.get(container)) return;
+  const drafts = [...container.children].flatMap((row, index) => {
+    const current = readSource(row), saved = row.savedSource;
+    const urlKey = current.type === "addon" ? "manifestURL" : "baseURL";
+    return !saved || current[urlKey] !== saved[urlKey] || current.disabled !== !!saved.disabled
+      ? [{ row, index }] : [];
+  });
+  container.replaceChildren();
+  const retained = new Set();
+  for (const source of sources) {
+    const draft = drafts.find(({ row }) => !retained.has(row) &&
+      [row.savedSource, row.validatedSource].some((previous) => sourceKey(previous) === sourceKey(source)));
+    if (draft) {
+      const previous = draft.row.savedSource;
+      if (previous && readSource(draft.row).disabled === !!previous.disabled) {
+        draft.row.querySelector(".source-enabled").checked = !source.disabled;
+        draft.row.classList.toggle("source-disabled", !!source.disabled);
+      }
+      if (previous && sourceKey(draft.row.validatedSource) === sourceKey(previous)) {
+        draft.row.validatedSource = { ...source };
+      }
+      draft.row.savedSource = { ...source };
+      container.append(draft.row);
+      retained.add(draft.row);
+    } else sourceRow(source, container);
+  }
+  for (const { row, index } of drafts) {
+    if (retained.has(row)) continue;
+    if (index < container.children.length) container.insertBefore(row, container.children[index]);
+    else container.append(row);
+  }
+  syncSourceControls(container);
+}
+async function queueSourceSave(container, buildConfig, entries, syncCurrent = false) {
+  sourceWrites.set(container, (sourceWrites.get(container) || 0) + 1);
+  const other = otherSourceContainer(container);
+  syncSourceControls(other);
+  let saved;
+  try {
+    saved = await queueSettingsSave(buildConfig);
+    entries.forEach(({ row }, index) => { row.savedSource = { ...saved.sources[index] }; });
+  } finally {
+    sourceWrites.set(container, sourceWrites.get(container) - 1);
+    syncSourceControls(other);
+  }
+  syncSources(other, saved.sources);
+  if (syncCurrent) syncSources(container, saved.sources);
+  return saved;
+}
+async function saveSources(container) {
+  // The other view may still be saving a source addition or removal. Its
+  // controls are disabled, but an earlier manifest lookup can finish now.
+  // Wait for synchronization before collecting this view's source list.
+  if (sourceWrites.get(otherSourceContainer(container))) await waitSettingsWrites();
+  // Keep incomplete URL edits as drafts. Reordering or toggling other cards
+  // must still save, retaining each source's last validated URL, including
+  // changes already queued for saving.
+  const entries = [...container.children].flatMap((row) => {
+    const current = readSource(row);
+    const valid = completeSourceURL(row) && (current.type !== "addon" || row.dataset.validatedURL === current.manifestURL);
+    if (valid) row.validatedSource = { ...current };
+    const previous = row.validatedSource || row.savedSource;
+    const source = valid ? current : previous && { ...previous, disabled: current.disabled };
+    return source ? [{ row, source }] : [];
+  });
+  try {
+    await queueSourceSave(container, () => ({ ...settings, sources: entries.map(({ source }) => source) }), entries);
+  } catch (err) {
+    toast(`Sources not saved: ${err.message}`);
+  }
+}
+function sourceRow(source = { type: "addon", name: "", manifestURL: "" }, container = $("sources")) {
+  const builtin = sourceTypes.find((type) => type.type === source.type);
   const row = document.createElement("div");
-  row.className = "addon";
+  row.className = "source";
+  row.setAttribute("role", "group");
+  row.dataset.type = source.type;
+  row.savedSource = builtin || source.manifestURL ? { ...source } : null;
+  row.dataset.validatedURL = source.manifestURL || "";
   const details = document.createElement("div");
-  details.className = "addon-details";
-  details.hidden = true;
+  details.className = "source-details";
   const icon = document.createElement("img");
-  icon.className = "addon-icon";
+  icon.className = "source-icon";
   icon.alt = "";
   icon.hidden = true;
   const fallback = document.createElement("span");
-  fallback.className = "addon-icon addon-icon-fallback";
+  fallback.className = "source-icon source-icon-fallback";
+  fallback.setAttribute("aria-hidden", "true");
   const name = document.createElement("strong");
-  name.className = "addon-name";
-  details.append(icon, fallback, name);
+  name.className = "source-name";
+  const identity = document.createElement("div");
+  identity.className = "source-identity";
+  const kind = document.createElement("span");
+  kind.className = "source-kind";
+  kind.textContent = builtin ? "Built-in" : "Addon";
+  identity.append(name, kind);
+  details.append(icon, fallback, identity);
   row.append(details);
   const label = document.createElement("label");
-  label.textContent = "Manifest URL";
+  label.className = "source-url";
+  label.textContent = builtin?.urlLabel || "Manifest URL";
   const input = document.createElement("input");
   input.type = "url";
+  input.dataset.sourceUrl = "";
   input.autocomplete = "url";
   input.required = true;
-  input.value = addon.manifestURL;
+  input.value = builtin ? source.baseURL : source.manifestURL;
   const status = document.createElement("p");
-  status.className = "addon-status help";
+  status.className = "source-status help";
   status.setAttribute("role", "status");
   status.hidden = true;
   let debounce;
+  function setLoading(loading) {
+    row.classList.toggle("source-loading", loading);
+    row.setAttribute("aria-busy", String(loading));
+    fallback.textContent = loading ? "" : name.textContent.charAt(0).toUpperCase();
+    if (loading) {
+      icon.hidden = true;
+      fallback.hidden = false;
+    }
+  }
   function showDetails(result) {
     row.dataset.name = result.name;
+    row.setAttribute("aria-label", result.name);
     name.textContent = result.name;
-    fallback.textContent = result.name.charAt(0).toUpperCase();
+    setLoading(false);
     fallback.hidden = !!result.icon;
     icon.hidden = !result.icon;
-    if (result.icon) icon.src = result.icon;
-    details.hidden = false;
+    if (result.icon && icon.dataset.url !== result.icon) {
+      icon.dataset.url = result.icon;
+      icon.src = result.icon;
+    }
     status.hidden = true;
   }
   icon.onerror = () => { icon.hidden = true; fallback.hidden = false; };
-  async function fetchDetails() {
+  async function fetchDetails(save = false) {
+    if (builtin || !completeAddonURL(input)) return;
     const url = input.value.trim();
-    if (!url || !input.checkValidity()) return;
-    status.textContent = "Checking addon…";
-    status.hidden = false;
+    const cached = addonDetailsCache.get(url);
+    if (save && cached && row.dataset.validatedURL === url && row.savedSource?.manifestURL === url) return;
+    status.hidden = true;
+    if (!cached) setLoading(true);
     try {
-      const result = await lookupAddonDetails(url);
-      if (input.value.trim() === url) showDetails(result);
+      const result = cached || await lookupAddonDetails(url);
+      if (input.value.trim() === url && row.isConnected) {
+        showDetails(result);
+        row.dataset.validatedURL = url;
+        if (save) await saveSources(container);
+      }
     } catch (err) {
-      if (input.value.trim() === url) {
-        details.hidden = true;
+      if (input.value.trim() === url && row.isConnected) {
+        setLoading(false);
         status.textContent = err.message;
         status.hidden = false;
       }
@@ -136,38 +297,106 @@ function addonRow(addon = { name: "", manifestURL: "" }, container = $("addons")
   }
   input.addEventListener("input", () => {
     clearTimeout(debounce);
-    details.hidden = true;
     status.hidden = true;
-    row.dataset.name = "";
-    if (input.checkValidity()) debounce = setTimeout(fetchDetails, 450);
-    syncAddonControls(container);
+    if (!builtin) {
+      const url = input.value.trim();
+      const cached = addonDetailsCache.get(url);
+      showDetails(cached || { name: "Addon source", icon: "" });
+      if (!cached) row.dataset.name = "";
+      row.dataset.validatedURL = cached ? url : "";
+      if (completeAddonURL(input)) {
+        if (!cached) setLoading(true);
+        debounce = setTimeout(() => fetchDetails(true), 450);
+      } else if (input.value.trim()) {
+        status.textContent = "Enter an HTTP(S) manifest URL ending in /manifest.json.";
+        status.hidden = false;
+      }
+    }
+    syncSourceControls(container);
   });
   input.addEventListener("change", () => {
     clearTimeout(debounce);
-    fetchDetails();
-    syncAddonControls(container);
+    if (builtin) {
+      if (completeSourceURL(row)) saveSources(container);
+      else toast("Source URL not saved: enter a valid HTTP(S) URL.");
+    } else fetchDetails(true);
+    syncSourceControls(container);
   });
   label.append(input);
   row.append(label, status);
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "text-button remove";
-  remove.textContent = "Remove addon";
-  remove.onclick = () => {
-    if (container.children.length <= 1) return;
-    row.remove();
-    syncAddonControls(container);
+  const controls = document.createElement("div");
+  controls.className = "source-controls";
+  const toggleLabel = document.createElement("label");
+  toggleLabel.className = "source-toggle";
+  const toggle = document.createElement("input");
+  toggle.type = "checkbox";
+  toggle.setAttribute("role", "switch");
+  toggle.setAttribute("aria-label", "Use this source for video");
+  toggle.title = "Include this source's video streams in your player";
+  toggle.checked = !source.disabled;
+  toggle.className = "source-enabled";
+  row.classList.toggle("source-disabled", !toggle.checked);
+  toggle.onchange = () => {
+    row.classList.toggle("source-disabled", !toggle.checked);
+    saveSources(container);
   };
-  row.append(remove);
+  toggleLabel.append(toggle);
+  controls.append(toggleLabel);
+  const actions = document.createElement("div");
+  actions.className = "source-actions";
+  const order = document.createElement("div");
+  order.className = "source-order";
+  order.setAttribute("role", "group");
+  order.setAttribute("aria-label", "Source order");
+  for (const [direction, symbol] of [["up", "↑"], ["down", "↓"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "text-button source-" + direction;
+    button.textContent = symbol;
+    button.title = "Move source " + direction;
+    button.setAttribute("aria-label", button.title);
+    button.onclick = () => {
+      const sibling = direction === "up" ? row.previousElementSibling : row.nextElementSibling;
+      if (!sibling) return;
+      if (direction === "up") container.insertBefore(row, sibling);
+      else container.insertBefore(sibling, row);
+      syncSourceControls(container);
+      saveSources(container);
+    };
+    order.append(button);
+  }
+  actions.append(order);
+  if (!builtin) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "text-button source-remove";
+    remove.textContent = "×";
+    remove.title = "Remove source";
+    remove.setAttribute("aria-label", "Remove source");
+    remove.onclick = () => {
+      clearTimeout(debounce);
+      row.remove();
+      syncSourceControls(container);
+      saveSources(container);
+    };
+    actions.append(remove);
+  }
+  controls.append(actions);
+  row.append(controls);
   container.append(row);
-  syncAddonControls(container);
-  if (addon.name && addon.manifestURL) showDetails({ name: addon.name, icon: "" });
-  if (addon.manifestURL) fetchDetails();
+  syncSourceControls(container);
+  const cached = !builtin && addonDetailsCache.get(source.manifestURL);
+  showDetails(cached || { name: builtin?.name || source.name || "Addon source", icon: builtin?.icon || "" });
+  if (!builtin && !source.name) row.dataset.name = "";
+  if (!builtin && source.manifestURL) fetchDetails();
 }
-const readAddons = (container) => [...container.children].map((row) => ({
+const readSource = (row) => ({
+  type: row.dataset.type,
   name: row.dataset.name || "",
-  manifestURL: row.querySelector("input").value.trim(),
-}));
+  [row.dataset.type === "addon" ? "manifestURL" : "baseURL"]: row.querySelector("[data-source-url]").value.trim(),
+  disabled: !row.querySelector(".source-enabled").checked,
+});
+const readSources = (container) => [...container.children].map(readSource);
 const inPlaybackSection = (session) => session.playing || session.preparationStarted;
 function applyStreamFilters(sessions) {
   let shown = 0;
@@ -179,9 +408,10 @@ function applyStreamFilters(sessions) {
       continue;
     }
     resultCount++;
-    const italian = session.listed !== false && !session.passthrough;
+    const italian = session.listed !== false && session.italian !== false && !session.passthrough;
     const format = !streamFilters.hls && !streamFilters.mkv && !streamFilters.mp4 || !!streamFilters[session.sourceFormat];
-    const matches = (!streamFilters.italian || italian) && format;
+    const source = !sourceFilters.size || sourceFilters.has(session.sourceID);
+    const matches = (!streamFilters.italian || italian) && format && source;
     card.hidden = !matches;
     if (matches) shown++;
   }
@@ -201,15 +431,77 @@ function setStreamFilters(next) {
   catch { /* The filters still work for this page session. */ }
   if (latestStatus) applyStreamFilters(latestStatus.sessions);
 }
+function updateSourceFilterButtons() {
+  $("filter-all-sources").setAttribute("aria-pressed", String(!sourceFilters.size));
+  for (const [id, button] of sourceFilterButtons) {
+    button.setAttribute("aria-pressed", String(sourceFilters.has(id)));
+  }
+}
+function setSourceFilters(next) {
+  sourceFilters.clear();
+  for (const id of next) {
+    if (typeof id === "string" && id) sourceFilters.add(id);
+  }
+  updateSourceFilterButtons();
+  try { localStorage.setItem(sourceFilterKey, JSON.stringify([...sourceFilters])); }
+  catch { /* The filters still work for this page session. */ }
+  if (latestStatus) applyStreamFilters(latestStatus.sessions);
+}
+function renderSourceFilters(sources, sessions) {
+  const available = new Map(sources.map((source) => [source.id, source.name]));
+  for (const session of sessions) {
+    if (session.sourceID && !available.has(session.sourceID)) {
+      available.set(session.sourceID, session.sourceName || "Addon source");
+    }
+  }
+  for (const [id, button] of sourceFilterButtons) {
+    if (!available.has(id)) {
+      button.remove();
+      sourceFilterButtons.delete(id);
+    }
+  }
+  const container = $("source-filter-options");
+  let index = 0;
+  for (const [id, name] of available) {
+    let button = sourceFilterButtons.get(id);
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.onclick = () => {
+        const next = new Set(sourceFilters);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        setSourceFilters(next);
+      };
+      sourceFilterButtons.set(id, button);
+    }
+    setText(button, name);
+    if (container.children[index] !== button) {
+      container.insertBefore(button, container.children[index] || null);
+    }
+    index++;
+  }
+  const selected = [...sourceFilters].filter((id) => available.has(id));
+  if (selected.length !== sourceFilters.size) setSourceFilters(selected);
+  else updateSourceFilterButtons();
+}
 try {
   const stored = JSON.parse(localStorage.getItem(streamFilterKey) || "{}");
   setStreamFilters(stored && typeof stored === "object" ? stored : {});
 } catch { setStreamFilters({}); }
+try {
+  const stored = JSON.parse(localStorage.getItem(sourceFilterKey) || "[]");
+  setSourceFilters(Array.isArray(stored) ? stored : []);
+} catch { setSourceFilters([]); }
 for (const key of Object.keys(streamFilters)) {
   $("filter-" + key).onclick = () =>
     setStreamFilters({ ...streamFilters, [key]: !streamFilters[key] });
 }
-$("clear-filters").onclick = () => setStreamFilters({});
+$("filter-all-sources").onclick = () => setSourceFilters([]);
+$("clear-filters").onclick = () => {
+  setStreamFilters({});
+  setSourceFilters([]);
+};
 $("redirect-original").onchange = async () => {
   const toggle = $("redirect-original");
   const enabled = toggle.checked;
@@ -232,42 +524,42 @@ const fields = {
   cacheMB: "cache-mb",
   ffmpeg: "ffmpeg",
   ffprobe: "ffprobe",
-  vixBaseURL: "vix-base",
   tmdbToken: "tmdb-token",
 };
 async function loadSettings() {
-  settings = await api("/api/settings");
+  [settings, sourceTypes] = await Promise.all([api("/api/settings"), api("/api/source-types")]);
   for (const [key, id] of Object.entries(fields))
     $(id).value = settings[key] ?? "";
   $("confidence").value = settings.minConfidence;
   confidenceLabel();
-  $("addons").replaceChildren();
-  settings.addons.forEach((addon) => addonRow(addon));
-  if (!settings.addons.length) addonRow(undefined, $("addons"));
-  $("wizard-addons").replaceChildren();
-  settings.addons.forEach((addon) => addonRow(addon, $("wizard-addons")));
-  if (!settings.addons.length) addonRow(undefined, $("wizard-addons"));
+  for (const container of [$("sources"), $("wizard-sources")]) {
+    renderSources(container, settings.sources);
+  }
 }
 function confidenceLabel() {
   $("confidence-value").textContent =
     Math.round(Number($("confidence").value) * 100) + "%";
 }
 $("confidence").oninput = confidenceLabel;
-$("add-addon").onclick = () => addonRow();
-$("wizard-add-addon").onclick = () => addonRow(undefined, $("wizard-addons"));
-async function saveConfig(cfg) {
-  settings = await api("/api/settings", cfg);
-  await loadSettings();
+for (const [buttonID, containerID] of [["add-source", "sources"], ["wizard-add-source", "wizard-sources"]]) {
+  $(buttonID).onclick = () => {
+    sourceRow(undefined, $(containerID));
+  };
+}
+async function saveConfig(cfg, container = $("sources")) {
+  const entries = cfg.sources ? [...container.children].map((row) => ({ row })) : [];
+  await queueSourceSave(container, () => ({ ...settings, ...cfg }), entries, true);
 }
 $("settings-form").onsubmit = async (e) => {
   e.preventDefault();
+  await waitSettingsWrites();
   const cfg = { ...settings };
   for (const [key, id] of Object.entries(fields))
     cfg[key] = ["searchRadius", "alignmentSampleSeconds", "alignmentSamples", "cacheMB"].includes(key)
       ? Number($(id).value)
       : $(id).value.trim();
   cfg.minConfidence = Number($("confidence").value);
-  cfg.addons = readAddons($("addons"));
+  cfg.sources = readSources($("sources"));
   try {
     await saveConfig(cfg);
     toast("Settings saved");
@@ -312,8 +604,10 @@ $("run-setup").onclick = startWizard;
 $("wizard-back").onclick = () => { setupStep--; renderWizard(); };
 async function finishWizard() {
   try {
-    await api("/api/setup-complete", {});
-    settings.setupCompleted = true;
+    await queueSettingsWrite(async () => {
+      await api("/api/setup-complete", {});
+      settings.setupCompleted = true;
+    });
     setupStep = -1;
     renderWizard();
     showView("streams");
@@ -328,13 +622,14 @@ $("wizard-next").onclick = async () => {
       setupStep = 1;
       renderWizard();
     } else if (setupStep === 1) {
-      const inputs = [...$("wizard-addons").querySelectorAll("input")];
-      if (!inputs.length || inputs.some((input) => !completeAddonURL(input))) {
-        $("wizard-error").textContent = "Enter an upstream HTTP(S) manifest URL ending in /manifest.json to continue.";
-        inputs.find((input) => !completeAddonURL(input))?.focus();
+      await waitSettingsWrites();
+      const invalid = [...$("wizard-sources").children].find((row) => !completeSourceURL(row));
+      if (invalid) {
+        $("wizard-error").textContent = "Enter a valid HTTP(S) source URL. Addon manifest URLs must end in /manifest.json.";
+        invalid.querySelector("[data-source-url]").focus();
         return;
       }
-      await saveConfig({ ...settings, addons: readAddons($("wizard-addons")) });
+      await saveConfig({ sources: readSources($("wizard-sources")) }, $("wizard-sources"));
       await finishWizard();
     }
   } catch (err) {
@@ -351,7 +646,7 @@ $("resolve-form").onsubmit = async (e) => {
   e.preventDefault();
   const button = e.target.querySelector("button");
   button.disabled = true;
-  $("resolve-status").textContent = "Querying configured addons…";
+  $("resolve-status").textContent = "Querying configured sources…";
   try {
     const r = await api("/api/resolve", {
       type: $("content-type").value,
@@ -480,6 +775,9 @@ function sessionMessages(v) {
   if (v.passthrough) {
     status = "Original stream · Italian audio was not added";
     progress = `${v.fallbackReason || "DubLift unavailable"}. Playback through the original link cannot be tracked here.`;
+  } else if (v.native) {
+    if (v.ready) status = "Ready · original source audio and video";
+    progress = "Source audio and subtitles use their original timing.";
   } else if (v.aligning) {
     progress = `Sample ${v.sampleIndex || 1} of ${v.sampleTotal || settings?.alignmentSamples || 1} · ${v.samplePhase || "Checking audio timing"}`;
   } else if (v.ready) {
@@ -554,8 +852,8 @@ function updateCard(v) {
     button.disabled = !!disabled || button.dataset.pending === "true";
   };
   disable(".prepare", v.listed === false);
-  card.querySelector(".session-metrics").hidden = !v.ready;
-  card.querySelector(".sync-controls").hidden = !v.ready;
+  card.querySelector(".session-metrics").hidden = !v.ready || !!v.native;
+  card.querySelector(".sync-controls").hidden = !v.ready || !!v.native;
   card.querySelector(".copy").textContent = v.passthrough ? "Copy original upstream URL" : "Copy DubLift URL";
   card.querySelector(".copy-original").hidden = v.passthrough || !v.originalUrl;
   disable(".realign", v.aligning || !v.ready || !positionKnown);
@@ -648,6 +946,7 @@ function renderStatus(state) {
       if (card.parentElement !== target) target.append(card);
     }
     $("playing-section").hidden = !state.sessions.some(inPlaybackSection);
+    renderSourceFilters(state.sources || [], state.sessions);
     applyStreamFilters(state.sessions);
     const events = state.events.length ? state.events : ["No events yet."];
     const key = JSON.stringify(events);

@@ -4,10 +4,42 @@ See the [README](../README.md) for installation and first setup.
 
 ## Configuration and network access
 
-Settings are stored in `.local/config.json` by default. Fresh installs have
-no upstream addons: add their HTTP(S) manifest URLs through the guided setup
-or **Settings**. Upstream changes apply to new lookups; changing the listen
-address requires a restart.
+Settings are stored in `.local/config.json` by default. Fresh installs include
+VixSrc and do not require an upstream addon. In **Settings → Source settings**,
+edit the fixed VixSrc card’s **Vixsrc base URL** or add optional addon sources
+using their HTTP(S) manifest URLs. Source changes apply to new lookups;
+changing the listen address requires a restart.
+
+Source changes save automatically. An addon is saved once its manifest loads;
+source ordering, visibility, removal, and built-in base URL changes save as
+you edit them. While one view saves sources, source editing in the other view
+waits for synchronization. The dashboard shows an error if saving fails.
+Loaded addon names and logos are reused until you reload the dashboard.
+Other settings use **Save settings**.
+
+Each source’s switch controls whether its videos appear in your
+player. Switching off VixSrc videos still allows its Italian audio to be used for
+other sources. Use the up/down arrows to set source order; results stay
+grouped in that order and addon results retain their original ordering. The
+X removes an addon source, even the last one. Built-in sources cannot be
+removed. These controls are also available during setup.
+
+In the dashboard's **Stream results**, **Sources** filters select VixSrc or
+individual addons independently of **TYPE** filters. Selecting multiple
+sources shows results from any of them; **All** removes only the source
+filter. Both filter groups combine and are remembered in your browser.
+**Clear filters** resets both groups. Playing and preparing streams stay visible
+in **Playback** regardless of filters.
+
+VixSrc lists each available HLS quality with its resolution and bitrate
+(preferably average bitrate), highest quality first. If its playlist has no
+quality metadata, DubLift offers **Auto quality**. VixSrc playback preserves
+its original audio and subtitles without audio alignment.
+
+The config stores `configVersion` (currently `1`) and an ordered `sources`
+array. On startup, a missing or unsupported version replaces the entire
+config with current defaults and starts the setup wizard again. No config
+migrations are currently available.
 
 ```sh
 ./bin/dublift -config /path/to/private/config.json
@@ -29,7 +61,7 @@ optional port (`IP:PORT`, or `[IPv6]:PORT`).
 
 ## Playback and synchronization
 
-Eligible HTTP(S) results receive a local DubLift URL when Vixsrc Italian
+Eligible addon HTTP(S) results receive a local DubLift URL when Vixsrc Italian
 audio is available. Torrents, external-player links, and results without
 Italian audio keep their original links. Source compatibility is checked
 when you prepare or play a result, so a listed result can still fail playback.

@@ -444,8 +444,7 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	}
 	settings := cfg.Get()
 	settings.PublicURL = "" // Test clients use the httptest listener, not the host LAN address.
-	settings.VixBaseURL = origin.URL
-	settings.Addons = []Addon{{"Fixture", origin.URL + "/manifest.json"}}
+	settings.Sources = []Source{{Type: "addon", Name: "Fixture", ManifestURL: origin.URL + "/manifest.json"}, {Type: "vixsrc", BaseURL: origin.URL, Disabled: true}}
 	if e = cfg.Save(settings); e != nil {
 		t.Fatal(e)
 	}

@@ -2,15 +2,17 @@
 
 **Your video sources, with synchronized Italian audio.**
 
-DubLift is a local HTTP addon for Stremio and Nuvio. It combines video from
-your configured upstream addons with Italian and English audio from Vixsrc,
-keeping the original video quality.
+DubLift is a local HTTP addon for Stremio and Nuvio. It lists VixSrc video on its own and alongside your configured upstream
+addons, and adds synchronized Italian audio to addon video without changing
+the original video quality.
 
 ## ✨ Features
 
 - Automatic audio synchronization using English reference tracks, with
   manual timing controls when you need them.
 - Video passes through without re-encoding; generated audio uses AAC.
+- VixSrc quality choices with resolution and bitrate, plus optional addon sources.
+- Source visibility toggles and ordering in the dashboard.
 - Finite HLS streams and indexed MKV/MP4 files over HTTP(S).
 - A browser dashboard for guided setup, stream preparation, audio timing,
   and playback diagnostics. Open playback URLs in VLC too.
@@ -41,8 +43,8 @@ go build -trimpath -o bin/dublift ./cmd/dublift
 ```
 
 1. Open [localhost:7000](http://localhost:7000).
-2. Follow the guided setup to install the addon in your player and connect
-   upstream addon manifest URLs. For Stremio, follow the **Stremio Addon
+2. Follow the guided setup to install the addon in your player and choose
+   sources. VixSrc works immediately; upstream addon manifest URLs are optional. For Stremio, follow the **Stremio Addon
    Manager** link shown in the dashboard.
 3. Choose a movie or episode in Stremio/Nuvio, then select a DubLift result
    marked with the Italian flag. Italian audio is the default track.

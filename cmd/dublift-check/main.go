@@ -60,7 +60,10 @@ func main() {
 				season = 1
 				episode = 1
 			}
-			for _, addon := range settings.Addons {
+			for _, addon := range settings.Sources {
+				if addon.Type != "addon" || addon.Disabled {
+					continue
+				}
 				u, e := url.Parse(addon.ManifestURL)
 				if e != nil {
 					continue
@@ -88,7 +91,7 @@ func main() {
 					}
 				}
 			}
-			origin, e := network.ResolveVix(ctx, settings.VixBaseURL, t.Type, t.ID, season, episode)
+			origin, e := network.ResolveVix(ctx, settings.Source("vixsrc").BaseURL, t.Type, t.ID, season, episode)
 			if e == nil {
 				h, err := network.LoadHLS(ctx, origin)
 				e = err

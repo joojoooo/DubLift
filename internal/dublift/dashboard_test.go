@@ -50,17 +50,15 @@ func TestDashboardSetupAndAddonName(t *testing.T) {
 		}
 		return response
 	}
-	empty, _ := json.Marshal(c.Get())
-	rejected, err := http.Post(local.URL+"/api/settings", "application/json", bytes.NewReader(empty))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rejected.Body.Close()
-	if rejected.StatusCode != 400 {
-		t.Fatalf("settings accepted zero upstream addons: %d", rejected.StatusCode)
+	response := post("/api/settings", c.Get())
+	response.Body.Close()
+	manifest := httptest.NewRecorder()
+	s.ServeHTTP(manifest, httptest.NewRequest("GET", "/manifest.json", nil))
+	if strings.Contains(manifest.Body.String(), `"configurationRequired":true`) {
+		t.Fatal("VixSrc alone should not require an addon")
 	}
 	url := upstream.URL + "/manifest.json"
-	response := post("/api/addon-name", map[string]string{"manifestURL": url})
+	response = post("/api/addon-name", map[string]string{"manifestURL": url})
 	var name struct {
 		Name string `json:"name"`
 		Icon string `json:"icon"`
@@ -85,11 +83,11 @@ func TestDashboardSetupAndAddonName(t *testing.T) {
 	}
 
 	cfg := c.Get()
-	cfg.Addons = []Addon{{Name: "User supplied name", ManifestURL: url}}
+	cfg.Sources = append(cfg.Sources, Source{Type: "addon", Name: "User supplied name", ManifestURL: url})
 	cfg.AlignmentSampleSeconds = 24
 	response = post("/api/settings", cfg)
 	response.Body.Close()
-	if c.Get().Addons[0].Name != "Fixture Addon" || c.Get().AlignmentSampleSeconds != 24 {
+	if c.Get().Sources[1].Name != "Fixture Addon" || c.Get().AlignmentSampleSeconds != 24 {
 		t.Fatal("settings did not save the upstream name and sample length")
 	}
 	response = post("/api/setup-complete", struct{}{})
@@ -128,6 +126,44 @@ func TestStreamSourceFormatUsesCheckedMedia(t *testing.T) {
 	}
 	if got := streamSourceFormat(Stream{URL: "https://origin.test/opaque"}, &Asset{Index: FileIndex{Container: "mp4"}}); got != "mp4" {
 		t.Fatalf("checked MP4 format not used: %s", got)
+	}
+}
+
+func TestDashboardSourcesKeepDistinctStablePrivateIdentities(t *testing.T) {
+	s := lifecycleServer(t)
+	cfg := s.Config.Get()
+	cfg.Sources = append(cfg.Sources,
+		Source{Type: "addon", Name: "Same name", ManifestURL: "https://addon.test/fixture-credential/manifest.json"},
+		Source{Type: "addon", Name: "Same name", ManifestURL: "https://addon.test/other/manifest.json"},
+		Source{Type: "addon", Name: "Hidden", ManifestURL: "https://hidden.test/manifest.json", Disabled: true},
+	)
+	if err := s.Config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("GET", "/api/status", nil)
+	sources := s.status(request)["sources"].([]dashboardSource)
+	if len(sources) != 3 || sources[0].Name != "VixSrc" || sources[1].Name != "Same name" || sources[2].Name != "Same name" {
+		t.Fatalf("unexpected dashboard sources: %v", sources)
+	}
+	if sources[1].ID == sources[2].ID || sources[0].ID == sources[1].ID {
+		t.Fatal("different sources share a filter identity")
+	}
+	b, err := json.Marshal(sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "fixture-credential") || strings.Contains(string(b), "addon.test") {
+		t.Fatal("source filters expose addon URLs or credentials")
+	}
+	cfg.Sources[1], cfg.Sources[2] = cfg.Sources[2], cfg.Sources[1]
+	cfg.Sources[2].Name = "Renamed"
+	cfg.Sources[0].BaseURL = "https://other-vix.test"
+	if err := s.Config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	updated := s.status(request)["sources"].([]dashboardSource)
+	if updated[0].ID != sources[0].ID || updated[1].ID != sources[2].ID || updated[2].ID != sources[1].ID || updated[2].Name != "Renamed" {
+		t.Fatal("source filters changed identity after editing source settings")
 	}
 }
 

@@ -17,8 +17,9 @@ make release
 ```
 
 - **Tests:** local mock servers and synthetic media check discovery,
-  upstream preservation/order, HTTP ranges and retries, HLS proxying, file
-  remuxing/timing, generated audio, alignment, dashboard APIs, and
+  config version resets, source toggles/order, upstream preservation, VixSrc
+  qualities and native playback across restarts, HTTP ranges and retries,
+  HLS proxying, file remuxing/timing, generated audio, alignment, dashboard APIs, and
   session/cache lifecycle. The race detector checks executed Go code for data
   races.
 - **Vet / module verification:** static Go diagnostics and cached dependency
@@ -33,6 +34,25 @@ Media tests skip when FFmpeg/ffprobe are missing. Fixtures also need the
 encoders used by the tests, including `libx264` and AAC; HEVC/AV1 tests skip
 without `libx265`/`libsvtav1`. Error-clip tests need `lavfi`, `drawtext`, and a
 usable font. Inspect skip messages before claiming media coverage.
+
+## Dashboard sources and filters
+
+For dashboard source-editing or filtering changes, also run the regressions with
+Node.js (no third-party packages are needed):
+
+```sh
+node --test scripts/dashboard-sources.test.cjs
+node --test scripts/dashboard-filters.test.cjs
+```
+
+These check valid addon additions, rapid reorder saves, draft URLs, failed
+saves, reuse of addon details on blur and reorder, lookup retries, source editing
+waiting for synchronization between settings and setup,
+manifest validation during pending saves, and preserving other settings.
+They use a small DOM fixture and do not check browser rendering. Filter checks
+cover combined source/type selections, saved
+preferences, source refreshes, result counts, and keeping playback visible.
+Node.js is not needed to run the server.
 
 ## Optional playback and provider checks
 
@@ -58,7 +78,8 @@ success, decode playback, or download complete titles. Keep reports private.
 ## Manual checks and gaps
 
 - Start `./bin/dublift` with a private test config. Check `/healthz`, guided
-  setup, settings save/reload, upstream editing, and manifest installation.
+  setup, settings save/reload, source toggles/reordering/removal, VixSrc-only setup,
+  and manifest installation.
 - Check desktop and narrow mobile dashboard layouts, browser errors,
   stream ordering/filtering, preparation, and manual timing/reset controls.
 - Play through Stremio/Nuvio and VLC: verify video and Italian audio at

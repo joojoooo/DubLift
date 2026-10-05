@@ -112,7 +112,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/manifest.json":
 		s.manifestRequests.Add(1)
-		jsonResponse(w, 200, map[string]any{"id": "local.dublift", "version": "0.1.0", "name": "DubLift", "logo": s.base(r) + "/icon.svg", "description": "Your high-quality streams with synchronized Italian audio. Runs on your local network.", "resources": []string{"stream"}, "types": []string{"movie", "series"}, "catalogs": []any{}, "behaviorHints": map[string]any{"configurable": true, "configurationRequired": len(s.Config.Get().Addons) == 0}})
+		jsonResponse(w, 200, map[string]any{"id": "local.dublift", "version": "0.1.0", "name": "DubLift", "logo": s.base(r) + "/icon.svg", "description": "Your high-quality streams with synchronized Italian audio. Runs on your local network.", "resources": []string{"stream"}, "types": []string{"movie", "series"}, "catalogs": []any{}, "behaviorHints": map[string]any{"configurable": true, "configurationRequired": !s.Config.Get().hasEnabledSource()}})
 	case strings.HasPrefix(r.URL.Path, "/stream/"):
 		s.streams(w, r)
 	case strings.HasPrefix(r.URL.Path, "/media/"):
@@ -163,6 +163,12 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.URL.Path {
+	case "/api/source-types":
+		if r.Method != "GET" {
+			w.WriteHeader(405)
+			return
+		}
+		jsonResponse(w, 200, builtinSources)
 	case "/api/settings":
 		if r.Method == "GET" {
 			jsonResponse(w, 200, s.Config.Get())
@@ -173,14 +179,13 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg := DefaultSettings()
+		cfg.ConfigVersion = 0 // Require the version supplied by the dashboard.
+		cfg.Sources = nil
 		if err := decodeRequest(w, r, &cfg); err != nil {
 			failure(w, 400, err)
 			return
 		}
-		if len(cfg.Addons) == 0 {
-			failure(w, 400, errors.New("at least one upstream addon is required"))
-			return
-		}
+		cfg = cfg.normalizedSources()
 		cfg.SetupCompleted = s.Config.Get().SetupCompleted
 		if err := cfg.Validate(); err != nil {
 			failure(w, 400, err)
@@ -287,6 +292,9 @@ func (s *Server) status(r *http.Request) map[string]any {
 		v.mu.Lock()
 		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, nil), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
 		view["contentType"] = v.Content.Type
+		view["sourceID"], view["sourceName"] = v.SourceID, v.SourceName
+		view["native"] = v.native != nil
+		view["italian"] = !v.Passthrough && (v.native == nil || v.native.Italian)
 		if v.Passthrough {
 			view["url"] = v.stream.URL
 		}
@@ -328,7 +336,13 @@ func (s *Server) status(r *http.Request) map[string]any {
 	lookupStatus := s.lookupStatus
 	s.mu.Unlock()
 	cfg := s.Config.Get()
-	return map[string]any{"sessions": snapshots, "redirectOriginal": s.redirectOriginal.Load(), "lookupStatus": lookupStatus, "events": events, "cacheBytes": s.Engine.Cache.Used(), "cacheMaxBytes": int64(cfg.CacheMB) << 20, "originBytes": s.Net.Bytes.Load(), "manifestURL": s.base(r) + "/manifest.json", "manifestRequests": s.manifestRequests.Load()}
+	sources := []dashboardSource{}
+	for _, source := range cfg.Sources {
+		if !source.Disabled {
+			sources = append(sources, source.dashboardSource())
+		}
+	}
+	return map[string]any{"sessions": snapshots, "sources": sources, "redirectOriginal": s.redirectOriginal.Load(), "lookupStatus": lookupStatus, "events": events, "cacheBytes": s.Engine.Cache.Used(), "cacheMaxBytes": int64(cfg.CacheMB) << 20, "originBytes": s.Net.Bytes.Load(), "manifestURL": s.base(r) + "/manifest.json", "manifestRequests": s.manifestRequests.Load()}
 }
 
 func streamSourceFormat(stream Stream, asset *Asset) string {
@@ -457,12 +471,15 @@ func (s *Server) addonDetails(ctx context.Context, manifestURL string) (addonDet
 }
 
 func (s *Server) populateAddonNames(ctx context.Context, cfg *Settings) error {
-	previous := s.Config.Get().Addons
-	for i := range cfg.Addons {
+	previous := s.Config.Get().Sources
+	for i := range cfg.Sources {
+		if cfg.Sources[i].Type != "addon" {
+			continue
+		}
 		found := false
 		for _, old := range previous {
-			if cfg.Addons[i].ManifestURL == old.ManifestURL && old.Name != "" {
-				cfg.Addons[i].Name = old.Name
+			if old.Type == "addon" && cfg.Sources[i].ManifestURL == old.ManifestURL && old.Name != "" {
+				cfg.Sources[i].Name = old.Name
 				found = true
 				break
 			}
@@ -470,11 +487,11 @@ func (s *Server) populateAddonNames(ctx context.Context, cfg *Settings) error {
 		if found {
 			continue
 		}
-		details, err := s.addonDetails(ctx, cfg.Addons[i].ManifestURL)
+		details, err := s.addonDetails(ctx, cfg.Sources[i].ManifestURL)
 		if err != nil {
 			return err
 		}
-		cfg.Addons[i].Name = details.Name
+		cfg.Sources[i].Name = details.Name
 	}
 	return nil
 }

@@ -103,6 +103,20 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		s.servePreparationError(w, r, v, p, err)
 		return
 	}
+	if v.native != nil {
+		if p[1] != "master.m3u8" {
+			http.NotFound(w, r)
+			return
+		}
+		b, err := s.nativePlaylist(v, v.nativeMaster, v.native.VariantURL, true, 0)
+		if err != nil {
+			v.note(err)
+			failure(w, 502, err)
+			return
+		}
+		sendPlaylist(w, b)
+		return
+	}
 	switch {
 	case p[1] == "master.m3u8":
 		b, err := s.master(v)
@@ -517,6 +531,26 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 	v.mu.Unlock()
 	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if res.PlaylistDepth > 0 {
+		if res.PlaylistDepth > 3 {
+			failure(w, 502, errors.New("too many nested HLS playlists"))
+			return
+		}
+		h, err := s.Net.LoadHLS(r.Context(), res.Origin)
+		if err != nil {
+			v.note(err)
+			failure(w, 502, err)
+			return
+		}
+		b, err := s.nativePlaylist(v, h, "", res.Video, res.PlaylistDepth)
+		if err != nil {
+			v.note(err)
+			failure(w, 502, err)
+			return
+		}
+		sendPlaylist(w, b)
 		return
 	}
 	if res.Track && res.Video && r.Method == "GET" {

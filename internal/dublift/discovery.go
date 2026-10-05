@@ -20,21 +20,17 @@ import (
 type vixBundle struct {
 	tracks  []Track
 	english *Track
+	master  *HLS
 	err     error
 }
 
 func (s *Server) resolveVixBundle(ctx context.Context, c Content) vixBundle {
 	cfg := s.Config.Get()
-	for _, binary := range []string{cfg.FFmpeg, cfg.FFprobe} {
-		if _, err := exec.LookPath(binary); err != nil {
-			return vixBundle{err: errors.New("FFmpeg/ffprobe unavailable")}
-		}
-	}
 	id, err := s.Net.ResolveTMDB(ctx, c, cfg.TMDBToken)
 	if err != nil {
 		return vixBundle{err: err}
 	}
-	origin, err := s.Net.ResolveVix(ctx, cfg.VixBaseURL, c.Type, id, c.Season, c.Episode)
+	origin, err := s.Net.ResolveVix(ctx, cfg.Source("vixsrc").BaseURL, c.Type, id, c.Season, c.Episode)
 	if err != nil {
 		return vixBundle{err: err}
 	}
@@ -42,9 +38,14 @@ func (s *Server) resolveVixBundle(ctx context.Context, c Content) vixBundle {
 	if err != nil {
 		return vixBundle{err: err}
 	}
+	for _, binary := range []string{cfg.FFmpeg, cfg.FFprobe} {
+		if _, err := exec.LookPath(binary); err != nil {
+			return vixBundle{master: h, err: errors.New("FFmpeg/ffprobe unavailable")}
+		}
+	}
 	v := &Session{}
 	err = s.vixTracks(ctx, v, h)
-	return vixBundle{v.tracks, v.vixEnglish, err}
+	return vixBundle{tracks: v.tracks, english: v.vixEnglish, master: h, err: err}
 }
 
 func (s *Server) inspectSource(ctx context.Context, stream Stream) (*Asset, *HLS, *playlist.MultivariantVariant, error) {
@@ -146,8 +147,8 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(lookup)
 	stop := context.AfterFunc(r.Context(), cancel)
 	defer func() { stop(); cancel() }()
-	// Discovery fetches upstream results and Vixsrc audio only. Source media
-	// is inspected when the user prepares or plays a selected stream.
+	// Discovery reads source listings, VixSrc quality metadata and Italian audio.
+	// Video probing, indexing and decoding wait for preparation or playback.
 	fetchCtx, fetchCancel := context.WithTimeout(ctx, 40*time.Second)
 	defer fetchCancel()
 	cfg := s.Config.Get()
@@ -155,9 +156,12 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		streams []Stream
 		err     error
 	}
-	addons := make([]addonResult, len(cfg.Addons))
+	addons := make([]addonResult, len(cfg.Sources))
 	var wg sync.WaitGroup
-	for i, addon := range cfg.Addons {
+	for i, addon := range cfg.Sources {
+		if addon.Type != "addon" || addon.Disabled {
+			continue
+		}
 		wg.Go(func() {
 			u, _ := url.Parse(addon.ManifestURL)
 			id := c.ID
@@ -183,22 +187,38 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		bundleReady <- s.resolveVixBundle(work, c)
 	}()
 	wg.Wait()
-	var upstream []Stream
-	for i, result := range addons {
+	bundle := <-bundleReady
+	fetchCancel()
+	type listedStream struct {
+		stream Stream
+		native *nativePlayback
+		source dashboardSource
+	}
+	var upstream []listedStream
+	for i, source := range cfg.Sources {
+		if source.Disabled {
+			continue
+		}
+		provider := source.dashboardSource()
+		if source.Type == "vixsrc" {
+			for _, quality := range vixQualityStreams(bundle.master) {
+				upstream = append(upstream, listedStream{stream: quality.stream, native: quality.native, source: provider})
+			}
+			continue
+		}
+		result := addons[i]
 		if result.err != nil {
-			s.event(cfg.Addons[i].Name + ": " + result.err.Error())
+			s.event(source.Name + ": " + result.err.Error())
 		}
 		for _, stream := range result.streams {
 			if stream.ExternalURL != "https://pengu.uk/donate" {
-				upstream = append(upstream, stream)
+				upstream = append(upstream, listedStream{stream: stream, source: provider})
 			}
 		}
 	}
-	bundle := <-bundleReady
-	fetchCancel()
-	results := append([]Stream{}, upstream...)
+	results := make([]Stream, len(upstream))
 	s.mu.Lock()
-	if generation != s.generation {
+	if generation != s.generation || ctx.Err() != nil {
 		s.mu.Unlock()
 		jsonResponse(w, 200, map[string]any{"streams": []Stream{}, "cacheMaxAge": 0, "staleRevalidate": 0, "staleError": 0})
 		return
@@ -209,22 +229,36 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		s.lookupStatus = "Vixsrc Italian audio confirmed; returning streams…"
 	}
 	sessions := make([]*Session, len(upstream))
-	for i, stream := range upstream {
+	for i, item := range upstream {
+		stream := item.stream
 		v := s.newSessionLocked(c, stream)
+		v.SourceID, v.SourceName = item.source.ID, item.source.Name
+		v.native = item.native
+		if item.native != nil {
+			v.nativeMaster = bundle.master
+		}
 		v.listedReady = make(chan struct{})
 		v.Order = i
 		v.ticket = s.sealPlayback(v)
-		v.Status = "Waiting in upstream order"
+		v.Status = "Waiting in source order"
 		v.ContentName = fallbackContentName(c, stream)
 		sessions[i] = v
 	}
 	s.mu.Unlock()
 	italianResults := 0
-	for i, stream := range upstream {
+	for i, item := range upstream {
+		stream := item.stream
+		results[i] = stream
 		v := sessions[i]
 		v.mu.Lock()
 		_, urlErr := httpURL(stream.URL)
-		if bundle.err == nil && urlErr == nil {
+		if item.native != nil {
+			v.Status = "Source audio and video · ready to prepare or play"
+			results[i] = stream.localPlayback(s.playbackURL(r, v), item.native.Italian)
+			if item.native.Italian {
+				italianResults++
+			}
+		} else if bundle.err == nil && urlErr == nil {
 			v.listedVix, v.listedEnglish = bundle.tracks, bundle.english
 			v.Status = "Italian audio found · ready to prepare or play"
 			results[i] = stream.dubbed(s.playbackURL(r, v))
@@ -241,12 +275,17 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		close(v.listedReady)
 	}
 	s.mu.Lock()
-	current := generation == s.generation
+	current := generation == s.generation && ctx.Err() == nil
+	if generation == s.generation && !current {
+		for _, v := range sessions {
+			s.discardLocked(v)
+		}
+	}
 	if current {
 		if bundle.err != nil {
-			s.lookupStatus = fmt.Sprintf("Vixsrc Italian audio unavailable · %d original streams returned", len(results))
+			s.lookupStatus = fmt.Sprintf("Italian audio unavailable for dubbing · %d streams returned in source order", len(results))
 		} else {
-			s.lookupStatus = fmt.Sprintf("%d Italian results · %d streams returned in upstream order", italianResults, len(results))
+			s.lookupStatus = fmt.Sprintf("%d Italian results · %d streams returned in source order", italianResults, len(results))
 		}
 	}
 	s.mu.Unlock()
@@ -279,7 +318,10 @@ func (s *Server) resolveContentName(c Content, cfg Settings) {
 		}
 		urls = append(urls, Origin{URL: "https://api.themoviedb.org/3/" + kind + "/" + c.TMDB, Headers: http.Header{"Authorization": {"Bearer " + cfg.TMDBToken}}})
 	}
-	for _, a := range cfg.Addons {
+	for _, a := range cfg.Sources {
+		if a.Type != "addon" || a.Disabled {
+			continue
+		}
 		u, err := httpURL(a.ManifestURL)
 		if err != nil {
 			continue
