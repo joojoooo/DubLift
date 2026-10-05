@@ -648,9 +648,15 @@ $("resolve-form").onsubmit = async (e) => {
   button.disabled = true;
   $("resolve-status").textContent = "Querying configured sources…";
   try {
+    const type = $("content-type").value;
+    const id = $("content-id").value.trim();
+    const preset = $("preset").selectedOptions[0];
+    const [presetType, presetID] = (preset?.value || "").split(":");
+    const baseID = id.replace(/^tmdb:/, "").split(":")[0];
     const r = await api("/api/resolve", {
-      type: $("content-type").value,
-      id: $("content-id").value.trim(),
+      type,
+      id,
+      contentName: type === presetType && baseID === presetID ? preset.textContent.trim() : "",
     });
     const hint = !r.streams.length
       ? "Check the activity log for provider errors."
@@ -730,17 +736,21 @@ function createCard(session) {
   return card;
 }
 const normalizedLine = (text) => String(text || "").trim().replace(/\s+/g, " ").toLowerCase();
+const normalizedTitleLine = (text) => normalizedLine(String(text || "")
+  .trim().replace(/^(?:\p{Extended_Pictographic}|\p{Emoji_Presentation}|\uFE0F|\u200D|[\u{1F3FB}-\u{1F3FF}]|\s)+/u, "")
+  .replace(/\s+\((?:18|19|20|21)\d{2}\)$/, ""));
 function streamText(v, heading) {
-  // Only remove whole, identical lines. Addon text has no fixed schema;
-  // retain unfamiliar formatting and all additional stream information.
-  const seen = new Set([normalizedLine(heading)]);
+  // Recognize title-only lines with an addon icon or release year. Keep
+  // technical details and unfamiliar formatting, even when they include a title.
+  const headings = new Set([normalizedTitleLine(heading)]);
+  const seen = new Set();
   // Metadata adds this episode suffix to series headings. Also recognize
   // the same series name without that suffix as a duplicate whole line.
-  if (v.contentType === "series") seen.add(normalizedLine(String(heading).replace(/ · S\d+E\d+$/, "")));
+  if (v.contentType === "series") headings.add(normalizedTitleLine(String(heading).replace(/ · S\d+E\d+$/, "")));
   return [v.name || "Upstream stream", v.title, v.description].map((text) =>
     String(text || "").split(/\r?\n/).filter((line) => {
       const key = normalizedLine(line);
-      if (!key || seen.has(key)) return false;
+      if (!key || seen.has(key) || headings.has(normalizedTitleLine(line))) return false;
       seen.add(key);
       return true;
     }).join("\n"),
@@ -814,7 +824,7 @@ function updateCard(v) {
   updateContentLink(card, v);
   const format = ["hls", "mkv", "mp4"].includes(v.sourceFormat) ? v.sourceFormat.toUpperCase() : "";
   set(".content-kind", [v.contentType === "series" ? "Series" : v.contentType === "movie" ? "Movie" : "Stream", format].filter(Boolean).join(" · "));
-  const heading = v.contentName || v.title?.split(/\r?\n/)[0] || v.content;
+  const heading = v.contentName || v.content;
   set(".content-name", heading);
   const [name, title, description] = streamText(v, heading);
   set(".name", name);

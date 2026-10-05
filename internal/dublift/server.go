@@ -262,18 +262,17 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(405)
 			return
 		}
-		var req struct{ Type, ID string }
+		var req struct{ Type, ID, ContentName string }
 		if err := decodeRequest(w, r, &req); err != nil {
 			failure(w, 400, err)
 			return
 		}
-		if _, err := ParseContent(req.Type, req.ID); err != nil {
+		c, err := ParseContent(req.Type, req.ID)
+		if err != nil {
 			failure(w, 400, err)
 			return
 		}
-		r2 := r.Clone(r.Context())
-		r2.URL.Path = "/stream/" + req.Type + "/" + req.ID + ".json"
-		s.streams(w, r2)
+		s.listStreams(w, r, c, req.ContentName)
 	default:
 		s.sessionAction(w, r)
 	}

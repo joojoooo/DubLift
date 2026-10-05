@@ -9,9 +9,12 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/bluenviron/gohlslib/v2/pkg/playlist"
 	"github.com/bluenviron/gohlslib/v2/pkg/playlist/primitives"
@@ -143,6 +146,10 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		failure(w, 400, err)
 		return
 	}
+	s.listStreams(w, r, c, "")
+}
+
+func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, name string) {
 	generation, lookup := s.beginLookup()
 	ctx, cancel := context.WithCancel(lookup)
 	stop := context.AfterFunc(r.Context(), cancel)
@@ -216,6 +223,19 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Native stream titles describe quality, not the content. Use one title
+	// for the entire lookup, including native qualities and addon results.
+	if name = strings.TrimSpace(name); name == "" {
+		var candidates []Stream
+		for _, item := range upstream {
+			if item.native == nil {
+				candidates = append(candidates, item.stream)
+			}
+		}
+		name = fallbackContentName(c, candidates...)
+	} else {
+		name = contentHeading(c, name)
+	}
 	results := make([]Stream, len(upstream))
 	s.mu.Lock()
 	if generation != s.generation || ctx.Err() != nil {
@@ -239,9 +259,9 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		}
 		v.listedReady = make(chan struct{})
 		v.Order = i
+		v.ContentName = name
 		v.ticket = s.sealPlayback(v)
 		v.Status = "Waiting in source order"
-		v.ContentName = fallbackContentName(c, stream)
 		sessions[i] = v
 	}
 	s.mu.Unlock()
@@ -292,24 +312,57 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	if !current {
 		results = []Stream{}
 	} else {
-		go s.resolveContentName(c, cfg)
+		go s.resolveContentName(c, cfg, sessions)
 	}
 	jsonResponse(w, 200, map[string]any{"streams": results, "cacheMaxAge": 0, "staleRevalidate": 0, "staleError": 0})
 }
 
-func fallbackContentName(c Content, stream Stream) string {
-	for _, value := range []string{stream.Title, stream.Description} {
-		line := strings.TrimSpace(strings.Split(value, "\n")[0])
-		if line != "" {
-			return line
+var contentYearRE = regexp.MustCompile(`\s+\((?:18|19|20|21)\d{2}\)$`)
+
+func fallbackContentName(c Content, streams ...Stream) string {
+	for _, stream := range streams {
+		for _, value := range []string{stream.Title, stream.Description} {
+			line := strings.TrimSpace(strings.Split(strings.TrimSpace(value), "\n")[0])
+			line = strings.TrimLeftFunc(line, func(r rune) bool {
+				return unicode.IsSpace(r) || unicode.Is(unicode.So, r) || r == '\uFE0F' || r == '\u200D' || r >= '\U0001F3FB' && r <= '\U0001F3FF'
+			})
+			line = contentYearRE.ReplaceAllString(line, "")
+			if line != "" {
+				return contentHeading(c, line)
+			}
 		}
 	}
-	return strings.ToUpper(c.Type[:1]) + c.Type[1:] + " · " + c.BaseID
+	return contentHeading(c, strings.ToUpper(c.Type[:1])+c.Type[1:]+" · "+c.BaseID)
 }
 
-func (s *Server) resolveContentName(c Content, cfg Settings) {
+func contentHeading(c Content, name string) string {
+	if c.Type == "series" {
+		episode := fmt.Sprintf("S%02dE%02d", c.Season, c.Episode)
+		if !strings.HasSuffix(name, episode) {
+			name += " · " + episode
+		}
+	}
+	return name
+}
+
+func (s *Server) resolveContentName(c Content, cfg Settings, sessions []*Session) {
+	if len(sessions) == 0 {
+		return
+	}
 	ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
 	defer cancel()
+	// Keep title lookup alive for a selected stream, but cancel its reads once
+	// all results it belongs to have been discarded.
+	var remaining atomic.Int32
+	remaining.Store(int32(len(sessions)))
+	for _, v := range sessions {
+		stop := context.AfterFunc(v.ctx, func() {
+			if remaining.Add(-1) == 0 {
+				cancel()
+			}
+		})
+		defer stop()
+	}
 	urls := []Origin{}
 	if c.TMDB != "" && cfg.TMDBToken != "" {
 		kind := "movie"
@@ -354,24 +407,28 @@ func (s *Server) resolveContentName(c Content, cfg Settings) {
 		if json.Unmarshal(b, &response) != nil {
 			continue
 		}
-		name := response.Meta.Name
+		name := strings.TrimSpace(response.Meta.Name)
 		if name == "" {
-			name = response.Title
+			name = strings.TrimSpace(response.Title)
 		}
 		if name == "" {
-			name = response.Name
+			name = strings.TrimSpace(response.Name)
 		}
 		if name == "" {
 			continue
 		}
-		if c.Type == "series" {
-			name += fmt.Sprintf(" · S%02dE%02d", c.Season, c.Episode)
-		}
+		name = contentHeading(c, name)
 		s.mu.Lock()
-		for _, v := range s.sessions {
-			if v.Content.ID == c.ID && v.Content.Type == c.Type {
+		for _, v := range sessions {
+			if ctx.Err() == nil && v.ctx.Err() == nil && s.sessions[v.ID] == v {
 				v.mu.Lock()
 				v.ContentName = name
+				// Update the immutable ticket snapshot: native preparation may
+				// already be refreshing the live source's selected variant.
+				if ticket, err := s.readPlayback(v.ID, v.ticket); err == nil {
+					ticket.ContentName = name
+					v.ticket = s.sealPlaybackTicket(ticket)
+				}
 				v.mu.Unlock()
 			}
 		}

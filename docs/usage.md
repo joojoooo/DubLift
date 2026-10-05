@@ -31,6 +31,13 @@ filter. Both filter groups combine and are remembered in your browser.
 **Clear filters** resets both groups. Playing and preparing streams stay visible
 in **Playback** regardless of filters.
 
+Dashboard results use one title across sources, whether requested with
+**Resolve a title** or through Stremio. Presets supply their title directly;
+custom IDs use addon title text until metadata is available. Repeated
+title-only lines, including addon icons and release years, are hidden in
+the stream details. Resolution, bitrate, codecs, and other details remain.
+If no title is available, the heading shows the content type and ID.
+
 VixSrc lists each available HLS quality with its resolution and bitrate
 (preferably average bitrate), highest quality first. If its playlist has no
 quality metadata, DubLift offers **Auto quality**. VixSrc playback preserves

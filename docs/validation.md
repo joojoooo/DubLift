@@ -35,14 +35,15 @@ encoders used by the tests, including `libx264` and AAC; HEVC/AV1 tests skip
 without `libx265`/`libsvtav1`. Error-clip tests need `lavfi`, `drawtext`, and a
 usable font. Inspect skip messages before claiming media coverage.
 
-## Dashboard sources and filters
+## Dashboard sources, filters, and titles
 
-For dashboard source-editing or filtering changes, also run the regressions with
-Node.js (no third-party packages are needed):
+For dashboard source-editing, filtering, or title-display changes, also run the
+regressions with Node.js (no third-party packages are needed):
 
 ```sh
 node --test scripts/dashboard-sources.test.cjs
 node --test scripts/dashboard-filters.test.cjs
+node --test scripts/dashboard-content.test.cjs
 ```
 
 These check valid addon additions, rapid reorder saves, draft URLs, failed
@@ -52,6 +53,8 @@ manifest validation during pending saves, and preserving other settings.
 They use a small DOM fixture and do not check browser rendering. Filter checks
 cover combined source/type selections, saved
 preferences, source refreshes, result counts, and keeping playback visible.
+Title checks cover resolver presets, consistent headings, decorated title
+deduplication, and preserving technical stream details.
 Node.js is not needed to run the server.
 
 ## Optional playback and provider checks
