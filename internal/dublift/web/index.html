@@ -248,13 +248,14 @@
                   min="32"
                   max="2048"
                   required /></label
-              ><label id="app-ffmpeg-setting" hidden>FFmpeg executable<input id="ffmpeg" /></label
-              ><label id="app-ffprobe-setting" hidden>ffprobe executable<input id="ffprobe" /></label
-              ><label
-                >TMDB API read token
-                <small>Optional title names and IMDb lookup</small
-                ><input id="tmdb-token" type="password" autocomplete="off"
-              /></label>
+              ><label id="app-ffmpeg-setting" hidden>FFmpeg executable<input id="ffmpeg" /></label>
+              <label id="app-ffprobe-setting" hidden>ffprobe executable<input id="ffprobe" /></label>
+              <!-- Hide tmdb-token input, it's broken, causes HTTP 401 errors if set, unhide when fixed -->
+              <label hidden>
+                TMDB API read token
+                <small>Optional title names and IMDb lookup</small>
+                <input id="tmdb-token" type="text" autocomplete="off"/>
+              </label>
             </details>
             <button class="button primary save" type="submit">
               Save settings</button>
