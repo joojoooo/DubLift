@@ -116,13 +116,28 @@ func (c Settings) Validate() error {
 }
 
 type Config struct {
-	mu    sync.RWMutex
-	path  string
-	value Settings
+	mu      sync.RWMutex
+	path    string
+	value   Settings
+	options ConfigOptions
+}
+
+// ConfigOptions carries process-supplied settings and defaults.
+type ConfigOptions struct {
+	AppListen      string
+	AppFFmpeg      string
+	AppFFprobe     string
+	DefaultCacheMB int
 }
 
 func OpenConfig(path string) (*Config, error) {
-	c := &Config{path: path, value: DefaultSettings()}
+	return OpenConfigWithOptions(path, ConfigOptions{})
+}
+
+func OpenConfigWithOptions(path string, options ConfigOptions) (*Config, error) {
+	initial := DefaultSettings()
+	options.applyDefaults(&initial)
+	c := &Config{path: path, value: initial, options: options}
 	b, e := os.ReadFile(path)
 	if errors.Is(e, os.ErrNotExist) {
 		return c, c.Save(c.value)
@@ -147,6 +162,12 @@ func OpenConfig(path string) (*Config, error) {
 		return nil, e
 	}
 	c.value = c.value.normalizedSources()
+	if options.applyManaged(&c.value) {
+		if e = c.Save(c.value); e != nil {
+			return nil, e
+		}
+		return c, nil
+	}
 	if e = c.value.Validate(); e != nil {
 		return nil, e
 	}
@@ -155,6 +176,54 @@ func OpenConfig(path string) (*Config, error) {
 	}
 	return c, nil
 }
+
+// ManagedOptions captures which settings are locked by the host process.
+type ManagedOptions struct {
+	AppListenManaged  bool `json:"appListenManaged"`
+	AppFFmpegManaged  bool `json:"appFFmpegManaged"`
+	AppFFprobeManaged bool `json:"appFFprobeManaged"`
+}
+
+func (o ConfigOptions) Managed() ManagedOptions {
+	return ManagedOptions{
+		AppListenManaged:  o.AppListen != "",
+		AppFFmpegManaged:  o.AppFFmpeg != "",
+		AppFFprobeManaged: o.AppFFprobe != "",
+	}
+}
+
+func (o ConfigOptions) applyDefaults(settings *Settings) {
+	o.applyManaged(settings)
+	if o.DefaultCacheMB != 0 {
+		settings.CacheMB = o.DefaultCacheMB
+	}
+}
+
+func (o ConfigOptions) applyManaged(settings *Settings) bool {
+	c1 := setManagedValue(&settings.Listen, o.AppListen)
+	c2 := setManagedValue(&settings.FFmpeg, o.AppFFmpeg)
+	c3 := setManagedValue(&settings.FFprobe, o.AppFFprobe)
+	return c1 || c2 || c3
+}
+
+func setManagedValue(setting *string, managed string) bool {
+	if managed == "" || *setting == managed {
+		return false
+	}
+	*setting = managed
+	return true
+}
+
+func (c *Config) Managed() ManagedOptions { return c.options.Managed() }
+
+// PrepareCandidate prepares settings submitted by the dashboard before validation:
+// normalizes sources, preserves setup completion, and applies host-managed overrides.
+func (c *Config) PrepareCandidate(s *Settings) {
+	*s = s.normalizedSources()
+	s.SetupCompleted = c.Get().SetupCompleted
+	c.options.applyManaged(s)
+}
+
 func (c *Config) Get() Settings {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -163,6 +232,7 @@ func (c *Config) Get() Settings {
 	return s
 }
 func (c *Config) Save(s Settings) error {
+	c.options.applyManaged(&s)
 	s = s.normalizedSources()
 	if e := s.Validate(); e != nil {
 		return e

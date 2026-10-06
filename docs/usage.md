@@ -79,9 +79,13 @@ Config, `alignment.json`, and `playback.key` contain private state and live
 beside each other. The config and key use file mode `0600`; do not share them
 or raw provider reports. Generated binaries and `.local/` are ignored by Git.
 
-FFmpeg and ffprobe paths are configurable in Settings. DNS normally uses the
-system resolver; `DUBLIFT_DNS` optionally selects a DNS server IP, with an
-optional port (`IP:PORT`, or `[IPv6]:PORT`).
+FFmpeg and ffprobe paths are configurable in Settings for standalone runs. A
+host application can supply and lock those paths and the listen address;
+DubLift then hides their inputs. A host-provided cache default applies only to
+new or reset configs and can be changed in Settings. DNS normally uses the
+system resolver;
+`DUBLIFT_DNS` optionally selects a DNS server IP, with an optional port
+(`IP:PORT`, or `[IPv6]:PORT`).
 
 ## Playback and synchronization
 

@@ -16,8 +16,20 @@ import (
 func main() {
 	path := flag.String("config", ".local/config.json", "private settings file")
 	listen := flag.String("listen", "", "override listen address")
+	appListen := flag.String("app-listen", "", "application-managed listen address")
+	appFFmpeg := flag.String("app-ffmpeg", "", "application-managed FFmpeg executable")
+	appFFprobe := flag.String("app-ffprobe", "", "application-managed ffprobe executable")
+	defaultCacheMB := flag.Int("default-cache-mb", 0, "rolling cache default for new or reset config")
 	flag.Parse()
-	c, err := dublift.OpenConfig(*path)
+	if *defaultCacheMB != 0 && (*defaultCacheMB < 32 || *defaultCacheMB > 2048) {
+		log.Fatal("default cache must be 32–2048 MiB")
+	}
+	c, err := dublift.OpenConfigWithOptions(*path, dublift.ConfigOptions{
+		AppListen:      *appListen,
+		AppFFmpeg:      *appFFmpeg,
+		AppFFprobe:     *appFFprobe,
+		DefaultCacheMB: *defaultCacheMB,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

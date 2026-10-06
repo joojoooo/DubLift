@@ -528,6 +528,17 @@ const fields = {
 };
 async function loadSettings() {
   [settings, sourceTypes] = await Promise.all([api("/api/settings"), api("/api/source-types")]);
+  for (const [id, option] of Object.entries({
+    listen: "appListenManaged",
+    ffmpeg: "appFFmpegManaged",
+    ffprobe: "appFFprobeManaged",
+  })) {
+    const managed = Boolean(settings[option]);
+    const input = $(id);
+    $("app-" + id + "-setting").hidden = managed;
+    input.required = !managed;
+    input.disabled = managed;
+  }
   for (const [key, id] of Object.entries(fields))
     $(id).value = settings[key] ?? "";
   $("confidence").value = settings.minConfidence;

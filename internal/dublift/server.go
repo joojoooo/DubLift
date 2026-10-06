@@ -42,6 +42,18 @@ type Server struct {
 	manifestRequests atomic.Uint64
 }
 
+type dashboardSettings struct {
+	Settings
+	ManagedOptions
+}
+
+func (s *Server) settingsResponse(settings Settings) dashboardSettings {
+	return dashboardSettings{
+		Settings:       settings,
+		ManagedOptions: s.Config.Managed(),
+	}
+}
+
 func NewServer(c *Config) (*Server, error) {
 	key, err := openPlaybackKey(c.path)
 	if err != nil {
@@ -171,22 +183,22 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, 200, builtinSources)
 	case "/api/settings":
 		if r.Method == "GET" {
-			jsonResponse(w, 200, s.Config.Get())
+			jsonResponse(w, 200, s.settingsResponse(s.Config.Get()))
 			return
 		}
 		if r.Method != "POST" {
 			w.WriteHeader(405)
 			return
 		}
-		cfg := DefaultSettings()
-		cfg.ConfigVersion = 0 // Require the version supplied by the dashboard.
-		cfg.Sources = nil
-		if err := decodeRequest(w, r, &cfg); err != nil {
+		request := dashboardSettings{Settings: DefaultSettings()}
+		request.ConfigVersion = 0 // Require the version supplied by the dashboard.
+		request.Sources = nil
+		if err := decodeRequest(w, r, &request); err != nil {
 			failure(w, 400, err)
 			return
 		}
-		cfg = cfg.normalizedSources()
-		cfg.SetupCompleted = s.Config.Get().SetupCompleted
+		cfg := request.Settings
+		s.Config.PrepareCandidate(&cfg)
 		if err := cfg.Validate(); err != nil {
 			failure(w, 400, err)
 			return
@@ -199,8 +211,9 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			failure(w, 400, err)
 			return
 		}
-		s.Engine.Cache.Resize(int64(cfg.CacheMB) << 20)
-		jsonResponse(w, 200, cfg)
+		saved := s.Config.Get()
+		s.Engine.Cache.Resize(int64(saved.CacheMB) << 20)
+		jsonResponse(w, 200, s.settingsResponse(saved))
 	case "/api/addon-name":
 		if r.Method != "POST" {
 			w.WriteHeader(405)

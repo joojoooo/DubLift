@@ -310,6 +310,7 @@ label {
   color: #c1ced5;
   margin-top: 17px;
 }
+.settings label[hidden] { display: none; }
 label small {
   font-weight: 400;
   color: var(--muted);
