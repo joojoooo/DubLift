@@ -3,6 +3,7 @@ package dublift
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,18 @@ import (
 	"testing"
 	"time"
 )
+
+func TestVideoWindowOverflowPolicy(t *testing.T) {
+	if err := videoWindowOverflow(7, 2, 1, 8); !errors.Is(err, errVideoWindowFull) {
+		t.Fatalf("overflow after a published segment = %v, want the partial-window signal", err)
+	}
+	if err := videoWindowOverflow(7, 2, 0, 8); !errors.Is(err, errVideoWindowNoSegment) {
+		t.Fatalf("overflow before any segment is published = %v, want a bounded window failure", err)
+	}
+	if err := videoWindowOverflow(7, 1, 1, 8); err != nil {
+		t.Fatalf("output at the byte budget was rejected: %v", err)
+	}
+}
 
 func fileVideoTestSession(t *testing.T, s *Server, url string) *Session {
 	t.Helper()

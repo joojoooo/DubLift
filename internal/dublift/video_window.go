@@ -9,6 +9,25 @@ import (
 	"time"
 )
 
+var (
+	errVideoWindowFull      = errors.New("video window output budget reached")
+	errVideoWindowNoSegment = errors.New("video window exceeds output budget before publishing a segment")
+)
+
+// A window can contain several high-bitrate 4K segments. Bound the combined
+// stream-copy output separately from the 96 MiB single-resource limit.
+const videoWindowLimit = 256 << 20
+
+func videoWindowOverflow(current, incoming, published, limit int) error {
+	if current+incoming <= limit {
+		return nil
+	}
+	if published > 0 {
+		return errVideoWindowFull
+	}
+	return errVideoWindowNoSegment
+}
+
 type windowClock struct {
 	mu sync.Mutex
 	packetClock
@@ -21,10 +40,12 @@ func (c *windowClock) Write(b []byte) (int, error) {
 }
 
 // One sequential FFmpeg extraction publishes each complete HLS segment as it
-// arrives. The output and origin byte budgets still bound the entire window.
+// arrives. Stop the window after its output budget once at least one segment
+// is available; the remaining segments can be extracted in a fresh window.
 type videoWindowWriter struct {
 	raw                    []byte
 	parsed, complete, next int
+	writeErr               error
 	bounds                 []float64
 	duration               float64
 	sequence               uint32
@@ -35,8 +56,9 @@ type videoWindowWriter struct {
 }
 
 func (w *videoWindowWriter) Write(b []byte) (int, error) {
-	if len(w.raw)+len(b) > segmentLimit {
-		return 0, errors.New("video window exceeds byte budget")
+	if err := videoWindowOverflow(len(w.raw), len(b), w.next, videoWindowLimit); err != nil {
+		w.writeErr = err
+		return 0, w.writeErr
 	}
 	w.raw = append(w.raw, b...)
 	for w.parsed+8 <= len(w.raw) {
@@ -49,8 +71,9 @@ func (w *videoWindowWriter) Write(b []byte) (int, error) {
 			}
 			size, head = binary.BigEndian.Uint64(box[8:]), 16
 		}
-		if size < head || size > segmentLimit {
-			return 0, errors.New("invalid streaming MP4 box")
+		if size < head || size > videoWindowLimit {
+			w.writeErr = errors.New("invalid streaming MP4 box")
+			return 0, w.writeErr
 		}
 		if size > uint64(len(box)) {
 			break
@@ -65,6 +88,7 @@ func (w *videoWindowWriter) Write(b []byte) (int, error) {
 				continue
 			}
 			if err := w.flush(false); err != nil {
+				w.writeErr = err
 				return 0, err
 			}
 		}
@@ -126,6 +150,18 @@ func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []floa
 	unmarked := a.unmarkedVideo.Load()
 	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), sequence: videoSequence(a, start), unmarked: unmarked, clock: &windowClock{}, publish: publish}
 	err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgsMode(u, skip, start, end-start, unmarked), w, w.clock)
+	if errors.Is(w.writeErr, errVideoWindowFull) {
+		if originErr, metadata := inputFailure.failure(); originErr != nil && !metadata {
+			return fmt.Errorf("upstream video download failed: %w", originErr)
+		}
+		// The output cap stopped extraction after publishing a complete segment.
+		// Treat this as a successful partial window; fileVideo can resume at the
+		// first unpublished segment with a fresh extraction.
+		return nil
+	}
+	if w.writeErr != nil {
+		err = fmt.Errorf("video output: %w", w.writeErr)
+	}
 	if originErr, metadata := inputFailure.failure(); originErr != nil {
 		// Missing key flags can exhaust the read budget before any packet is
 		// emitted. Preserve the -copyinkf retry before reporting that failure.
