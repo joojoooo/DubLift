@@ -134,14 +134,14 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			s.ensurePlaybackAlignment(v)
 		}
 	case p[1] == "video.m3u8":
-		if v.video.HLS != nil {
+		if v.video.HLS != nil && !s.separateMuxedSourceAudio(v) {
 			sendPlaylist(w, []byte(s.proxyPlaylist(v, v.video, true)))
 		} else {
 			sendPlaylist(w, []byte(s.generatedPlaylist(v, nil)))
 		}
 	case p[1] == "video" && len(p) == 4:
 		n, err := strconv.Atoi(p[2])
-		if err != nil || n < 0 || n >= len(v.boundaries)-1 || v.video.File == nil || (p[3] != "init.mp4" && p[3] != "segment.m4s") {
+		if err != nil || n < 0 || n >= len(v.boundaries)-1 || (v.video.File == nil && !s.separateMuxedSourceAudio(v)) || (p[3] != "init.mp4" && p[3] != "segment.m4s") {
 			http.NotFound(w, r)
 			return
 		}
@@ -337,6 +337,23 @@ func (s *Server) playbackOffset(v *Session, at float64) float64 {
 	a := s.Alignments.Get(v.Key)
 	return a.At(at, s.Config.Get().MinConfidence)
 }
+
+// A URI-less HLS audio rendition tells players to use the audio embedded in
+// the video playlist. When an Italian alternative is available, expose that
+// source audio through its own playlist so selecting Italian cannot fall back
+// to the embedded source track.
+func (s *Server) separateMuxedSourceAudio(v *Session) bool {
+	if v.video == nil || v.video.HLS == nil || !v.sourceHasMuxedAudio {
+		return false
+	}
+	for _, t := range v.tracks {
+		if !t.Original && !t.Subtitle && t.Lang == "it" {
+			return true
+		}
+	}
+	return false
+}
+
 func serveBytes(w http.ResponseWriter, r *http.Request, kind string, data []byte) {
 	w.Header().Set("Content-Type", kind)
 	w.Header().Set("Cache-Control", "no-store")
@@ -387,7 +404,7 @@ func (s *Server) master(v *Session) ([]byte, error) {
 	for _, t := range ordered {
 		uri := "track/" + t.ID + ".m3u8"
 		uriPointer := &uri
-		if t.Original && !t.Subtitle && t.Asset == v.video && v.video.HLS != nil {
+		if t.Original && !t.Subtitle && t.Asset == v.video && v.video.HLS != nil && !s.separateMuxedSourceAudio(v) {
 			uriPointer = nil
 		}
 		typ := playlist.MultivariantRenditionTypeAudio
@@ -424,6 +441,7 @@ func (s *Server) master(v *Session) ([]byte, error) {
 	// codec discovery is delegated to the init segment when unknown.
 	return bytes.ReplaceAll(b, []byte(`,CODECS=""`), nil), err
 }
+
 func safeHLSName(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '"' || r == '\n' || r == '\r' {

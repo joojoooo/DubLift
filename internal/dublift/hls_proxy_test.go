@@ -3,6 +3,7 @@ package dublift
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -203,6 +204,161 @@ func TestHLSPlaybackProxiesSourceMediaAndRenditions(t *testing.T) {
 				t.Fatal("origin headers/cookies were lost", rejected.Load())
 			}
 		})
+	}
+}
+
+func TestMuxedHLSAudioIsExposedAsAnExternalRendition(t *testing.T) {
+	ffmpegAvailable(t)
+	dir := t.TempDir()
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=96x64:rate=10", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "4", "-c:v", "libx264", "-preset", "ultrafast", "-g", "20", "-sc_threshold", "0", "-c:a", "aac", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_segment_type", "fmp4", "-hls_segment_filename", filepath.Join(dir, "segment-%03d.m4s"), filepath.Join(dir, "source.m3u8"))
+	origin := httptest.NewServer(http.FileServer(http.Dir(dir)))
+	defer origin.Close()
+
+	s := lifecycleServer(t)
+	v := preparedHLSSession(t, s, Origin{URL: origin.URL + "/source.m3u8"})
+	v.sourceHasMuxedAudio = true
+	v.variant = &playlist.MultivariantVariant{Bandwidth: 500000, Codecs: []string{"avc1.42c00a", "mp4a.40.2"}}
+	v.tracks = []Track{
+		{ID: "source-1", Name: "Original English", Lang: "en", Asset: v.video, Selector: "0:1", Original: true},
+		{ID: "vix-it-0", Name: "Italian · Vixsrc", Lang: "it", Asset: v.video, Selector: "0:1"},
+	}
+	local := httptest.NewServer(s)
+	defer local.Close()
+	base := local.URL + "/media/" + v.ID
+
+	var master playlist.Multivariant
+	if err := master.Unmarshal(getBytes(t, base+"/master.m3u8")); err != nil {
+		t.Fatal(err)
+	}
+	var original *playlist.MultivariantRendition
+	for _, rendition := range master.Renditions {
+		if rendition.Name == "Original English" {
+			original = rendition
+		}
+		if rendition.Name == "Italian · Vixsrc" && !rendition.Default {
+			t.Fatal("Italian audio is not the default rendition")
+		}
+	}
+	if original == nil || original.URI == nil {
+		t.Fatal("muxed source audio was not exposed as a separate rendition")
+	}
+	if len(master.Variants[0].Codecs) != 2 || master.Variants[0].Codecs[1] != "mp4a.40.2" {
+		t.Fatalf("master lost its source and external audio codecs: %v", master.Variants[0].Codecs)
+	}
+	videoPlaylist := getBytes(t, base+"/video.m3u8")
+	if !bytes.Contains(videoPlaylist, []byte("video/0/segment.m4s")) || !bytes.Contains(videoPlaylist, []byte("video/0/init.mp4")) {
+		t.Fatalf("muxed source audio was not replaced with local video-only segments:\n%s", videoPlaylist)
+	}
+	init := getBytes(t, base+"/video/0/init.mp4")
+	segment := getBytes(t, base+"/video/0/segment.m4s")
+	videoPath := filepath.Join(dir, "video-only.mp4")
+	if err := os.WriteFile(videoPath, append(init, segment...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var videoProbe Probe
+	if err := json.Unmarshal(command(t, "ffprobe", "-v", "error", "-show_streams", "-of", "json", videoPath), &videoProbe); err != nil {
+		t.Fatal(err)
+	}
+	if len(videoProbe.Streams) != 1 || videoProbe.Streams[0].CodecType != "video" {
+		t.Fatalf("video rendition retained source audio: %+v", videoProbe.Streams)
+	}
+	firstStart, firstEnd := packetTimes(t, videoPath, "v:0")
+	secondSegment := getBytes(t, base+"/video/1/segment.m4s")
+	secondPath := filepath.Join(dir, "video-only-second.mp4")
+	if err := os.WriteFile(secondPath, append(append([]byte(nil), init...), secondSegment...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	secondStart, secondEnd := packetTimes(t, secondPath, "v:0")
+	if firstEnd-firstStart < 1.8 || firstEnd-firstStart > 2.2 || secondStart < firstEnd-.1 || secondStart > firstEnd+.1 || secondEnd-secondStart < 1.8 || secondEnd-secondStart > 2.2 {
+		t.Fatalf("video-only HLS fragments have a discontinuous media clock: first %.3f–%.3f, second %.3f–%.3f", firstStart, firstEnd, secondStart, secondEnd)
+	}
+	originalURL := base + "/" + strings.TrimPrefix(*original.URI, "/")
+	var originalMedia playlist.Media
+	if err := originalMedia.Unmarshal(getBytes(t, originalURL)); err != nil {
+		t.Fatal(err)
+	}
+	if len(originalMedia.Segments) == 0 {
+		t.Fatal("separate source audio playlist is empty")
+	}
+	audioURL, err := resolveURL(originalURL, originalMedia.Segments[0].URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audio := getBytes(t, audioURL)
+	path := filepath.Join(dir, "original-audio.ts")
+	if err := os.WriteFile(path, audio, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var audioProbe Probe
+	if err := json.Unmarshal(command(t, "ffprobe", "-v", "error", "-show_streams", "-of", "json", path), &audioProbe); err != nil {
+		t.Fatal(err)
+	}
+	if len(audioProbe.Streams) != 1 || audioProbe.Streams[0].CodecType != "audio" {
+		t.Fatalf("separate source audio rendition has unexpected streams: %+v", audioProbe.Streams)
+	}
+}
+
+func TestHLSVideoWindowRemuxesTSAsVideoOnly(t *testing.T) {
+	ffmpegAvailable(t)
+	dir := t.TempDir()
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=96x64:rate=10", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "4", "-c:v", "libx264", "-preset", "ultrafast", "-g", "20", "-sc_threshold", "0", "-c:a", "aac", "-hls_time", "2", "-hls_playlist_type", "vod", filepath.Join(dir, "source.m3u8"))
+	origin := httptest.NewServer(http.FileServer(http.Dir(dir)))
+	defer origin.Close()
+
+	s := lifecycleServer(t)
+	v := preparedHLSSession(t, s, Origin{URL: origin.URL + "/source.m3u8"})
+	probe, err := s.Engine.Probe(context.Background(), v.video)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range probe.Streams {
+		if stream.CodecType == "video" {
+			v.video.MP4VideoTag = mp4VideoSampleEntry(stream.CodecName, stream.CodecTag)
+		}
+	}
+	v.video.VideoClockBase, err = strconv.ParseFloat(probe.Format.StartTime, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments := make([][]byte, len(v.boundaries)-1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = s.Engine.VideoWindow(ctx, v.video, v.boundaries, func(index int, data []byte) error {
+		segments[index] = data
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 2 || len(segments[0]) == 0 || len(segments[1]) == 0 {
+		t.Fatalf("video window did not produce both TS-derived segments: sizes=%v", []int{len(segments[0]), len(segments[1])})
+	}
+	init, err := s.Engine.VideoInit(ctx, v.video)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var previousEnd float64
+	for i, data := range segments {
+		_, media, err := splitFMP4(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, fmt.Sprintf("video-only-%d.mp4", i))
+		if err := os.WriteFile(path, append(append([]byte(nil), init...), media...), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var probe Probe
+		if err := json.Unmarshal(command(t, "ffprobe", "-v", "error", "-show_streams", "-of", "json", path), &probe); err != nil {
+			t.Fatal(err)
+		}
+		if len(probe.Streams) != 1 || probe.Streams[0].CodecType != "video" {
+			t.Fatalf("TS-derived segment %d contains non-video streams: %+v", i, probe.Streams)
+		}
+		start, end := packetTimes(t, path, "v:0")
+		if end-start < 1.8 || end-start > 2.2 || (i > 0 && (start < previousEnd-.1 || start > previousEnd+.1)) {
+			t.Fatalf("TS-derived segment %d has an invalid clock: %.3f–%.3f (previous end %.3f)", i, start, end, previousEnd)
+		}
+		previousEnd = end
 	}
 }
 

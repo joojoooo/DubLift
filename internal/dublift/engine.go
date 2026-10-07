@@ -32,6 +32,11 @@ type Asset struct {
 	HLS    *HLS
 	File   *RemoteFile
 	Index  FileIndex
+	// MP4VideoTag overrides transport-stream codec IDs when remuxing HLS video
+	// segments into fragmented MP4.
+	MP4VideoTag string
+	// VideoClockBase is the source's initial presentation offset for HLS media.
+	VideoClockBase float64
 	// Some Matroska files have valid video cues but mark every packet non-key.
 	// Remember the stream-copy fallback after the default remux emits no packets.
 	unmarkedVideo atomic.Bool
@@ -937,7 +942,11 @@ func (e *Engine) VideoInit(ctx context.Context, a *Asset) ([]byte, error) {
 	// Even with zero output frames, stream copy waits for an accepted input
 	// packet before it stops. Files without marked key packets would otherwise
 	// scan media until the download budget or deadline instead of returning init.
-	args = append(args, "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy", "-copyinkf", "-frames:v", "0", "-copytb", "1", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
+	args = append(args, "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy")
+	if a.HLS != nil && a.MP4VideoTag != "" {
+		args = append(args, "-tag:v", a.MP4VideoTag)
+	}
+	args = append(args, "-copyinkf", "-frames:v", "0", "-copytb", "1", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
 	init, err := e.run(ctx, e.Config.Get().FFmpeg, args, 1<<20)
 	// The init contains no media packets. FFmpeg can finish it successfully
 	// even if a later, unnecessary read-ahead range fails.
@@ -960,7 +969,7 @@ func (e *Engine) videoAttempt(ctx context.Context, a *Asset, start, duration flo
 	}
 	defer cleanup()
 	unmarked := a.unmarkedVideo.Load()
-	args := videoArgsMode(u, skip, start, duration, unmarked)
+	args := videoArgsForAsset(a, u, skip, start, duration, unmarked, a.VideoClockBase)
 	clock := &packetClock{}
 	raw, err := e.run(ctx, e.Config.Get().FFmpeg, args, segmentLimit, clock)
 	if err != nil {
@@ -976,13 +985,64 @@ func (e *Engine) videoAttempt(ctx context.Context, a *Asset, start, duration flo
 	// still exits successfully. Do not cache that fragment as a complete HLS
 	// segment: the next segment would jump over the missing video frames.
 	completeEnd := start+duration < a.Duration()-.01
-	return placeFragmentsMode(raw, start+clock.first+1, start+1, start+duration+1, completeEnd, videoSequence(a, start), unmarked)
+	clockOffset := videoClockOffset(a, a.VideoClockBase)
+	return placeFragmentsMode(raw, start+clock.first+videoPacketOffset(a), start+clockOffset, start+duration+clockOffset, completeEnd, videoSequence(a, start), unmarked)
 }
 
 var errNoVideoPacketTimestamps = errors.New("remux produced no video packet timestamps")
 
 func videoSequence(a *Asset, start float64) uint32 {
+	if a.HLS != nil {
+		index := sort.Search(len(a.HLS.Segments), func(i int) bool {
+			segment := a.HLS.Segments[i]
+			return segment.Start+segment.Duration > start+1e-6
+		})
+		return uint32(index + 1)
+	}
 	return uint32(sort.SearchFloat64s(a.Index.Boundaries, start) + 1)
+}
+
+func videoClockOffset(a *Asset, hlsClockBase float64) float64 {
+	if a.HLS != nil {
+		return hlsClockBase
+	}
+	// Leave room for B-frame decode timestamps before presentation in file
+	// playback. HLS sources already carry their own presentation clock.
+	return 1
+}
+
+func videoPacketOffset(a *Asset) float64 {
+	if a.HLS != nil {
+		return 0
+	}
+	return 1
+}
+
+func mp4VideoSampleEntry(codec, sourceTag string) string {
+	switch codec {
+	case "h264":
+		if sourceTag == "avc1" || sourceTag == "avc3" {
+			return sourceTag
+		}
+		return "avc1"
+	case "hevc":
+		if sourceTag == "hev1" || sourceTag == "hvc1" {
+			return sourceTag
+		}
+		return "hvc1"
+	case "av1":
+		return "av01"
+	case "vp9":
+		return "vp09"
+	case "vp8":
+		return "vp08"
+	case "mpeg4":
+		return "mp4v"
+	case "mpeg2video":
+		return "mp2v"
+	default:
+		return ""
+	}
 }
 
 func videoArgs(u string, skip, start, duration float64) []string {
@@ -990,13 +1050,26 @@ func videoArgs(u string, skip, start, duration float64) []string {
 }
 
 func videoArgsMode(u string, skip, start, duration float64, unmarked bool) []string {
+	return videoArgsWithHLS(u, skip, start, duration, unmarked, false, "", 0)
+}
+
+func videoArgsForAsset(a *Asset, u string, skip, start, duration float64, unmarked bool, clockBase float64) []string {
+	return videoArgsWithHLS(u, skip, start, duration, unmarked, a.HLS != nil, a.MP4VideoTag, clockBase)
+}
+
+func videoArgsWithHLS(u string, skip, start, duration float64, unmarked, hls bool, tag string, clockBase float64) []string {
 	// Matroska cue times are rounded to the container's tick. Seek just after
-	// the cue; placeFragments discards any preroll using its actual clock.
+	// the cue; placeFragments discards any preroll using its actual clock. HLS
+	// jobs already bound the input playlist and use its source presentation clock.
 	// Keep the bounded stream analysis in ffInput: Matroska headers do not
 	// supply decode timestamps or HEVC's frame reorder delay. Skipping it
 	// makes FFmpeg substitute PTS for DTS and clamp reordered B-frames to
 	// near-identical timestamps, even though all compressed bytes survive.
-	args := []string{"-nostdin", "-v", "error", "-threads", "1", "-copyts", "-ss", decimal(skip + .01), "-itsoffset", decimal(-start), "-discard:a", "all", "-discard:s", "all", "-discard:d", "all"}
+	args := []string{"-nostdin", "-v", "error", "-threads", "1", "-copyts"}
+	if !hls {
+		args = append(args, "-ss", decimal(skip+.01))
+	}
+	args = append(args, "-itsoffset", decimal(-start), "-discard:a", "all", "-discard:s", "all", "-discard:d", "all")
 	args = append(args, ffInput(u)...)
 	// -dn does not disable the MP4 muxer's synthesized chapter text track.
 	// Explicitly exclude chapters so each fragment has exactly the video track.
@@ -1005,7 +1078,18 @@ func videoArgsMode(u string, skip, start, duration float64, unmarked bool) []str
 	// re-encoded. This distinguishes actual preroll from the requested GOP.
 	// tee otherwise chooses the decoder timebase, which can round distinct
 	// DTS to the same tick and make FFmpeg clamp the corresponding PTS too.
-	args = append(args, "-t", decimal(duration+.25), "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy")
+	inputDuration := duration + .25
+	if hls {
+		// Keep packets before the requested segment so timestamp placement can
+		// discard preroll without seeking against the source presentation clock.
+		// FFmpeg's output -t is measured from zero with -copyts, so include the
+		// source's initial timestamp to cover the full relative media window.
+		inputDuration += skip + max(0, clockBase)
+	}
+	args = append(args, "-t", decimal(inputDuration), "-map", "0:v:0", "-map_chapters", "-1", "-an", "-sn", "-dn", "-c:v", "copy")
+	if hls && tag != "" {
+		args = append(args, "-tag:v", tag)
+	}
 	fragmentFlags := "+frag_keyframe+empty_moov+default_base_moof"
 	if unmarked {
 		// FFmpeg otherwise drops every packet while waiting for a key flag.

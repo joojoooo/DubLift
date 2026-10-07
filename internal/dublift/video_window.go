@@ -48,6 +48,8 @@ type videoWindowWriter struct {
 	writeErr               error
 	bounds                 []float64
 	duration               float64
+	clockOffset            float64
+	packetOffset           float64
 	sequence               uint32
 	unmarked               bool
 	fragments              int
@@ -109,7 +111,7 @@ func (w *videoWindowWriter) flush(final bool) error {
 	for w.next < len(w.bounds)-1 {
 		start, end := w.bounds[w.next], w.bounds[w.next+1]
 		completeEnd := !final || end < w.duration-.01
-		data, err := placeFragmentsMode(w.raw[:w.complete], w.bounds[0]+first+1, start+1, end+1, completeEnd, w.sequence+uint32(w.next), w.unmarked)
+		data, err := placeFragmentsMode(w.raw[:w.complete], w.bounds[0]+first+w.packetOffset, start+w.clockOffset, end+w.clockOffset, completeEnd, w.sequence+uint32(w.next), w.unmarked)
 		if err != nil {
 			if final {
 				return err
@@ -125,10 +127,14 @@ func (w *videoWindowWriter) flush(final bool) error {
 }
 
 func (e *Engine) VideoWindow(ctx context.Context, a *Asset, bounds []float64, publish func(int, []byte) error) error {
+	return e.VideoWindowWithClockBase(ctx, a, bounds, a.VideoClockBase, publish)
+}
+
+func (e *Engine) VideoWindowWithClockBase(ctx context.Context, a *Asset, bounds []float64, clockBase float64, publish func(int, []byte) error) error {
 	finish := e.foregroundFile(a)
 	defer finish()
 	for attempt := 0; attempt < 2; attempt++ {
-		err := e.videoWindowAttempt(ctx, a, bounds, publish)
+		err := e.videoWindowAttempt(ctx, a, bounds, clockBase, publish)
 		if errors.Is(err, errNoVideoPacketTimestamps) && attempt == 0 && ctx.Err() == nil {
 			a.unmarkedVideo.Store(true)
 			continue
@@ -138,7 +144,7 @@ func (e *Engine) VideoWindow(ctx context.Context, a *Asset, bounds []float64, pu
 	return errNoVideoPacketTimestamps
 }
 
-func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []float64, publish func(int, []byte) error) error {
+func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []float64, clockBase float64, publish func(int, []byte) error) error {
 	start, end := bounds[0], bounds[len(bounds)-1]
 	inputFailure := &mediaInputFailure{video: true}
 	ctx = context.WithValue(ctx, mediaInputFailureKey{}, inputFailure)
@@ -148,8 +154,8 @@ func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []floa
 	}
 	defer cleanup()
 	unmarked := a.unmarkedVideo.Load()
-	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), sequence: videoSequence(a, start), unmarked: unmarked, clock: &windowClock{}, publish: publish}
-	err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgsMode(u, skip, start, end-start, unmarked), w, w.clock)
+	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), clockOffset: videoClockOffset(a, clockBase), packetOffset: videoPacketOffset(a), sequence: videoSequence(a, start), unmarked: unmarked, clock: &windowClock{}, publish: publish}
+	err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgsForAsset(a, u, skip, start, end-start, unmarked, clockBase), w, w.clock)
 	if errors.Is(w.writeErr, errVideoWindowFull) {
 		if originErr, metadata := inputFailure.failure(); originErr != nil && !metadata {
 			return fmt.Errorf("upstream video download failed: %w", originErr)
@@ -183,6 +189,7 @@ func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []floa
 
 type fileVideoWindow struct {
 	first, end int
+	clockBase  float64
 	ctx        context.Context
 	cancel     context.CancelFunc
 	changed    chan struct{}
@@ -198,6 +205,14 @@ type fileVideoWindow struct {
 func videoCacheKey(v *Session, n int) string { return fmt.Sprintf("video:%s:%d", v.video.ID, n) }
 
 func (s *Server) fileVideo(ctx context.Context, v *Session, n int) ([]byte, error) {
+	clockBase := v.video.VideoClockBase
+	if v.video.HLS != nil {
+		var err error
+		clockBase, err = s.sectionClock(ctx, v, n)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var waiting *fileVideoWindow
 	for attempt := 0; attempt < 2; {
 		if err := ctx.Err(); err != nil {
@@ -238,15 +253,26 @@ func (s *Server) fileVideo(ctx context.Context, v *Session, n int) ([]byte, erro
 			}
 			// A window covers up to 30 seconds / approximately 24 MiB of
 			// source media. Publish its first segment without waiting for its end.
-			seconds := min(30.0, float64(24<<20)*v.Duration/float64(v.video.File.Size))
+			seconds := 30.0
+			if v.video.File != nil && v.video.File.Size > 0 {
+				seconds = min(seconds, float64(24<<20)*v.Duration/float64(v.video.File.Size))
+			}
 			end := n + 1
 			for end < len(v.boundaries)-1 && v.boundaries[end+1]-v.boundaries[n] <= seconds {
 				end++
 			}
+			if v.video.HLS != nil {
+				for i := n + 1; i < end && i < len(v.video.HLS.Segments); i++ {
+					if v.video.HLS.Segments[i].Discontinuity {
+						end = i
+						break
+					}
+				}
+			}
 			limit := s.lookaheadEnd(v, min(v.videoHighest+1, len(v.boundaries)-2))
 			end = max(n+1, min(end, limit))
 			windowCtx, cancel := context.WithTimeout(context.WithValue(v.ctx, videoBytesKey{}, &v.videoDownload), 60*time.Second)
-			window = &fileVideoWindow{first: n, end: end, ctx: windowCtx, cancel: cancel, changed: make(chan struct{}), last: -1}
+			window = &fileVideoWindow{first: n, end: end, clockBase: clockBase, ctx: windowCtx, cancel: cancel, changed: make(chan struct{}), last: -1}
 			v.videoWindow = window
 			go s.fillVideoWindow(v, window)
 		}
@@ -296,7 +322,7 @@ func (s *Server) fileVideo(ctx context.Context, v *Session, n int) ([]byte, erro
 
 func (s *Server) fillVideoWindow(v *Session, window *fileVideoWindow) {
 	defer window.cancel()
-	err := s.Engine.VideoWindow(window.ctx, v.video, v.boundaries[window.first:window.end+1], func(i int, data []byte) error {
+	err := s.Engine.VideoWindowWithClockBase(window.ctx, v.video, v.boundaries[window.first:window.end+1], window.clockBase, func(i int, data []byte) error {
 		if err := window.ctx.Err(); err != nil {
 			return err
 		}

@@ -141,6 +141,7 @@ type Session struct {
 	ready                    chan struct{}
 	prepareErr               error
 	video                    *Asset
+	sourceHasMuxedAudio      bool
 	variant                  *playlist.MultivariantVariant
 	clockBase                float64
 	tracks                   []Track
@@ -341,15 +342,21 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 	if probeErr != nil {
 		return fmt.Errorf("source video could not be read: %w", probeErr)
 	}
-	haveVideo := false
+	haveVideo, haveAudio := false, false
 	for _, stream := range p.Streams {
 		if stream.CodecType == "video" {
 			haveVideo = true
+			if a.HLS != nil && a.MP4VideoTag == "" {
+				a.MP4VideoTag = mp4VideoSampleEntry(stream.CodecName, stream.CodecTag)
+			}
+		} else if stream.CodecType == "audio" {
+			haveAudio = true
 		}
 	}
 	if !haveVideo {
 		return errors.New("source contains no playable video track")
 	}
+	v.sourceHasMuxedAudio = a.HLS != nil && haveAudio
 	if a.HLS != nil {
 		// Direct media playlists (including Movy's 2160p results) have no
 		// STREAM-INF codec metadata. VLC needs it to distinguish muxed source
@@ -377,6 +384,7 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 				v.note(fmt.Errorf("source timeline probe: %w; using the initial clock", e))
 			}
 		}
+		a.VideoClockBase = v.clockBase
 	}
 	for _, t := range p.Streams {
 		if t.CodecType != "audio" {

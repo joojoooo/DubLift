@@ -539,7 +539,12 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 				if err := media.Unmarshal(video); err != nil {
 					t.Fatal(err)
 				}
-				getBytes(t, local.URL+media.Segments[7].URI)
+				videoURL := local.URL + "/media/" + id + "/video.m3u8"
+				segmentURL, err := resolveURL(videoURL, media.Segments[7].URI)
+				if err != nil {
+					t.Fatal(err)
+				}
+				getBytes(t, segmentURL)
 			}
 			deadline := time.Now().Add(25 * time.Second)
 			for time.Now().Before(deadline) {
