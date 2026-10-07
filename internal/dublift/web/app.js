@@ -341,7 +341,6 @@ function sourceRow(source = { type: "addon", name: "", manifestURL: "" }, contai
     saveSources(container);
   };
   toggleLabel.append(toggle);
-  controls.append(toggleLabel);
   const actions = document.createElement("div");
   actions.className = "source-actions";
   const order = document.createElement("div");
@@ -365,7 +364,6 @@ function sourceRow(source = { type: "addon", name: "", manifestURL: "" }, contai
     };
     order.append(button);
   }
-  actions.append(order);
   if (!builtin) {
     const remove = document.createElement("button");
     remove.type = "button";
@@ -381,7 +379,8 @@ function sourceRow(source = { type: "addon", name: "", manifestURL: "" }, contai
     };
     actions.append(remove);
   }
-  controls.append(actions);
+  actions.append(order);
+  controls.append(actions, toggleLabel);
   row.append(controls);
   container.append(row);
   syncSourceControls(container);
