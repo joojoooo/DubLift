@@ -909,6 +909,130 @@ func (e *Engine) Audio(ctx context.Context, t Track, start, duration, offset, cl
 	trim := []string{"-nostdin", "-v", "error", "-i", "pipe:0", "-ss", decimal(clockStart), "-t", decimal(duration - frame), "-map", "0:a:0", "-c", "copy", "-copyts", "-mpegts_copyts", "1", "-output_ts_offset", decimal(clockStart), "-mpegts_flags", "+initial_discontinuity", "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", "pipe:1"}
 	return e.runInput(ctx, e.Config.Get().FFmpeg, trim, encoded, 4<<20)
 }
+
+func (e *Engine) AudioFMP4(ctx context.Context, t Track, seq uint32, start, duration, offset, clockBase float64) ([]byte, error) {
+	finish := e.foregroundFile(t.Asset)
+	defer finish()
+	vixStart := start - offset
+	leading := max(0, -vixStart)
+	inputStart := max(0, vixStart)
+	available := max(0, min(duration-leading, t.Asset.Duration()-inputStart))
+	args := []string{"-nostdin", "-v", "error", "-threads", "1"}
+	cleanup := func() {}
+	if available > .001 {
+		u, skip, done, err := e.job(ctx, t.Asset, inputStart, available+1, false)
+		if err != nil {
+			return nil, err
+		}
+		cleanup = done
+		trimStart := 0.0
+		if t.Asset.File != nil {
+			args = append(args, "-ss", decimal(skip))
+		} else {
+			trimStart = skip
+		}
+		args = append(args, "-discard:v", "all")
+		args = append(args, ffInput(u)...)
+		args = append(args, "-map", t.Selector, "-af", fmt.Sprintf("asetpts=PTS-STARTPTS,atrim=start=%s:duration=%s,asetpts=PTS-STARTPTS,adelay=%d:all=1,apad", decimal(trimStart), decimal(available), int(math.Round(leading*1000))))
+	} else {
+		args = append(args, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo")
+	}
+	defer cleanup()
+	args = append(args, "-t", decimal(duration), "-vn", "-sn", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1")
+	raw, err := e.run(ctx, e.Config.Get().FFmpeg, args, 4<<20)
+	if err != nil {
+		return nil, err
+	}
+	_, media, err := splitFMP4(raw)
+	if err != nil {
+		return nil, err
+	}
+	return patchFMP4AudioFragment(media, seq, 48000, start+clockBase)
+}
+
+func (e *Engine) AudioInit(ctx context.Context) ([]byte, error) {
+	args := []string{
+		"-nostdin", "-v", "error", "-threads", "1",
+		"-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+		"-t", "0.1",
+		"-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+		"-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4", "pipe:1",
+	}
+	raw, err := e.run(ctx, e.Config.Get().FFmpeg, args, 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	init, _, err := splitFMP4(raw)
+	return init, err
+}
+
+func patchFMP4AudioFragment(data []byte, seq uint32, timescale uint32, startSeconds float64) ([]byte, error) {
+	out := append([]byte(nil), data...)
+	for i := 0; i+8 <= len(out); {
+		sz := int(binary.BigEndian.Uint32(out[i:]))
+		if sz < 8 || i+sz > len(out) {
+			break
+		}
+		if string(out[i+4:i+8]) == "mfra" {
+			out = out[:i]
+			break
+		}
+		i += sz
+	}
+	patched := false
+	for i := 0; i+8 <= len(out); {
+		sz := int(binary.BigEndian.Uint32(out[i:]))
+		if sz < 8 || i+sz > len(out) {
+			break
+		}
+		if string(out[i+4:i+8]) == "moof" {
+			for j := i + 8; j+8 <= i+sz; {
+				jsz := int(binary.BigEndian.Uint32(out[j:]))
+				if jsz < 8 || j+jsz > i+sz {
+					break
+				}
+				boxType := string(out[j+4 : j+8])
+				if boxType == "mfhd" && jsz >= 16 {
+					binary.BigEndian.PutUint32(out[j+12:j+16], seq)
+				} else if boxType == "traf" {
+					for k := j + 8; k+8 <= j+jsz; {
+						ksz := int(binary.BigEndian.Uint32(out[k:]))
+						if ksz < 8 || k+ksz > j+jsz {
+							break
+						}
+						if string(out[k+4:k+8]) == "tfdt" {
+							if ksz < 16 {
+								return nil, errors.New("truncated tfdt box")
+							}
+							version := out[k+8]
+							val := int64(math.Round(startSeconds * float64(timescale)))
+							if val < 0 {
+								val = 0
+							}
+							if version == 1 {
+								if ksz < 20 {
+									return nil, errors.New("truncated 64-bit tfdt box")
+								}
+								binary.BigEndian.PutUint64(out[k+12:k+20], uint64(val))
+							} else {
+								binary.BigEndian.PutUint32(out[k+12:k+16], uint32(val))
+							}
+							patched = true
+						}
+						k += ksz
+					}
+				}
+				j += jsz
+			}
+		}
+		i += sz
+	}
+	if !patched {
+		return nil, errors.New("tfdt box not found in fMP4 fragment")
+	}
+	return out, nil
+}
 func (e *Engine) Video(ctx context.Context, a *Asset, start, duration float64) ([]byte, error) {
 	finish := e.foregroundFile(a)
 	defer finish()

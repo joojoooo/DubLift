@@ -511,11 +511,11 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			if len(parsed.Renditions) == 0 {
 				t.Fatalf("master has no renditions:\n%s", master)
 			}
-			last := parsed.Renditions[len(parsed.Renditions)-1]
-			if last.Language != "it" || !last.Default || last.Type != playlist.MultivariantRenditionTypeAudio {
-				t.Fatalf("Italian audio is not the last and default rendition:\n%s", master)
+			first := parsed.Renditions[0]
+			if first.Language != "it" || !first.Default || first.Type != playlist.MultivariantRenditionTypeAudio {
+				t.Fatalf("Italian audio is not the first and default rendition:\n%s", master)
 			}
-			for _, rendition := range parsed.Renditions[:len(parsed.Renditions)-1] {
+			for _, rendition := range parsed.Renditions[1:] {
 				if rendition.Type == playlist.MultivariantRenditionTypeAudio && (rendition.Default || rendition.Autoselect) {
 					t.Fatalf("another audio rendition can be chosen automatically:\n%s", master)
 				}

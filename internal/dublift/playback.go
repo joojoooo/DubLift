@@ -232,6 +232,20 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if p[3] == "init.mp4" && !track.Subtitle {
+			ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+			defer cancel()
+			init, err := s.Engine.Cache.Get(ctx, "audio-init", func() ([]byte, error) {
+				return s.Engine.AudioInit(ctx)
+			})
+			if err != nil {
+				v.note(err)
+				failure(w, 502, err)
+				return
+			}
+			serveBytes(w, r, "video/mp4", init)
+			return
+		}
 		n, err := strconv.Atoi(strings.Split(p[3], ".")[0])
 		if err != nil || n < 0 || n >= len(v.boundaries)-1 {
 			http.NotFound(w, r)
@@ -253,6 +267,20 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			v.note(err)
 			failure(w, 502, err)
+			return
+		}
+		if strings.HasSuffix(p[3], ".m4s") && !track.Subtitle {
+			key := fmt.Sprintf("track-fmp4:%s:%s:%d:%.6f:%.6f", v.Key, track.ID, n, offset, clockBase)
+			data, err := s.Engine.Cache.Get(ctx, key, func() ([]byte, error) {
+				return s.Engine.AudioFMP4(ctx, *track, uint32(n+1), start, duration, offset, clockBase)
+			})
+			if err != nil {
+				v.note(err)
+				failure(w, 502, err)
+				return
+			}
+			s.prefetchAudio(v, *track, n)
+			serveBytes(w, r, "video/mp4", data)
 			return
 		}
 		key := fmt.Sprintf("track:%s:%s:%d:%.6f:%.6f", v.Key, track.ID, n, offset, clockBase)
@@ -314,6 +342,7 @@ func (s *Server) prefetchAudio(v *Session, track Track, n int) {
 		v.audioPrefetch.stop()
 		v.audioPrefetchID = track.ID
 	}
+	fmp4 := s.isFMP4Video(v)
 	v.audioPrefetch.schedule(v.ctx, n+1, s.lookaheadEnd(v, n+1), func(ctx context.Context, index int) error {
 		start := v.boundaries[index]
 		offset := 0.0
@@ -322,6 +351,13 @@ func (s *Server) prefetchAudio(v *Session, track Track, n int) {
 		}
 		clockBase, err := s.sectionClock(ctx, v, index)
 		if err != nil {
+			return err
+		}
+		if fmp4 {
+			key := fmt.Sprintf("track-fmp4:%s:%s:%d:%.6f:%.6f", v.Key, track.ID, index, offset, clockBase)
+			_, err = s.Engine.Cache.Get(ctx, key, func() ([]byte, error) {
+				return s.Engine.AudioFMP4(ctx, track, uint32(index+1), start, v.boundaries[index+1]-start, offset, clockBase)
+			})
 			return err
 		}
 		key := fmt.Sprintf("track:%s:%s:%d:%.6f:%.6f", v.Key, track.ID, index, offset, clockBase)
@@ -360,7 +396,7 @@ func serveBytes(w http.ResponseWriter, r *http.Request, kind string, data []byte
 	http.ServeContent(w, r, "segment", time.Time{}, bytes.NewReader(data))
 }
 func (s *Server) master(v *Session) ([]byte, error) {
-	m := playlist.Multivariant{Version: 7}
+	m := playlist.Multivariant{Version: 7, IndependentSegments: true}
 	variant := playlist.MultivariantVariant{Bandwidth: 20000000}
 	if v.variant != nil {
 		variant = *v.variant
@@ -386,17 +422,24 @@ func (s *Server) master(v *Session) ([]byte, error) {
 			}
 		}
 	}
-	// VLC 3 chooses the last audio rendition even when another is marked
-	// DEFAULT. Keep the selected Italian rendition last for VLC while retaining
-	// the HLS default flag for players that honor it.
+	// Default audio rendition comes first so players (like ExoPlayer on Stremio Android)
+	// select it by default on start. Non-default audio renditions follow with explicit
+	// DEFAULT=NO,AUTOSELECT=NO so players that parse all renditions (like VLC 3) honor
+	// the default track selection. Subtitles follow all audio renditions so the audio
+	// group remains contiguous.
 	ordered := make([]Track, 0, len(v.tracks))
 	for _, t := range v.tracks {
-		if t.ID != defaultID {
+		if !t.Subtitle && t.ID == defaultID {
 			ordered = append(ordered, t)
 		}
 	}
 	for _, t := range v.tracks {
-		if t.ID == defaultID {
+		if !t.Subtitle && t.ID != defaultID {
+			ordered = append(ordered, t)
+		}
+	}
+	for _, t := range v.tracks {
+		if t.Subtitle {
 			ordered = append(ordered, t)
 		}
 	}
@@ -415,6 +458,9 @@ func (s *Server) master(v *Session) ([]byte, error) {
 			variant.Subtitles = "subs"
 		}
 		name := safeHLSName(t.Name)
+		if t.Subtitle && !strings.Contains(strings.ToLower(name), "subtitle") && !strings.Contains(strings.ToLower(name), "sottotitoli") {
+			name += " (Subtitles)"
+		}
 		names[group+name]++
 		if n := names[group+name]; n > 1 {
 			name += fmt.Sprintf(" (%d)", n)
@@ -437,9 +483,23 @@ func (s *Server) master(v *Session) ([]byte, error) {
 	}
 	m.Variants = []*playlist.MultivariantVariant{&variant}
 	b, err := m.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	// gohlslib omits AUTOSELECT=NO and DEFAULT=NO for non-default renditions.
+	// Explicitly specifying them ensures VLC 3 selects the default rendition
+	// even when the default rendition is listed first for ExoPlayer.
+	var lines [][]byte
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("#EXT-X-MEDIA:TYPE=AUDIO")) && !bytes.Contains(line, []byte("DEFAULT=YES")) {
+			line = bytes.Replace(line, []byte("NAME="), []byte("AUTOSELECT=NO,DEFAULT=NO,NAME="), 1)
+		}
+		lines = append(lines, line)
+	}
+	b = bytes.Join(lines, []byte("\n"))
 	// CODECS is optional in HLS. An empty value is misleading to ExoPlayer;
 	// codec discovery is delegated to the init segment when unknown.
-	return bytes.ReplaceAll(b, []byte(`,CODECS=""`), nil), err
+	return bytes.ReplaceAll(b, []byte(`,CODECS=""`), nil), nil
 }
 
 func safeHLSName(s string) string {
@@ -450,6 +510,23 @@ func safeHLSName(s string) string {
 		return r
 	}, s)
 }
+
+func (s *Server) isFMP4Video(v *Session) bool {
+	if v == nil || v.video == nil {
+		return false
+	}
+	if v.video.File != nil || s.separateMuxedSourceAudio(v) {
+		return true
+	}
+	if v.video.HLS != nil {
+		if len(v.video.HLS.Segments) > 0 && v.video.HLS.Segments[0].Map != "" {
+			return true
+		}
+		return strings.Contains(v.video.HLS.Raw, "#EXT-X-MAP:")
+	}
+	return false
+}
+
 func (s *Server) generatedPlaylist(v *Session, t *Track) string {
 	var b strings.Builder
 	target := 1
@@ -466,6 +543,8 @@ func (s *Server) generatedPlaylist(v *Session, t *Track) string {
 		// init map with a different URI at every segment makes VLC reopen the
 		// fMP4 demuxer and can reset its playback clock at each boundary.
 		b.WriteString("#EXT-X-MAP:URI=\"video/0/init.mp4\"\n")
+	} else if !t.Subtitle && s.isFMP4Video(v) {
+		fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"%s/init.mp4\"\n", t.ID)
 	}
 	for i := 0; i < len(v.boundaries)-1; i++ {
 		duration := v.boundaries[i+1] - v.boundaries[i]
@@ -478,6 +557,8 @@ func (s *Server) generatedPlaylist(v *Session, t *Track) string {
 			ext := "ts"
 			if t.Subtitle {
 				ext = "vtt"
+			} else if s.isFMP4Video(v) {
+				ext = "m4s"
 			}
 			fmt.Fprintf(&b, "#EXTINF:%.6f,\n%s/%d.%s\n", duration, t.ID, i, ext)
 		}

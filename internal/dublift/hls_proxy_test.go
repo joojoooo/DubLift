@@ -220,6 +220,7 @@ func TestMuxedHLSAudioIsExposedAsAnExternalRendition(t *testing.T) {
 	v.variant = &playlist.MultivariantVariant{Bandwidth: 500000, Codecs: []string{"avc1.42c00a", "mp4a.40.2"}}
 	v.tracks = []Track{
 		{ID: "source-1", Name: "Original English", Lang: "en", Asset: v.video, Selector: "0:1", Original: true},
+		{ID: "vix-en-0", Name: "English · Vixsrc", Lang: "en", Asset: v.video, Selector: "0:1"},
 		{ID: "vix-it-0", Name: "Italian · Vixsrc", Lang: "it", Asset: v.video, Selector: "0:1"},
 	}
 	local := httptest.NewServer(s)
@@ -230,10 +231,13 @@ func TestMuxedHLSAudioIsExposedAsAnExternalRendition(t *testing.T) {
 	if err := master.Unmarshal(getBytes(t, base+"/master.m3u8")); err != nil {
 		t.Fatal(err)
 	}
-	var original *playlist.MultivariantRendition
+	var original, vixEnglish *playlist.MultivariantRendition
 	for _, rendition := range master.Renditions {
 		if rendition.Name == "Original English" {
 			original = rendition
+		}
+		if rendition.Name == "English · Vixsrc" {
+			vixEnglish = rendition
 		}
 		if rendition.Name == "Italian · Vixsrc" && !rendition.Default {
 			t.Fatal("Italian audio is not the default rendition")
@@ -241,6 +245,9 @@ func TestMuxedHLSAudioIsExposedAsAnExternalRendition(t *testing.T) {
 	}
 	if original == nil || original.URI == nil {
 		t.Fatal("muxed source audio was not exposed as a separate rendition")
+	}
+	if vixEnglish == nil || vixEnglish.URI == nil {
+		t.Fatal("Vixsrc English was not exposed as an alternative audio rendition")
 	}
 	if len(master.Variants[0].Codecs) != 2 || master.Variants[0].Codecs[1] != "mp4a.40.2" {
 		t.Fatalf("master lost its source and external audio codecs: %v", master.Variants[0].Codecs)
@@ -286,6 +293,13 @@ func TestMuxedHLSAudioIsExposedAsAnExternalRendition(t *testing.T) {
 	}
 	audio := getBytes(t, audioURL)
 	path := filepath.Join(dir, "original-audio.ts")
+	if strings.HasSuffix(audioURL, ".m4s") {
+		path = filepath.Join(dir, "original-audio.mp4")
+		initURL, err := resolveURL(originalURL, "source-1/init.mp4")
+		if err == nil {
+			audio = append(getBytes(t, initURL), audio...)
+		}
+	}
 	if err := os.WriteFile(path, audio, 0600); err != nil {
 		t.Fatal(err)
 	}

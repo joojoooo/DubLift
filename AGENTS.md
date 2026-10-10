@@ -20,8 +20,11 @@
   is intentional.
 - Transformed playback uses local playlists and media endpoints. Preserve
   origin headers/cookies, HLS resource URLs, byte ranges, and media clocks.
-- Stream-copy source video. Keep origin reads, caches, extraction windows,
-  and subprocess output bounded; do not add whole-file download fallbacks.
+- Stream-copy source video. When an HLS source contains muxed audio and alternate
+  audio tracks are active, stream-copy video into video-only segments so players
+  (such as web browsers using MSE/hls.js) can select external audio renditions.
+  Keep origin reads, caches, extraction windows, and subprocess output bounded;
+  do not add whole-file download fallbacks.
 - Preserve foreground playback priority over background alignment. Context
   cancellation must stop obsolete reads and jobs; canceled work must not
   repopulate discarded cache/session state.
