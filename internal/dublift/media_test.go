@@ -501,32 +501,34 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			if resp.StatusCode != 200 {
 				t.Fatalf("master: %s", master)
 			}
-			if !strings.Contains(string(master), `NAME="Italian · Vixsrc",AUTOSELECT=YES,DEFAULT=YES`) {
-				t.Fatalf("Italian not preferred:\n%s", master)
-			}
 			var parsed playlist.Multivariant
 			if err := parsed.Unmarshal(master); err != nil {
 				t.Fatal(err)
 			}
-			if len(parsed.Renditions) == 0 {
-				t.Fatalf("master has no renditions:\n%s", master)
-			}
-			first := parsed.Renditions[0]
-			if first.Language != "it" || !first.Default || first.Type != playlist.MultivariantRenditionTypeAudio {
-				t.Fatalf("Italian audio is not the first and default rendition:\n%s", master)
-			}
-			for _, rendition := range parsed.Renditions[1:] {
-				if rendition.Type == playlist.MultivariantRenditionTypeAudio && (rendition.Default || rendition.Autoselect) {
-					t.Fatalf("another audio rendition can be chosen automatically:\n%s", master)
-				}
-			}
 			id := strings.Split(strings.TrimPrefix(stream.URL, local.URL+"/media/"), "/")[0]
-			session := server.getSession(id)
-			if session.video.HLS != nil {
-				if len(parsed.Variants[0].Codecs) != 2 || !strings.HasPrefix(parsed.Variants[0].Codecs[0], "avc1.") || parsed.Variants[0].Codecs[1] != "mp4a.40.2" {
-					t.Fatalf("HLS master lacks source video and Italian AAC codecs:\n%s", master)
+			var audioRenditions []*playlist.MultivariantRendition
+			for _, rendition := range parsed.Renditions {
+				if rendition.Type == playlist.MultivariantRenditionTypeAudio {
+					audioRenditions = append(audioRenditions, rendition)
+					if rendition.Language != "it" && rendition.Default {
+						t.Fatalf("non-Italian audio rendition is marked default:\n%s", master)
+					}
+					if rendition.URI != nil && *rendition.URI != "" {
+						getBytes(t, local.URL+"/media/"+id+"/"+*rendition.URI)
+					}
 				}
 			}
+			if len(audioRenditions) == 0 {
+				t.Fatalf("master has no audio renditions:\n%s", master)
+			}
+			firstAudio := audioRenditions[0]
+			if firstAudio.Language != "it" || !firstAudio.Default {
+				t.Fatalf("Italian audio is not the first audio rendition or not default:\n%s", master)
+			}
+			if len(parsed.Variants[0].Codecs) != 2 || !strings.HasPrefix(parsed.Variants[0].Codecs[0], "avc1.") || parsed.Variants[0].Codecs[1] != "mp4a.40.2" {
+				t.Fatalf("master lacks source video and Italian AAC codecs:\n%s", master)
+			}
+			session := server.getSession(id)
 			// Immediate file alignment uses a complete playback window. Start
 			// with the segment this simulated player watches after seeking.
 			if session.video.File != nil {

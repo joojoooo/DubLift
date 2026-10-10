@@ -357,18 +357,34 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 		return errors.New("source contains no playable video track")
 	}
 	v.sourceHasMuxedAudio = a.HLS != nil && haveAudio
-	if a.HLS != nil {
-		// Direct media playlists (including Movy's 2160p results) have no
-		// STREAM-INF codec metadata. VLC needs it to distinguish muxed source
-		// audio from the added Italian rendition. Reuse the bounded probe.
-		if v.variant == nil {
-			v.variant = &playlist.MultivariantVariant{Bandwidth: 20000000}
-		}
-		if len(v.variant.Codecs) == 0 {
-			if codec := probeVideoCodec(p); codec != "" {
-				v.variant.Codecs = []string{codec}
+	if v.variant == nil {
+		v.variant = &playlist.MultivariantVariant{Bandwidth: 20000000}
+	}
+	if len(v.variant.Codecs) == 0 {
+		codec := probeVideoCodec(p)
+		if codec == "" {
+			for _, stream := range p.Streams {
+				if stream.CodecType == "video" {
+					switch stream.CodecName {
+					case "h264":
+						codec = "avc1.640028"
+					case "hevc":
+						codec = "hvc1.1.6.L93.B0"
+					case "vp9":
+						codec = "vp09.00.10.08"
+					case "av1":
+						codec = "av01.0.04M.08"
+					}
+					break
+				}
 			}
 		}
+		if codec == "" {
+			codec = "avc1.640028"
+		}
+		v.variant.Codecs = []string{codec}
+	}
+	if a.HLS != nil {
 		v.clockBase, _ = strconv.ParseFloat(p.Format.StartTime, 64)
 		// Some fMP4 packagers include the initial encoder gap in EXTINF.
 		// The first packet's PTS is then not the origin of the playlist clock.
@@ -391,10 +407,14 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 			continue
 		}
 		lang := language(t.Tags.Language)
-		track := Track{ID: fmt.Sprintf("source-%d", t.Index), Name: fmt.Sprintf("Original %s · %s · track %d", lang, strings.ToUpper(t.CodecName), t.Index), Lang: lang, Asset: a, Selector: fmt.Sprintf("0:%d", t.Index), Original: true}
-		if t.Tags.Title != "" {
-			track.Name = t.Tags.Title
+		name := fmt.Sprintf("Original %s · %s · track %d", lang, strings.ToUpper(t.CodecName), t.Index)
+		if lang == "en" {
+			name = "Original English"
 		}
+		if t.Tags.Title != "" {
+			name = t.Tags.Title
+		}
+		track := Track{ID: fmt.Sprintf("source-%d", t.Index), Name: name, Lang: lang, Asset: a, Selector: fmt.Sprintf("0:%d", t.Index), Original: true}
 		v.tracks = append(v.tracks, track)
 		if lang == "en" && v.sourceEnglish == nil {
 			cp := track

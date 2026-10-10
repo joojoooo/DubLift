@@ -396,7 +396,7 @@ func serveBytes(w http.ResponseWriter, r *http.Request, kind string, data []byte
 	http.ServeContent(w, r, "segment", time.Time{}, bytes.NewReader(data))
 }
 func (s *Server) master(v *Session) ([]byte, error) {
-	m := playlist.Multivariant{Version: 7, IndependentSegments: true}
+	m := playlist.Multivariant{Version: 7}
 	variant := playlist.MultivariantVariant{Bandwidth: 20000000}
 	if v.variant != nil {
 		variant = *v.variant
@@ -424,20 +424,39 @@ func (s *Server) master(v *Session) ([]byte, error) {
 	}
 	// Default audio rendition comes first so players (like ExoPlayer on Stremio Android)
 	// select it by default on start. Non-default audio renditions follow with explicit
-	// DEFAULT=NO,AUTOSELECT=NO so players that parse all renditions (like VLC 3) honor
-	// the default track selection. Subtitles follow all audio renditions so the audio
-	// group remains contiguous.
+	// DEFAULT=NO,AUTOSELECT=YES so players that parse all renditions (like VLC 3) honor
+	// the default track selection while players that allow switching (like Stremio) can
+	// choose between them. Subtitles follow all audio renditions so the audio group
+	// remains contiguous.
 	ordered := make([]Track, 0, len(v.tracks))
+	seenAudioLangs := map[string]bool{}
+	// Default audio rendition comes first so players (like ExoPlayer on Stremio Android)
+	// select it by default on start.
 	for _, t := range v.tracks {
 		if !t.Subtitle && t.ID == defaultID {
 			ordered = append(ordered, t)
+			seenAudioLangs[t.Lang] = true
+			break
 		}
 	}
+	// Prefer secondary source tracks (e.g. Vixsrc English) for alternate languages
+	// so both Italian and English tracks share the same Vixsrc origin, timeline,
+	// and fMP4 transmuxing pipeline (matching ToastFlix).
 	for _, t := range v.tracks {
-		if !t.Subtitle && t.ID != defaultID {
+		if !t.Subtitle && t.ID != defaultID && !t.Original && !seenAudioLangs[t.Lang] {
 			ordered = append(ordered, t)
+			seenAudioLangs[t.Lang] = true
 		}
 	}
+	// Fallback to original source audio tracks (e.g. Original English from video)
+	// when secondary source did not provide that language.
+	for _, t := range v.tracks {
+		if !t.Subtitle && t.ID != defaultID && !seenAudioLangs[t.Lang] {
+			ordered = append(ordered, t)
+			seenAudioLangs[t.Lang] = true
+		}
+	}
+	// Subtitles follow all audio renditions so the audio group remains contiguous.
 	for _, t := range v.tracks {
 		if t.Subtitle {
 			ordered = append(ordered, t)
@@ -465,12 +484,24 @@ func (s *Server) master(v *Session) ([]byte, error) {
 		if n := names[group+name]; n > 1 {
 			name += fmt.Sprintf(" (%d)", n)
 		}
-		m.Renditions = append(m.Renditions, &playlist.MultivariantRendition{Type: typ, GroupID: group, Name: name, Language: t.Lang, Autoselect: t.Subtitle || t.ID == defaultID, Default: t.ID == defaultID, URI: uriPointer})
+		rend := &playlist.MultivariantRendition{
+			Type:       typ,
+			GroupID:    group,
+			Name:       name,
+			Language:   t.Lang,
+			Autoselect: true,
+			Default:    t.ID == defaultID,
+			URI:        uriPointer,
+		}
+		m.Renditions = append(m.Renditions, rend)
 	}
 	if defaultID == "" {
 		variant.Audio = ""
 	}
-	if len(variant.Codecs) > 0 && defaultID != "" {
+	if len(variant.Codecs) == 0 {
+		variant.Codecs = []string{"avc1.640028"}
+	}
+	if defaultID != "" {
 		found := false
 		for _, c := range variant.Codecs {
 			if c == "mp4a.40.2" {
@@ -486,13 +517,18 @@ func (s *Server) master(v *Session) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// gohlslib omits AUTOSELECT=NO and DEFAULT=NO for non-default renditions.
-	// Explicitly specifying them ensures VLC 3 selects the default rendition
-	// even when the default rendition is listed first for ExoPlayer.
+	// gohlslib omits DEFAULT=NO for non-default renditions. Explicitly specifying
+	// DEFAULT=NO ensures VLC 3 selects the default Italian rendition instead of
+	// subsequent renditions, while preserving AUTOSELECT=YES so ExoPlayer in
+	// Stremio on Android can switch between all audio renditions.
 	var lines [][]byte
 	for _, line := range bytes.Split(b, []byte("\n")) {
 		if bytes.HasPrefix(line, []byte("#EXT-X-MEDIA:TYPE=AUDIO")) && !bytes.Contains(line, []byte("DEFAULT=YES")) {
-			line = bytes.Replace(line, []byte("NAME="), []byte("AUTOSELECT=NO,DEFAULT=NO,NAME="), 1)
+			if bytes.Contains(line, []byte("AUTOSELECT=YES")) {
+				line = bytes.Replace(line, []byte("AUTOSELECT=YES"), []byte("DEFAULT=NO,AUTOSELECT=YES"), 1)
+			} else {
+				line = bytes.Replace(line, []byte("NAME="), []byte("DEFAULT=NO,NAME="), 1)
+			}
 		}
 		lines = append(lines, line)
 	}

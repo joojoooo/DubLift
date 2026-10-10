@@ -243,11 +243,29 @@ func TestMuxedHLSAudioIsExposedAsAnExternalRendition(t *testing.T) {
 			t.Fatal("Italian audio is not the default rendition")
 		}
 	}
-	if original == nil || original.URI == nil {
-		t.Fatal("muxed source audio was not exposed as a separate rendition")
-	}
 	if vixEnglish == nil || vixEnglish.URI == nil {
-		t.Fatal("Vixsrc English was not exposed as an alternative audio rendition")
+		t.Fatal("Vixsrc English was not exposed as a separate rendition")
+	}
+	if original != nil {
+		t.Fatal("muxed source audio should not be exposed when Vixsrc English is available")
+	}
+
+	// When Vixsrc English is absent, the muxed source audio is exposed as fallback.
+	v.tracks = []Track{
+		{ID: "source-1", Name: "Original English", Lang: "en", Asset: v.video, Selector: "0:1", Original: true},
+		{ID: "vix-it-0", Name: "Italian · Vixsrc", Lang: "it", Asset: v.video, Selector: "0:1"},
+	}
+	if err := master.Unmarshal(getBytes(t, base+"/master.m3u8")); err != nil {
+		t.Fatal(err)
+	}
+	original = nil
+	for _, rendition := range master.Renditions {
+		if rendition.Name == "Original English" {
+			original = rendition
+		}
+	}
+	if original == nil || original.URI == nil {
+		t.Fatal("muxed source audio was not exposed as fallback when Vixsrc English is absent")
 	}
 	if len(master.Variants[0].Codecs) != 2 || master.Variants[0].Codecs[1] != "mp4a.40.2" {
 		t.Fatalf("master lost its source and external audio codecs: %v", master.Variants[0].Codecs)
