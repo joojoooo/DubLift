@@ -189,6 +189,17 @@ func TestMovyMovieAndEpisodeRequests(t *testing.T) {
 	}
 }
 
+func TestMovyScriptsFromTagsAndLoaderJSON(t *testing.T) {
+	page := `<script src="/_next/static/chunks/a.js"></script><script>load([{"src":"/_next/static/chunks/b.js"},{"src": "/_next/static/chunks/c.js?v=1"}])</script>`
+	var got []string
+	for _, match := range movyScriptRE.FindAllStringSubmatch(page, -1) {
+		got = append(got, match[1])
+	}
+	if strings.Join(got, " ") != "/_next/static/chunks/a.js /_next/static/chunks/b.js /_next/static/chunks/c.js?v=1" {
+		t.Fatalf("scripts = %q", got)
+	}
+}
+
 func TestMovyPageRejectsWrongTitle(t *testing.T) {
 	for _, data := range []string{movyPage("604", "movie", "Other"), movyPage("603", "tv", "Other"), movyPage("603", "movie", ""), `<script id="__NEXT_DATA__">invalid</script>`, `no player`} {
 		if _, err := parseMovyPage([]byte(data), "movie", "603"); err == nil {
