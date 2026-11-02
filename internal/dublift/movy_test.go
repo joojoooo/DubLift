@@ -197,6 +197,57 @@ func TestMovyPageRejectsWrongTitle(t *testing.T) {
 	}
 }
 
+func TestMovyDeferredPlayerScripts(t *testing.T) {
+	var scriptCalls atomic.Int64
+	var origin *httptest.Server
+	origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/movie/157336":
+			// Movy's deferred loader creates script elements from inline JSON
+			// after the first paint instead of rendering script src attributes.
+			page := strings.Replace(movyPage("157336", "movie", "Interstellar"), `<script src="/_next/static/chunks/player.js"></script>`, `<script>(function(chunks){ /* deferred boot */ })([{"src":"https://external.test/_next/static/tracker.js"},{"src":"/_next/static/chunks/player.js"},{"src":"/_next/static/chunks/player.js"}]);</script>`, 1)
+			io.WriteString(w, page)
+		case "/_next/static/chunks/player.js":
+			scriptCalls.Add(1)
+			if r.Header.Get("Referer") != origin.URL+"/movie/157336?play=true" {
+				t.Error("player script referer lost")
+			}
+			io.WriteString(w, `/seattle/sources`)
+		case "/movy-api/seed":
+			io.WriteString(w, `{"seed":"fixture-seed"}`)
+		case "/movy-api/seattle/sources":
+			io.WriteString(w, movyEnvelope(t, movyPayload{Sources: []movySource{{URL: origin.URL + "/video.m3u8", Quality: "1080p", Type: "hls"}}}, "fixture-seed", 157336))
+		case "/movy-subtitles/search":
+			io.WriteString(w, `[]`)
+		default:
+			t.Errorf("unexpected discovery request: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer origin.Close()
+	n := NewNetwork()
+	mockMovyNetwork(n, origin.URL)
+	transport := n.Client.Transport
+	n.Client.Transport = movyRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "external.test" {
+			t.Error("discovery fetched an external script")
+		}
+		return transport.RoundTrip(r)
+	})
+	for range 2 {
+		streams, err := n.ResolveMovy(context.Background(), origin.URL, Content{Type: "movie"}, "157336")
+		if err != nil || len(streams) != 1 {
+			t.Fatalf("deferred player discovery: streams=%d error=%v", len(streams), err)
+		}
+		if !strings.HasPrefix(streams[0].Title, "Interstellar\n") || !strings.Contains(streams[0].Name, "1080p") {
+			t.Fatal("deferred player title or quality lost")
+		}
+	}
+	if scriptCalls.Load() != 1 {
+		t.Fatalf("player script deduplication/cache: calls=%d", scriptCalls.Load())
+	}
+}
+
 func TestMovyMinimumQualityResults(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

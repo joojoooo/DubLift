@@ -25,7 +25,11 @@ const movyMinHeight = 1080
 const movyQuickScrapeTimeout = 8 * time.Second
 
 var movyNextDataRE = regexp.MustCompile(`(?is)<script\b[^>]*\bid=["']__NEXT_DATA__["'][^>]*>(.*?)</script>`)
-var movyScriptRE = regexp.MustCompile(`(?i)\bsrc=["']([^"']+\.js(?:\?[^"']*)?)["']`)
+
+// Player chunks appear in both script src attributes and the inline JSON
+// array used by Movy's deferred script loader. Only inspect their URLs;
+// downloaded JavaScript is never executed.
+var movyScriptRE = regexp.MustCompile(`(?i)\bsrc["']?\s*[:=]\s*["']([^"']+\.js(?:\?[^"']*)?)["']`)
 var movyRouteRE = regexp.MustCompile(`/([a-z]{2,24})/sources\b`)
 var movyHeightRE = regexp.MustCompile(`(?i)(\d{3,4})\s*p\b`)
 var movyEmbedRE = regexp.MustCompile(`(?i)/embed(?:/|\?|$)`)
