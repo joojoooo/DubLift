@@ -21,9 +21,12 @@ make release
   metadata decoding/server discovery (including deferred script loaders) and
   VixSrc audio integration, VixSrc
   qualities and native playback across restarts, HTTP ranges and retries,
-  HLS proxying, file remuxing/timing, generated audio, alignment, dashboard APIs, and
-  session/cache lifecycle. The race detector checks executed Go code for data
-  races.
+  HLS proxying, file remuxing/timing, generated fMP4 audio (including parallel
+  requests, retries, byte ranges, short final GOPs, wrapped HLS clocks with
+  TS initialization maps, bounded/ranged/encrypted initialization detection,
+  and adjacent fragment clocks), alignment, dashboard APIs, and session/cache
+  lifecycle. The race detector checks executed
+  Go code for data races.
 - **Vet / module verification:** static Go diagnostics and cached dependency
   integrity. These do not prove playback or provider availability.
 - **Formatting / diff:** Go formatting and patch whitespace. Review Markdown
@@ -64,11 +67,14 @@ Node.js is not needed to run the server.
 With VLC installed, run:
 
 ```sh
-DUBLIFT_VLC_TESTS=1 go test ./internal/dublift -run '^TestVirtualHLSEndToEnd$' -count=1 -v
+DUBLIFT_VLC_TESTS=1 go test ./internal/dublift -run '^Test(VirtualHLSEndToEnd|GeneratedAudioWrappedHLSClock)$' -count=1 -v
 ```
 
 This uses synthetic MKV, MPEG-TS HLS, and fMP4 HLS sources. It requires VLC
-to decode video and select Italian audio both before and after a seek.
+to decode video and select Italian audio both before and after a seek, including
+MPEG-TS timestamp rollover. The wrapped-clock fixture separately checks generated
+fragment clocks after discontinuity resets; VLC cannot seek directly into that
+fixture's reset section even when playing its original TS playlist.
 If VLC's custom HTTP client fails local connections (observed with the Snap
 build), add `DUBLIFT_VLC_USE_ACCESS=1` to test with `--adaptive-use-access`.
 

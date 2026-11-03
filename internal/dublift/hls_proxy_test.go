@@ -313,7 +313,7 @@ func TestHLSFailuresAfterStartupDoNotReplaceMedia(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	s.ServeHTTP(w, httptest.NewRequest("GET", base+"/track/generated/0.ts", nil))
+	s.ServeHTTP(w, httptest.NewRequest("GET", base+"/track/generated/0.m4s", nil))
 	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "audio remux failed") {
 		t.Fatal("failed audio extraction was replaced by silence", w.Code, w.Body.String())
 	}

@@ -160,7 +160,6 @@ type Session struct {
 	videoInit                []byte
 	audioPrefetch            segmentLookahead
 	audioPrefetchID          string
-	audioTS                  map[string]tsContinuityState
 	videoChanged             chan struct{}
 	listedVix                []Track
 	listedEnglish            *Track

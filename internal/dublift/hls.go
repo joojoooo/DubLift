@@ -33,6 +33,15 @@ type HLS struct {
 	Target   int
 }
 
+func (h *HLS) section(segment int) int {
+	for i := segment; i > 0; i-- {
+		if h.Segments[i].Discontinuity {
+			return i
+		}
+	}
+	return 0
+}
+
 func (n *Network) LoadHLS(ctx context.Context, o Origin) (*HLS, error) {
 	b, base, e := n.Fetch(ctx, o, manifestLimit)
 	if e != nil {

@@ -34,40 +34,6 @@ func ffmpegAvailable(t *testing.T) {
 	}
 }
 
-func assertContinuousTransport(t *testing.T, segments ...[]byte) {
-	t.Helper()
-	last := make(map[uint16]byte)
-	for segmentIndex, data := range segments {
-		if len(data)%188 != 0 {
-			t.Fatalf("audio segment %d is not packet aligned", segmentIndex)
-		}
-		for i := 0; i < len(data); i += 188 {
-			packet := data[i : i+188]
-			if packet[0] != 0x47 {
-				t.Fatalf("audio segment %d has bad transport sync", segmentIndex)
-			}
-			pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
-			control := packet[3] >> 4 & 3
-			if pid == 0x1fff || control == 0 {
-				continue
-			}
-			counter := packet[3] & 15
-			if prior, ok := last[pid]; ok {
-				expected := prior
-				if control&1 != 0 {
-					expected++
-				}
-				if counter != expected&15 {
-					t.Fatalf("audio PID %d counter broke at segment %d packet %d: got %d, want %d", pid, segmentIndex, i/188, counter, expected&15)
-				}
-				if segmentIndex > 0 && control&2 != 0 && packet[4] > 0 && packet[5]&0x80 != 0 {
-					t.Fatalf("audio PID %d signaled a discontinuity in segment %d", pid, segmentIndex)
-				}
-			}
-			last[pid] = counter
-		}
-	}
-}
 func command(t *testing.T, name string, args ...string) []byte {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -565,21 +531,19 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 					break
 				}
 			}
-			if zero := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/0.ts"); len(zero) == 0 {
+			if zero := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/0.m4s"); len(zero) == 0 {
 				t.Fatal("empty startup audio")
 			}
-			audioURL := local.URL + "/media/" + id + "/track/" + it.ID + "/" + strconv.Itoa(n) + ".ts"
+			audioURL := local.URL + "/media/" + id + "/track/" + it.ID + "/" + strconv.Itoa(n) + ".m4s"
 			audio := getBytes(t, audioURL)
-			nextAudio := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+1)+".ts")
-			assertContinuousTransport(t, audio, nextAudio)
-			seekAudio := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+4)+".ts")
-			assertInitialTransportReset(t, seekAudio)
-			assertContinuousTransport(t, seekAudio, getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+5)+".ts"))
-			path := filepath.Join(dir, "audio-"+id+".ts")
-			os.WriteFile(path, audio, 0600)
+			nextAudio := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/"+strconv.Itoa(n+1)+".m4s")
+			assertContinuousAudioFragments(t, audio, nextAudio)
+			init := getBytes(t, local.URL+"/media/"+id+"/track/"+it.ID+"/init.mp4")
+			path := filepath.Join(dir, "audio-"+id+".mp4")
+			os.WriteFile(path, append(append([]byte(nil), init...), audio...), 0600)
 			lo, hi := packetTimes(t, path, "a:0")
-			nextPath := filepath.Join(dir, "audio-next-"+id+".ts")
-			os.WriteFile(nextPath, nextAudio, 0600)
+			nextPath := filepath.Join(dir, "audio-next-"+id+".mp4")
+			os.WriteFile(nextPath, append(append([]byte(nil), init...), nextAudio...), 0600)
 			nextLo, _ := packetTimes(t, nextPath, "a:0")
 			if gap := nextLo - hi; gap < -.002 || gap > .05 {
 				t.Errorf("adjacent AAC segments have a %.3f second gap/overlap", gap)
@@ -610,25 +574,21 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			// HLS -ss has upstream bug #7359 even on unmodified fMP4 playlists.
 			// A selected window still reads/decode-checks the actual late URLs.
 			seeked := filepath.Join(dir, "seeked-"+id+".mkv")
-			if strings.Contains(string(playlist), "#EXT-X-MAP:") {
-				windowMaster := filepath.Join(dir, "window-"+id+".m3u8")
-				for _, rendition := range []struct{ name, route string }{{"video", "video.m3u8"}, {"audio", "track/" + it.ID + ".m3u8"}} {
-					url := local.URL + "/media/" + id + "/" + rendition.route
-					h, err := ParseHLS(getBytes(t, url), Origin{URL: url})
-					if err != nil {
-						t.Fatal(err)
-					}
-					window, _, err := h.Window(session.boundaries[n], 12, func(u string) string { return u })
-					if err != nil {
-						t.Fatal(err)
-					}
-					os.WriteFile(filepath.Join(dir, rendition.name+"-"+id+".m3u8"), []byte(window), 0600)
+			windowMaster := filepath.Join(dir, "window-"+id+".m3u8")
+			for _, rendition := range []struct{ name, route string }{{"video", "video.m3u8"}, {"audio", "track/" + it.ID + ".m3u8"}} {
+				url := local.URL + "/media/" + id + "/" + rendition.route
+				h, err := ParseHLS(getBytes(t, url), Origin{URL: url})
+				if err != nil {
+					t.Fatal(err)
 				}
-				os.WriteFile(windowMaster, fmt.Appendf(nil, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italian\",LANGUAGE=\"it\",DEFAULT=YES,URI=\"audio-%s.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO=\"a\"\nvideo-%s.m3u8\n", id, id), 0600)
-				command(t, "ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,http,tcp,crypto", "-allowed_extensions", "ALL", "-i", windowMaster, "-t", "2", "-map", "0:v:0", "-map", "0:a:m:language:it", "-c", "copy", seeked)
-			} else {
-				command(t, "ffmpeg", "-nostdin", "-v", "error", "-ss", "42", "-i", stream.URL, "-t", "2", "-map", "0:v:0", "-map", "0:a:m:language:it", "-c", "copy", seeked)
+				window, _, err := h.Window(session.boundaries[n], 12, func(u string) string { return u })
+				if err != nil {
+					t.Fatal(err)
+				}
+				os.WriteFile(filepath.Join(dir, rendition.name+"-"+id+".m3u8"), []byte(window), 0600)
 			}
+			os.WriteFile(windowMaster, fmt.Appendf(nil, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italian\",LANGUAGE=\"it\",DEFAULT=YES,URI=\"audio-%s.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO=\"a\"\nvideo-%s.m3u8\n", id, id), 0600)
+			command(t, "ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,http,tcp,crypto", "-allowed_extensions", "ALL", "-i", windowMaster, "-t", "2", "-map", "0:v:0", "-map", "0:a:m:language:it", "-c", "copy", seeked)
 			videoStart, videoEnd := packetTimes(t, seeked, "v:0")
 			audioStart, audioEnd := packetTimes(t, seeked, "a:0")
 			if videoEnd-videoStart < 1 || audioEnd-audioStart < 1 {
@@ -636,30 +596,12 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 			}
 			command(t, "ffmpeg", "-v", "error", "-xerror", "-i", seeked, "-frames:v", "2", "-an", "-f", "null", "-")
 			if session.video.File != nil {
-				content, e := server.Engine.Audio(context.Background(), it, 42, 24, 2.4, 1)
+				content, e := server.Engine.Audio(context.Background(), it, 42, 24, 2.4, 1, 8)
 				if e != nil {
 					t.Fatal(e)
 				}
-				seenPID := map[uint16]bool{}
-				for off := 0; off+188 <= len(content); off += 188 {
-					packet := content[off : off+188]
-					if packet[0] != 0x47 {
-						t.Fatal("generated audio lost MPEG-TS packet alignment")
-					}
-					pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
-					if seenPID[pid] {
-						continue
-					}
-					seenPID[pid] = true
-					if packet[3]&0x20 == 0 || packet[4] == 0 || packet[5]&0x80 == 0 {
-						t.Fatalf("first MPEG-TS packet for PID %d does not mark its counter reset", pid)
-					}
-				}
-				if len(seenPID) < 3 {
-					t.Fatalf("incomplete generated audio transport: %d PIDs", len(seenPID))
-				}
-				encoded := filepath.Join(dir, "content.ts")
-				os.WriteFile(encoded, content, 0600)
+				encoded := filepath.Join(dir, "content.mp4")
+				os.WriteFile(encoded, append(append([]byte(nil), init...), content...), 0600)
 				pcm := command(t, "ffmpeg", "-v", "error", "-i", encoded, "-ac", "1", "-ar", "11025", "-f", "s16le", "pipe:1")
 				decoded := make([]int16, len(pcm)/2)
 				for i := range decoded {
@@ -827,24 +769,6 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 	}
 }
 
-func assertInitialTransportReset(t *testing.T, data []byte) {
-	t.Helper()
-	seen := make(map[uint16]bool)
-	for i := 0; i+188 <= len(data); i += 188 {
-		packet := data[i : i+188]
-		pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
-		if pid == 0x1fff || seen[pid] {
-			continue
-		}
-		seen[pid] = true
-		if packet[3]&0x20 == 0 || packet[4] == 0 || packet[5]&0x80 == 0 {
-			t.Fatalf("audio PID %d did not mark a seek discontinuity", pid)
-		}
-	}
-	if len(seen) < 3 {
-		t.Fatalf("incomplete transport after seek: %d PIDs", len(seen))
-	}
-}
 func getJSON(t *testing.T, url string, v any) {
 	t.Helper()
 	b := getBytes(t, url)

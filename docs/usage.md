@@ -148,6 +148,11 @@ Live HLS, DRM/SAMPLE-AES, encrypted WebVTT, and file keyframe gaps above
 playback. Reads and the rolling media cache are bounded and kept in memory;
 there is no whole-title download or disk media cache.
 
+Generated audio uses AAC-LC in fragmented MP4 with a shared initialization
+segment. Players must support fMP4 HLS audio; segment retries and parallel
+downloads preserve the same media clock. Original HLS renditions retain their
+source format.
+
 ## Troubleshooting
 
 - **Playback fails:** inspect the stream's dashboard error and **Technical

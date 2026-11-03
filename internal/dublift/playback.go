@@ -232,8 +232,21 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		n, err := strconv.Atoi(strings.Split(p[3], ".")[0])
-		if err != nil || n < 0 || n >= len(v.boundaries)-1 {
+		if !track.Subtitle && p[3] == "init.mp4" {
+			data, err := audioInit()
+			if err != nil {
+				failure(w, 500, err)
+				return
+			}
+			serveBytes(w, r, "audio/mp4", data)
+			return
+		}
+		ext := ".m4s"
+		if track.Subtitle {
+			ext = ".vtt"
+		}
+		n, err := strconv.Atoi(strings.TrimSuffix(p[3], ext))
+		if err != nil || !strings.HasSuffix(p[3], ext) || n < 0 || n >= len(v.boundaries)-1 {
 			http.NotFound(w, r)
 			return
 		}
@@ -250,6 +263,9 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 		clockBase, err := s.sectionClock(ctx, v, n)
+		if err == nil && !track.Subtitle {
+			clockBase, err = s.Engine.audioClock(ctx, v.video, clockBase, n)
+		}
 		if err != nil {
 			v.note(err)
 			failure(w, 502, err)
@@ -260,21 +276,18 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			if track.Subtitle {
 				return s.subtitles(ctx, v, *track, start, duration, offset, clockBase)
 			}
-			return s.Engine.Audio(ctx, *track, start, duration, offset, clockBase)
+			return s.Engine.Audio(ctx, *track, start, duration, offset, clockBase, uint32(n+1))
 		})
 		if err != nil {
 			v.note(err)
 			failure(w, 502, err)
 			return
 		}
-		kind := "video/mp2t"
+		kind := "audio/mp4"
 		if track.Subtitle {
 			kind = "text/vtt"
 		} else {
 			s.prefetchAudio(v, *track, n)
-			if r.Method == http.MethodGet && r.Header.Get("Range") == "" {
-				data = v.continuousAudioTS(track.ID, n, data)
-			}
 		}
 		serveBytes(w, r, kind, data)
 	default:
@@ -321,12 +334,15 @@ func (s *Server) prefetchAudio(v *Session, track Track, n int) {
 			offset = s.playbackOffset(v, start)
 		}
 		clockBase, err := s.sectionClock(ctx, v, index)
+		if err == nil {
+			clockBase, err = s.Engine.audioClock(ctx, v.video, clockBase, index)
+		}
 		if err != nil {
 			return err
 		}
 		key := fmt.Sprintf("track:%s:%s:%d:%.6f:%.6f", v.Key, track.ID, index, offset, clockBase)
 		_, err = s.Engine.Cache.Get(ctx, key, func() ([]byte, error) {
-			return s.Engine.Audio(ctx, track, start, v.boundaries[index+1]-start, offset, clockBase)
+			return s.Engine.Audio(ctx, track, start, v.boundaries[index+1]-start, offset, clockBase, uint32(index+1))
 		})
 		return err
 	})
@@ -448,6 +464,8 @@ func (s *Server) generatedPlaylist(v *Session, t *Track) string {
 		// init map with a different URI at every segment makes VLC reopen the
 		// fMP4 demuxer and can reset its playback clock at each boundary.
 		b.WriteString("#EXT-X-MAP:URI=\"video/0/init.mp4\"\n")
+	} else if !t.Subtitle {
+		fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"%s/init.mp4\"\n", t.ID)
 	}
 	for i := 0; i < len(v.boundaries)-1; i++ {
 		duration := v.boundaries[i+1] - v.boundaries[i]
@@ -457,7 +475,7 @@ func (s *Server) generatedPlaylist(v *Session, t *Track) string {
 		if t == nil {
 			fmt.Fprintf(&b, "#EXTINF:%.6f,\nvideo/%d/segment.m4s\n", duration, i)
 		} else {
-			ext := "ts"
+			ext := "m4s"
 			if t.Subtitle {
 				ext = "vtt"
 			}
@@ -498,13 +516,7 @@ func (s *Server) sectionClock(ctx context.Context, v *Session, n int) (float64, 
 	if v.video.HLS == nil {
 		return v.clockBase, nil
 	}
-	section := 0
-	for i := n; i > 0; i-- {
-		if v.video.HLS.Segments[i].Discontinuity {
-			section = i
-			break
-		}
-	}
+	section := v.video.HLS.section(n)
 	if section == 0 {
 		return v.clockBase, nil
 	}
