@@ -125,9 +125,12 @@ uses zero offset and manual timing remains available.
   **Search radius** for a larger timing difference. **Alignment samples**
   checks additional positions; different edits may still need manual timing.
 
-Vixsrc WebVTT subtitles follow the audio timing. Original external/HLS
-subtitles are preserved where practical; embedded file subtitles are not
-extracted.
+Vixsrc WebVTT subtitles follow the audio timing. Original HLS subtitles are
+preserved where practical; embedded file subtitles are not extracted.
+Transformed streams omit upstream sidecar subtitle attachments to avoid a
+Stremio Android 2.5.1 track-selection bug. Original fallback streams retain
+those attachments. Subtitles supplied separately by another Stremio addon
+can still trigger the player bug; see [the compatibility note](stremio-track-selection.md).
 
 Keep DubLift running while playing or seeking. Streams exposes the local HLS
 URL for VLC. Selecting a different stream replaces active playback; refreshing

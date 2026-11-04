@@ -60,7 +60,18 @@ func (s Stream) MarshalJSON() ([]byte, error) {
 	return json.Marshal(plain(s))
 }
 func (s Stream) dubbed(local string) Stream {
-	return s.localPlayback(local, true)
+	playback := s.localPlayback(local, true)
+	var fields map[string]json.RawMessage
+	json.Unmarshal(playback.raw, &fields)
+	// Stremio Android 2.5.1 merges sidecar subtitles with HLS by assigning
+	// every unnamed HLS format the same "0:" ID. Its audio/subtitle selectors
+	// then choose the first track with that ID. Publish our HLS renditions
+	// without upstream sidecars; keep the original stream intact for fallback.
+	delete(fields, "subtitles")
+	b, _ := json.Marshal(fields)
+	var out Stream
+	json.Unmarshal(b, &out)
+	return out
 }
 
 func (s Stream) localPlayback(local string, italian bool) Stream {

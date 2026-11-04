@@ -151,6 +151,10 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 				got, expected := jsonValue(t, result.Streams[i]), jsonValue(t, want[i])
 				if italian && (i == 0 || i == 2) {
 					m, e := got.(map[string]any), expected.(map[string]any)
+					if _, ok := m["subtitles"]; ok {
+						t.Fatal("transformed playback must not sideload upstream subtitles alongside HLS renditions")
+					}
+					delete(e, "subtitles")
 					if m["name"] != "🇮🇹 "+e["name"].(string) || !strings.Contains(m["url"].(string), "/media/") {
 						t.Fatal(m)
 					}

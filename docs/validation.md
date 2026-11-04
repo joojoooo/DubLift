@@ -99,6 +99,9 @@ success, decode playback, or download complete titles. Keep reports private.
 - Play through Stremio/Nuvio and VLC: verify video and Italian audio at
   startup, after forward/backward seeks, and after timing changes. Refresh
   results during playback and select a different stream to check lifecycle.
+- In Stremio Android, verify both Vixsrc audio languages and HLS subtitles
+  from a freshly fetched stream result. Also check with external subtitle
+  addons enabled; see the [known 2.5.1 track-ID collision](stremio-track-selection.md).
 - Test from another LAN device with dynamic LAN address or configured Public base URL. Check real
   codecs/HDR, long playback, and slow or failing providers on target players.
 
