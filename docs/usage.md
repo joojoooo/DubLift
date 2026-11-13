@@ -52,12 +52,14 @@ time and returns as soon as both 4K and 1080p are found, or all servers finish.
 Once any supported result is found, the search stops after eight seconds of
 server searching if a target quality is still missing. Without results, it
 continues under the existing listing deadline. This timing excludes initial
-metadata retrieval, and subtitle or other source lookups can add time before
-the results appear. Source probing and audio synchronization wait for
+metadata retrieval, and other source lookups can add time before the results
+appear. Source probing and audio synchronization wait for
 preparation or playback.
 
 The base URL controls Movy's title pages and player origin;
-its source and subtitle services are handled by the built-in scraper.
+its source service is handled by the built-in scraper. The scraper preserves
+each Movy server's own subtitle links and does not search separate subtitle
+catalogs.
 Only supported file/HLS sources are listed; DASH and DRM sources are excluded.
 
 The config stores `configVersion` (currently `2`) and an ordered `sources`

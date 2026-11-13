@@ -70,8 +70,6 @@ func (transport movyTestTransport) RoundTrip(r *http.Request) (*http.Response, e
 	switch r.URL.Host {
 	case "api.wecollege.net":
 		prefix = "/movy-api"
-	case "subtitles.vidy.st":
-		prefix = "/movy-subtitles"
 	default:
 		if r.URL.Host != transport.origin.Host {
 			return nil, errors.New("external access disabled in Movy test")
@@ -138,8 +136,10 @@ func TestMovyMovieAndEpisodeRequests(t *testing.T) {
 						t.Error("title referer lost")
 					}
 					quality, source := "1080p", "/hd.mp4"
+					subtitle := movySubtitle{URL: origin.URL + "/munich/it.vtt", Language: "Italian"}
 					if r.URL.Path == "/movy-api/berlin/sources" {
 						quality, source = "4K", "/uhd.mkv"
+						subtitle = movySubtitle{URL: origin.URL + "/berlin/eng.vtt", Lang: "eng"}
 						if q.Get("altTitle") != "Titel%20%26%20Mehr" {
 							t.Error("alternate title encoding changed")
 						}
@@ -150,17 +150,11 @@ func TestMovyMovieAndEpisodeRequests(t *testing.T) {
 						{URL: origin.URL + "/uhd.mkv", Quality: "720p"},
 						{URL: origin.URL + source, Quality: quality},
 						{URL: origin.URL + "/sd.mp4", Quality: "SD"},
-					}, Subtitles: []movySubtitle{{URL: origin.URL + "/en.vtt", Lang: "EN"}}}
+					}, Subtitles: []movySubtitle{subtitle}}
 					// Both raw and JSON-string envelopes occur upstream.
 					json.NewEncoder(w).Encode(movyEnvelope(t, data, "fixture-seed", 603))
 				case "/movy-api/broken/sources":
 					w.WriteHeader(500)
-				case "/movy-subtitles/search":
-					q := r.URL.Query()
-					if q.Get("id") != "603" || kind == "series" && (q.Get("season") != "0" || q.Get("episode") != "2") {
-						t.Error("subtitle identity changed")
-					}
-					json.NewEncoder(w).Encode([]movySubtitle{{URL: origin.URL + "/en.vtt", Lang: "en"}, {URL: origin.URL + "/it.vtt", Language: "Italian"}})
 				default:
 					t.Error("discovery read media", r.URL.Path)
 					w.WriteHeader(404)
@@ -169,6 +163,13 @@ func TestMovyMovieAndEpisodeRequests(t *testing.T) {
 			defer origin.Close()
 			n := NewNetwork()
 			mockMovyNetwork(n, origin.URL)
+			transport := n.Client.Transport
+			n.Client.Transport = movyRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Host != "api.wecollege.net" && r.URL.Scheme+"://"+r.URL.Host != origin.URL {
+					t.Errorf("unexpected external discovery request: %s", r.URL.Host)
+				}
+				return transport.RoundTrip(r)
+			})
 			streams, err := n.ResolveMovy(context.Background(), origin.URL, c, "603")
 			if err != nil || len(streams) != 2 {
 				t.Fatal("movie/episode discovery failed", len(streams), err)
@@ -179,8 +180,10 @@ func TestMovyMovieAndEpisodeRequests(t *testing.T) {
 			if seeds.Load() < 2 {
 				t.Fatal("401 did not refresh seed")
 			}
-			if len(streams[0].Subtitles) != 2 || streams[0].Subtitles[0].Lang != "en" || streams[0].Subtitles[1].Lang != "it" {
-				t.Fatal("subtitle merge changed", streams[0].Subtitles)
+			for i, want := range []struct{ path, lang string }{{"/berlin/eng.vtt", "en"}, {"/munich/it.vtt", "it"}} {
+				if len(streams[i].Subtitles) != 1 || streams[i].Subtitles[0].URL != origin.URL+want.path || streams[i].Subtitles[0].Lang != want.lang {
+					t.Fatal("server-provided subtitles changed", streams[i].Subtitles)
+				}
 			}
 			if _, err := n.ResolveMovy(context.Background(), origin.URL+"/", c, "603"); err != nil || registryCalls.Load() != 1 {
 				t.Fatal("registry cache missed", err, registryCalls.Load())
@@ -217,8 +220,6 @@ func TestMovyDeferredPlayerScripts(t *testing.T) {
 			io.WriteString(w, `{"seed":"fixture-seed"}`)
 		case "/movy-api/seattle/sources":
 			io.WriteString(w, movyEnvelope(t, movyPayload{Sources: []movySource{{URL: origin.URL + "/video.m3u8", Quality: "1080p", Type: "hls"}}}, "fixture-seed", 157336))
-		case "/movy-subtitles/search":
-			io.WriteString(w, `[]`)
 		default:
 			t.Errorf("unexpected discovery request: %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -270,8 +271,6 @@ func TestMovyMinimumQualityResults(t *testing.T) {
 					io.WriteString(w, `/seattle/sources`)
 				case "/movy-api/seed":
 					io.WriteString(w, `{"seed":"fixture-seed"}`)
-				case "/movy-subtitles/search":
-					io.WriteString(w, `[]`)
 				case "/movy-api/seattle/sources":
 					payload := movyPayload{Sources: []movySource{}}
 					for i, quality := range tc.qualities {
@@ -372,9 +371,10 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 				case "/movy-api/seed":
 					io.WriteString(w, `{"seed":"fixture-seed"}`)
 				case "/movy-api/seattle/sources":
-					io.WriteString(w, movyEnvelope(t, movyPayload{Sources: []movySource{{URL: origin.URL + "/video.m3u8", Type: "hls", Quality: "1080p"}}}, "fixture-seed", 603))
-				case "/movy-subtitles/search":
-					io.WriteString(w, `[]`)
+					io.WriteString(w, movyEnvelope(t, movyPayload{
+						Sources:   []movySource{{URL: origin.URL + "/video.m3u8", Type: "hls", Quality: "1080p"}},
+						Subtitles: []movySubtitle{{URL: origin.URL + "/eng.vtt", Lang: "eng"}},
+					}, "fixture-seed", 603))
 				case "/addon/stream/movie/tmdb:603.json":
 					fmt.Fprintf(w, `{"streams":[{"name":"Addon","url":%q}]}`, origin.URL+"/addon.mkv")
 				case "/api/movie/603":
@@ -422,6 +422,9 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 			}
 			if strings.Contains(streams[0].URL, "/media/") != italian || strings.HasPrefix(streams[0].Name, "🇮🇹 ") != italian {
 				t.Fatal("Italian audio eligibility incorrect", streams[0])
+			}
+			if len(streams[0].Subtitles) != 1 || streams[0].Subtitles[0].URL != origin.URL+"/eng.vtt" || streams[0].Subtitles[0].Lang != "en" {
+				t.Fatal("listing lost server-provided subtitles", streams[0].Subtitles)
 			}
 			if !italian && (streams[0].URL != origin.URL+"/video.m3u8" || streams[0].Headers["Referer"] != origin.URL+"/movie/603?play=true") {
 				t.Fatal("original fallback changed")
@@ -486,8 +489,6 @@ func TestMovyCancellationStopsServerRequests(t *testing.T) {
 			io.WriteString(w, `/seattle/sources`)
 		case "/movy-api/seed":
 			io.WriteString(w, `{"seed":"fixture-seed"}`)
-		case "/movy-subtitles/search":
-			io.WriteString(w, `[]`)
 		case "/movy-api/seattle/sources":
 			close(started)
 			<-r.Context().Done()
@@ -566,8 +567,6 @@ func TestMovyQuickScrapeWaitsForQualityWithinBudget(t *testing.T) {
 								body += "/" + server + "/sources;"
 							}
 						}
-					case "subtitles.vidy.st":
-						body = "[]"
 					case "api.wecollege.net":
 						if r.URL.Path == "/seed" {
 							body = `{"seed":"fixture-seed"}`
@@ -635,8 +634,6 @@ func TestMovyTargetQualitiesCancelPendingServers(t *testing.T) {
 			io.WriteString(w, `/seattle/sources;/boise/sources;/miami/sources;/denver/sources;/dallas/sources`)
 		case "/movy-api/seed":
 			io.WriteString(w, `{"seed":"fixture-seed"}`)
-		case "/movy-subtitles/search":
-			io.WriteString(w, `[]`)
 		default:
 			if !strings.HasPrefix(r.URL.Path, "/movy-api/") {
 				t.Error("unexpected origin request", r.URL.Path)

@@ -18,8 +18,8 @@ make release
 
 - **Tests:** local mock servers and synthetic media check discovery,
   config version resets, source toggles/order, upstream preservation, Movy
-  metadata decoding/server discovery (including deferred script loaders) and
-  VixSrc audio integration, VixSrc
+  metadata decoding/server discovery (including deferred script loaders),
+  server-provided subtitle preservation and VixSrc audio integration, VixSrc
   qualities and native playback across restarts, HTTP ranges and retries,
   HLS proxying, file remuxing/timing, generated fMP4 audio (including parallel
   requests, retries, byte ranges, short final GOPs, wrapped HLS clocks with

@@ -19,7 +19,6 @@ import (
 )
 
 const movyAPIURL = "https://api.wecollege.net"
-const movySubtitleURL = "https://subtitles.vidy.st"
 const movyDefaultURL = "https://www.movy.sx"
 const movyMinHeight = 1080
 const movyQuickScrapeTimeout = 8 * time.Second
@@ -449,22 +448,9 @@ func (n *Network) ResolveMovy(ctx context.Context, base string, c Content, id st
 	var servers []string
 	var seed string
 	var registryErr, seedErr error
-	var subtitles []movySubtitle
-	subtitleReady := make(chan []movySubtitle, 1)
 	var wg sync.WaitGroup
 	wg.Go(func() { servers, registryErr = n.movyServers(work, base, page, b) })
 	wg.Go(func() { seed, seedErr = n.movySeed(work, id, base) })
-	go func() {
-		var found []movySubtitle
-		u := movySubtitleURL + "/search?id=" + id
-		if kind == "tv" {
-			u += fmt.Sprintf("&season=%d&episode=%d", c.Season, c.Episode)
-		}
-		if data, err := n.fetchMovy(work, u, movyHeaders(base, base+"/")); err == nil {
-			_ = json.Unmarshal(data, &found)
-		}
-		subtitleReady <- found
-	}()
 	wg.Wait()
 	if registryErr != nil {
 		return nil, registryErr
@@ -528,13 +514,6 @@ func (n *Network) ResolveMovy(ctx context.Context, base string, c Content, id st
 	if found == 0 && lastErr != nil {
 		return nil, fmt.Errorf("Movy sources: %w", lastErr)
 	}
-	if found > 0 {
-		select {
-		case subtitles = <-subtitleReady:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
 	var choices []movyChoice
 	seen := map[string]bool{}
 	for _, group := range groups {
@@ -550,7 +529,6 @@ func (n *Network) ResolveMovy(ctx context.Context, base string, c Content, id st
 	sort.SliceStable(choices, func(i, j int) bool { return choices[i].height > choices[j].height })
 	streams := []Stream{}
 	for _, choice := range choices {
-		appendMovySubtitles(&choice.stream, subtitles)
 		streams = append(streams, choice.stream)
 	}
 	return streams, nil

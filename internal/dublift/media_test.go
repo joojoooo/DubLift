@@ -398,8 +398,6 @@ func TestVirtualHLSEndToEnd(t *testing.T) {
 		case "/movy-api/seattle/sources":
 			id, _ := strconv.ParseUint(r.URL.Query().Get("tmdbId"), 10, 32)
 			io.WriteString(w, movyEnvelope(t, movyPayload{Sources: []movySource{{URL: origin.URL + "/movy-video.m3u8", Quality: "1080p", Type: "hls"}}}, "fixture-seed", uint32(id)))
-		case "/movy-subtitles/search":
-			io.WriteString(w, `[]`)
 		case "/movy-video.m3u8":
 			// Movy's direct fMP4 playlist has muxed English audio and no master
 			// supplying CODECS, as with the live 2160p series source.
