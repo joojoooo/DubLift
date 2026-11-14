@@ -103,9 +103,17 @@ system resolver;
 ## Playback and synchronization
 
 Movy and eligible addon HTTP(S) results receive a local DubLift URL when Vixsrc Italian
-audio is available. Torrents, external-player links, and results without
-Italian audio keep their original links. Source compatibility is checked
-when you prepare or play a result, so a listed result can still fail playback.
+audio is available. If no track is identified as Italian, DubLift assumes the
+first unknown-language audio track may be Italian and selects it by default.
+These results also receive the Italian flag, but the track stays labelled
+**Unknown · Vixsrc**. All unknown audio tracks remain available in the player's
+audio menu so you can try another one. This also covers audio embedded in
+VixSrc video playlists without separate audio renditions.
+
+Torrents, external-player links, and results with neither Italian nor unknown
+VixSrc audio keep their original links, without added VixSrc tracks or an Italian
+flag. Source compatibility is checked when you prepare or play a result, so a
+listed result can still fail playback.
 
 If VLC's Snap build stops immediately with local HTTP connection errors,
 enable **Connect using HTTP access instead of custom HTTP code** in VLC's

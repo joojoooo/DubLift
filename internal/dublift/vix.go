@@ -22,6 +22,39 @@ var fhdRE = regexp.MustCompile(`\bwindow\.canPlayFHD\s*=\s*true\b`)
 var numericRE = regexp.MustCompile(`^[1-9]\d*$`)
 var imdbRE = regexp.MustCompile(`^tt\d+$`)
 
+// Missing/undefined metadata is a candidate for Italian audio, but must stay
+// labelled unknown. A known language other than Italian/English is not one.
+func vixLanguage(tag, name string) string {
+	lang := language(strings.TrimSpace(tag))
+	if lang == "it" || lang == "en" {
+		return lang
+	}
+	if named := language(strings.TrimSpace(name)); named == "it" || named == "en" {
+		return named
+	}
+	switch lang {
+	case "", "und", "unk", "unknown", "undefined":
+		return "und"
+	}
+	return lang
+}
+
+func preferredVixAudio(tracks []Track) string {
+	unknown := ""
+	for _, t := range tracks {
+		if t.Subtitle || t.Original {
+			continue
+		}
+		if t.Lang == "it" {
+			return t.ID
+		}
+		if t.Lang == "und" && unknown == "" {
+			unknown = t.ID
+		}
+	}
+	return unknown
+}
+
 func objectAt(s string, start int) (string, error) {
 	depth := 0
 	var quote byte

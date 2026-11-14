@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -357,8 +358,19 @@ func TestMovyExtensionlessQualitiesPreserveMasterAndTicket(t *testing.T) {
 
 func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 	ffmpegAvailable(t)
-	for _, italian := range []bool{false, true} {
-		t.Run(fmt.Sprintf("italian=%t", italian), func(t *testing.T) {
+	dir := t.TempDir()
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000", "-t", "2", "-c:a", "aac", "-hls_time", "2", "-hls_playlist_type", "vod", filepath.Join(dir, "embedded.m3u8"))
+	for _, tc := range []struct {
+		name     string
+		italian  bool
+		embedded bool
+	}{
+		{"English only", false, false},
+		{"external Italian", true, false},
+		{"external English and embedded unknown", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			italian := tc.italian
 			var movyPages, mediaReads atomic.Int64
 			var origin *httptest.Server
 			origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -383,13 +395,25 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 					io.WriteString(w, `window.masterPlaylist={url:'/vix',params:{token:'fixture',expires:9999999999}}`)
 				case "/vix.m3u8":
 					io.WriteString(w, "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"English\",LANGUAGE=\"en\",URI=\"en.m3u8\"\n")
-					if italian {
+					if tc.embedded {
+						io.WriteString(w, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Embedded\"\n")
+					} else if italian {
 						io.WriteString(w, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Italian\",LANGUAGE=\"it\",URI=\"it.m3u8\"\n")
 					}
 					io.WriteString(w, "#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvix-video.m3u8\n")
 				case "/en.m3u8", "/it.m3u8":
 					io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\naudio.ts\n#EXT-X-ENDLIST\n")
-				case "/video.m3u8", "/addon.mkv", "/audio.ts", "/vix-video.m3u8", "/eng.vtt":
+				case "/vix-video.m3u8":
+					if tc.embedded {
+						r.URL.Path = "/embedded.m3u8"
+						http.FileServer(http.Dir(dir)).ServeHTTP(w, r)
+					} else {
+						mediaReads.Add(1)
+						w.WriteHeader(500)
+					}
+				case "/embedded0.ts":
+					http.FileServer(http.Dir(dir)).ServeHTTP(w, r)
+				case "/video.m3u8", "/addon.mkv", "/audio.ts", "/eng.vtt":
 					mediaReads.Add(1)
 					w.WriteHeader(500)
 				default:
@@ -420,8 +444,10 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 			if len(streams) != 2 || !strings.Contains(streams[0].Name, "Movy") || !strings.Contains(streams[1].Name, "Addon") {
 				t.Fatal("source order changed", streams)
 			}
-			if strings.Contains(streams[0].URL, "/media/") != italian || strings.HasPrefix(streams[0].Name, "🇮🇹 ") != italian {
-				t.Fatal("Italian audio eligibility incorrect", streams[0])
+			for _, stream := range streams {
+				if strings.Contains(stream.URL, "/media/") != italian || strings.HasPrefix(stream.Name, "🇮🇹 ") != italian {
+					t.Fatal("Italian audio eligibility incorrect", stream.Name, stream.URL)
+				}
 			}
 			if italian && len(streams[0].Subtitles) != 0 {
 				t.Fatal("transformed listing retained JSON subtitles", streams[0].Subtitles)
@@ -441,6 +467,9 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 				for _, session := range s.sessions {
 					session.mu.Lock()
 					if session.SourceName == "Movy" && (session.native != nil || session.listedVix == nil || session.listedEnglish == nil || session.ContentName != "Fixture title") {
+						valid = false
+					}
+					if tc.embedded && preferredVixAudio(session.listedVix) != "vix-embedded-und-0" {
 						valid = false
 					}
 					if session.SourceName == "Movy" && len(session.stream.Subtitles) != 1 {

@@ -317,9 +317,9 @@ func (s *Server) prefetchAudio(v *Session, track Track, n int) {
 		return
 	}
 	v.mu.Lock()
-	// Players probe segment zero of every rendition. Only warm the default
-	// Italian track until subsequent requests identify a different selection.
-	if n == 0 && (track.Original || track.Lang != "it" || v.audioPrefetchID != "") {
+	// Players probe segment zero of every rendition. Only warm the preferred
+	// Vixsrc track until later requests identify another selection.
+	if n == 0 && (track.ID != preferredVixAudio(v.tracks) || v.audioPrefetchID != "") {
 		v.mu.Unlock()
 		return
 	}
@@ -370,13 +370,7 @@ func (s *Server) master(v *Session) ([]byte, error) {
 	variant.Subtitles = ""
 	variant.Video = ""
 	variant.ClosedCaptions = ""
-	defaultID := ""
-	for _, t := range v.tracks {
-		if !t.Subtitle && !t.Original && t.Lang == "it" {
-			defaultID = t.ID
-			break
-		}
-	}
+	defaultID := preferredVixAudio(v.tracks)
 	if defaultID == "" {
 		for _, t := range v.tracks {
 			if !t.Subtitle {
@@ -386,7 +380,7 @@ func (s *Server) master(v *Session) ([]byte, error) {
 		}
 	}
 	// VLC 3 chooses the last audio rendition even when another is marked
-	// DEFAULT. Keep the selected Italian rendition last for VLC while retaining
+	// DEFAULT. Keep the preferred rendition last for VLC while retaining
 	// the HLS default flag for players that honor it.
 	ordered := make([]Track, 0, len(v.tracks))
 	for _, t := range v.tracks {

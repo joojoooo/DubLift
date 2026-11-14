@@ -483,54 +483,50 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 	return nil
 }
 func (s *Server) vixTracks(ctx context.Context, v *Session, master *HLS) error {
-	if master.Master == nil {
-		asset := &Asset{ID: identity(master.Origin.URL), Origin: master.Origin, HLS: master}
-		p, err := s.Engine.Probe(ctx, asset)
+	var tracks []Track
+	var renditions []*playlist.MultivariantRendition
+	if master.Master != nil {
+		renditions = master.Master.Renditions
+	}
+	externalAudio := false
+	embeddedAudio := false
+	for _, r := range renditions {
+		if r.Type != playlist.MultivariantRenditionTypeAudio {
+			continue
+		}
+		if r.URI == nil {
+			embeddedAudio = true
+		} else {
+			externalAudio = true
+		}
+	}
+	if !externalAudio || embeddedAudio {
+		// Audio may be embedded even beside external renditions, or in
+		// variants whose master lists only subtitles. Keep probing bounded.
+		var err error
+		tracks, err = s.probeVixAudio(ctx, master)
 		if err != nil {
-			return err
+			if !externalAudio {
+				return err
+			}
+			v.note(fmt.Errorf("Vixsrc embedded audio: %w", err))
 		}
-		italian := false
-		for _, r := range p.Streams {
-			if r.CodecType != "audio" {
-				continue
-			}
-			lang := language(r.Tags.Language)
-			if lang != "en" && lang != "it" {
-				continue
-			}
-			if lang == "it" {
-				italian = true
-			}
-			t := Track{ID: fmt.Sprintf("vix-%s-%d", lang, r.Index), Name: vixTrackName(lang), Lang: lang, Asset: asset, Selector: fmt.Sprintf("0:%d", r.Index)}
-			v.tracks = append(v.tracks, t)
-			if lang == "en" {
-				cp := t
-				v.vixEnglish = &cp
-			}
-		}
-		if !italian {
-			return errors.New("Vixsrc has no Italian audio track")
-		}
-		return nil
 	}
 	have := map[string]bool{}
-	for i, r := range master.Master.Renditions {
-		lang := language(r.Language)
-		if lang != "it" && lang != "en" {
-			lang = language(r.Name)
-		}
-		if lang != "it" && lang != "en" {
+	for i, r := range renditions {
+		lang := vixLanguage(r.Language, r.Name)
+		sub := r.Type == playlist.MultivariantRenditionTypeSubtitles
+		if lang != "it" && lang != "en" && (lang != "und" || sub) {
 			continue
 		}
 		if r.URI == nil {
 			continue
 		}
-		sub := r.Type == playlist.MultivariantRenditionTypeSubtitles
 		if !sub && r.Type != playlist.MultivariantRenditionTypeAudio {
 			continue
 		}
 		key := lang + strconv.FormatBool(sub)
-		if have[key] {
+		if lang != "und" && have[key] {
 			continue
 		}
 		o, e := master.Child(*r.URI)
@@ -549,23 +545,67 @@ func (s *Server) vixTracks(ctx context.Context, v *Session, master *HLS) error {
 			continue
 		}
 		t := Track{ID: fmt.Sprintf("vix-%s-%d", lang, i), Name: vixTrackName(lang), Lang: lang, Asset: a, Selector: "0:a:0", Subtitle: sub}
-		v.tracks = append(v.tracks, t)
+		tracks = append(tracks, t)
 		have[key] = true
-		if lang == "en" && !sub {
+	}
+	if preferredVixAudio(tracks) == "" {
+		return errors.New("Vixsrc has no Italian or unknown-language audio track")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	v.tracks = append(v.tracks, tracks...)
+	for _, t := range tracks {
+		if t.Lang == "en" && !t.Subtitle {
 			cp := t
 			v.vixEnglish = &cp
 		}
 	}
-	if !have["itfalse"] {
-		return errors.New("Vixsrc has no Italian audio rendition")
-	}
 	return nil
 }
+
+func (s *Server) probeVixAudio(ctx context.Context, h *HLS) ([]Track, error) {
+	if h.Master != nil {
+		variant, err := h.BestVariant()
+		if err != nil {
+			return nil, err
+		}
+		o, err := h.Child(variant.URI)
+		if err != nil {
+			return nil, err
+		}
+		a, err := s.loadMedia(ctx, o)
+		if err != nil {
+			return nil, err
+		}
+		h = a.HLS
+	}
+	a := &Asset{ID: identity(h.Origin.URL), Origin: h.Origin, HLS: h}
+	p, err := s.Engine.Probe(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	var tracks []Track
+	for _, r := range p.Streams {
+		if r.CodecType != "audio" {
+			continue
+		}
+		lang := vixLanguage(r.Tags.Language, r.Tags.Title)
+		if lang == "it" || lang == "en" || lang == "und" {
+			tracks = append(tracks, Track{ID: fmt.Sprintf("vix-embedded-%s-%d", lang, r.Index), Name: vixTrackName(lang), Lang: lang, Asset: a, Selector: fmt.Sprintf("0:%d", r.Index)})
+		}
+	}
+	return tracks, nil
+}
+
 func vixTrackName(lang string) string {
 	if lang == "it" {
 		return "Italian · Vixsrc"
 	}
-	return "English · Vixsrc"
+	if lang == "en" {
+		return "English · Vixsrc"
+	}
+	return "Unknown · Vixsrc"
 }
 func (s *Server) startAlignment(v *Session, from *float64) bool {
 	return s.startAlignmentMode(v, from, false)

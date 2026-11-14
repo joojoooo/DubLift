@@ -15,6 +15,7 @@ import (
 
 var hlsDefaultRE = regexp.MustCompile(`([:,])DEFAULT=(?:YES|NO)\b`)
 var hlsAutoselectRE = regexp.MustCompile(`([:,])AUTOSELECT=NO\b`)
+var hlsNameRE = regexp.MustCompile(`([:,])NAME="[^"]*"`)
 
 // Native playback retains the source's media clock, audio and subtitles. Only
 // manifests and bounded resources are proxied; no alignment or decoding runs.
@@ -49,19 +50,22 @@ func formatBitrate(bits int) string {
 	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(float64(bits)/1000000, 'f', precision, 64), "0"), ".") + " Mbps"
 }
 
-func masterHasItalian(h *HLS, variant *playlist.MultivariantVariant) bool {
-	if h.Master == nil {
-		return false
-	}
-	for _, r := range h.Master.Renditions {
-		if r.Type == playlist.MultivariantRenditionTypeAudio && (variant == nil || r.GroupID == variant.Audio) && (language(r.Language) == "it" || language(r.Name) == "it") {
-			return true
+func masterHasVixAudio(h *HLS, variant *playlist.MultivariantVariant, tracks []Track) bool {
+	haveAudio := false
+	if h.Master != nil {
+		for _, r := range h.Master.Renditions {
+			if r.Type == playlist.MultivariantRenditionTypeAudio && (variant == nil || r.GroupID == variant.Audio) {
+				haveAudio = true
+				if lang := vixLanguage(r.Language, r.Name); lang == "it" || lang == "und" {
+					return true
+				}
+			}
 		}
 	}
-	return false
+	return !haveAudio && preferredVixAudio(tracks) != ""
 }
 
-func vixQualityStreams(h *HLS) []sourceQuality {
+func vixQualityStreams(h *HLS, tracks []Track) []sourceQuality {
 	if h == nil {
 		return nil
 	}
@@ -74,7 +78,7 @@ func vixQualityStreams(h *HLS) []sourceQuality {
 		return sourceQuality{stream, &nativePlayback{ProviderURL: h.Origin.Headers.Get("Origin"), Quality: quality, VariantURL: variantURL, Italian: italian}}
 	}
 	if h.Master == nil || len(h.Master.Variants) == 0 {
-		return []sourceQuality{create("Auto quality", "VixSrc · Original audio and subtitles", "", masterHasItalian(h, nil))}
+		return []sourceQuality{create("Auto quality", "VixSrc · Original audio and subtitles", "", masterHasVixAudio(h, nil, tracks))}
 	}
 	variants := append([]*playlist.MultivariantVariant{}, h.Master.Variants...)
 	sort.SliceStable(variants, func(i, j int) bool {
@@ -136,7 +140,7 @@ func vixQualityStreams(h *HLS) []sourceQuality {
 			}
 			lines = append(lines, "🎞️ "+strings.Join(labels, " / "))
 		}
-		result := create(quality, strings.Join(lines, "\n"), origin.URL, masterHasItalian(h, variant))
+		result := create(quality, strings.Join(lines, "\n"), origin.URL, masterHasVixAudio(h, variant, tracks))
 		if label := formatBitrate(bitrate); label != "" {
 			result.stream.Name += " · " + label
 		}
@@ -189,7 +193,7 @@ func (s *Server) prepareNative(ctx context.Context, v *Session) error {
 			return err
 		}
 		matched := false
-		for _, candidate := range vixQualityStreams(h) {
+		for _, candidate := range vixQualityStreams(h, nil) {
 			if candidate.native.Quality == quality {
 				v.native.VariantURL = candidate.native.VariantURL
 				matched = true
@@ -237,7 +241,14 @@ func (s *Server) prepareNative(ctx context.Context, v *Session) error {
 			if variant != nil && !renditionMatches(r.Type, r.GroupID, variant) {
 				continue
 			}
-			v.tracks = append(v.tracks, Track{ID: fmt.Sprintf("native-%d", i), Name: r.Name, Lang: language(r.Language), Original: true, Subtitle: r.Type == playlist.MultivariantRenditionTypeSubtitles})
+			lang, name := language(r.Language), r.Name
+			if r.Type == playlist.MultivariantRenditionTypeAudio {
+				lang = vixLanguage(r.Language, r.Name)
+				if lang == "und" {
+					name = vixTrackName(lang)
+				}
+			}
+			v.tracks = append(v.tracks, Track{ID: fmt.Sprintf("native-%d", i), Name: name, Lang: lang, Original: true, Subtitle: r.Type == playlist.MultivariantRenditionTypeSubtitles})
 		}
 	}
 	v.state("Ready · original source audio and video")
@@ -280,16 +291,20 @@ func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video bool,
 			return nil, err
 		}
 	}
-	italianDefaults := map[string]string{}
+	audioDefaults := map[string]*playlist.MultivariantRendition{}
 	if h.Master != nil {
 		for _, r := range h.Master.Renditions {
-			if r.Type == playlist.MultivariantRenditionTypeAudio && (language(r.Language) == "it" || language(r.Name) == "it") {
-				if _, exists := italianDefaults[r.GroupID]; !exists || r.Default {
-					italianDefaults[r.GroupID] = r.Name
-				}
+			if r.Type != playlist.MultivariantRenditionTypeAudio {
+				continue
+			}
+			lang := vixLanguage(r.Language, r.Name)
+			preferred := audioDefaults[r.GroupID]
+			if (lang == "und" && preferred == nil) || (lang == "it" && (preferred == nil || vixLanguage(preferred.Language, preferred.Name) != "it" || r.Default)) {
+				audioDefaults[r.GroupID] = r
 			}
 		}
 	}
+	unknownNames := map[string]int{}
 	var b strings.Builder
 	pending := ""
 	index := 0
@@ -342,11 +357,11 @@ func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video bool,
 				continue
 			}
 			childVideo = attrs["TYPE"] == "VIDEO"
-			if preferred, ok := italianDefaults[attrs["GROUP-ID"]]; attrs["TYPE"] == "AUDIO" && ok {
-				italian := attrs["NAME"] == preferred
+			if preferred, ok := audioDefaults[attrs["GROUP-ID"]]; attrs["TYPE"] == "AUDIO" && ok {
+				selectedAudio := attrs["NAME"] == preferred.Name
 				// DEFAULT is explicit for every audio track; other attributes stay intact.
 				defaultValue := "NO"
-				if italian {
+				if selectedAudio {
 					defaultValue = "YES"
 				}
 				if _, ok := attrs["DEFAULT"]; ok {
@@ -354,9 +369,17 @@ func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video bool,
 				} else {
 					raw += ",DEFAULT=" + defaultValue
 				}
-				if italian {
+				if selectedAudio {
 					raw = hlsAutoselectRE.ReplaceAllString(raw, "${1}AUTOSELECT=YES")
 				}
+			}
+			if attrs["TYPE"] == "AUDIO" && vixLanguage(attrs["LANGUAGE"], attrs["NAME"]) == "und" {
+				unknownNames[attrs["GROUP-ID"]]++
+				name := vixTrackName("und")
+				if n := unknownNames[attrs["GROUP-ID"]]; n > 1 {
+					name += fmt.Sprintf(" (%d)", n)
+				}
+				raw = hlsNameRE.ReplaceAllString(raw, `${1}NAME="`+name+`"`)
 			}
 		}
 		playlistURI := isRendition || strings.HasPrefix(line, "#EXT-X-I-FRAME-STREAM-INF:") || strings.HasPrefix(line, "#EXT-X-RENDITION-REPORT:")

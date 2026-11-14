@@ -216,7 +216,7 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 		}
 		provider := source.dashboardSource()
 		if source.Type == "vixsrc" {
-			for _, quality := range vixQualityStreams(bundle.master) {
+			for _, quality := range vixQualityStreams(bundle.master, bundle.tracks) {
 				upstream = append(upstream, listedStream{stream: quality.stream, native: quality.native, source: provider})
 			}
 			continue
@@ -254,7 +254,7 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 	if bundle.err != nil {
 		s.lookupStatus = "Vixsrc Italian audio unavailable; returning original links…"
 	} else {
-		s.lookupStatus = "Vixsrc Italian audio confirmed; returning streams…"
+		s.lookupStatus = "Vixsrc audio available; returning streams…"
 	}
 	sessions := make([]*Session, len(upstream))
 	for i, item := range upstream {
@@ -288,7 +288,7 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 			}
 		} else if bundle.err == nil && urlErr == nil {
 			v.listedVix, v.listedEnglish = bundle.tracks, bundle.english
-			v.Status = "Italian audio found · ready to prepare or play"
+			v.Status = "Vixsrc audio found · ready to prepare or play"
 			results[i] = stream.dubbed(s.playbackURL(r, v))
 			italianResults++
 		} else {

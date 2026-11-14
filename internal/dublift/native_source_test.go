@@ -122,7 +122,7 @@ func TestNativePlaybackRestartRecoversCookiesAndSelectedQuality(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			qualities := vixQualityStreams(h)
+			qualities := vixQualityStreams(h, nil)
 			selected := qualities[len(qualities)-1]
 			v := s.newSession(c, selected.stream)
 			v.native, v.nativeMaster = selected.native, h
@@ -419,7 +419,7 @@ func TestVixNativeAutoQualityAndMissingItalian(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		qualities := vixQualityStreams(h)
+		qualities := vixQualityStreams(h, nil)
 		if len(qualities) != 1 || qualities[0].native.Italian {
 			t.Fatal("native video incorrectly required/claimed Italian audio")
 		}
@@ -457,7 +457,7 @@ func TestNativeSourcePlaybackDecodes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			quality := vixQualityStreams(h)[0]
+			quality := vixQualityStreams(h, nil)[0]
 			v := s.newSession(Content{Type: "movie", ID: "tmdb:603"}, quality.stream)
 			v.native, v.nativeMaster = quality.native, h
 			local := httptest.NewServer(s)

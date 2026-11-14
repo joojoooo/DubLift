@@ -28,7 +28,9 @@ make release
   rollover/discontinuity clocks independent of VixSrc timing,
   isolated subtitle failures and bounded parsing/reads, cancellation/cache
   invalidation, playback-ticket metadata and track reconstruction, VixSrc
-  qualities and native playback across restarts, HTTP ranges and retries,
+  qualities and native playback across restarts, unknown-language audio
+  fallback/default selection and embedded AAC discovery (including mixed external
+  and embedded audio renditions), HTTP ranges and retries,
   HLS proxying, file remuxing/timing, generated fMP4 audio (including parallel
   requests, retries, byte ranges, short final GOPs, wrapped HLS clocks with
   TS initialization maps, bounded/ranged/encrypted initialization detection,

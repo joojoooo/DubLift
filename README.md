@@ -47,7 +47,8 @@ go build -trimpath -o bin/dublift ./cmd/dublift
    sources. VixSrc and Movy are included; upstream addon manifest URLs are optional. For Stremio, follow the **Stremio Addon
    Manager** link shown in the dashboard.
 3. Choose a movie or episode in Stremio/Nuvio, then select a DubLift result
-   marked with the Italian flag. Italian audio is the default track.
+   marked with the Italian flag. Italian audio is the default track; when its
+   language is missing, the default is labelled **Unknown · Vixsrc**.
 4. Use **Streams → Adjust audio timing** if synchronization needs adjusting.
 
 Keep DubLift running during playback. For another device on your network,
