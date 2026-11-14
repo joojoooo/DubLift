@@ -38,6 +38,11 @@ title-only lines, including addon icons and release years, are hidden in
 the stream details. Resolution, bitrate, codecs, and other details remain.
 If no title is available, the heading shows the content type and ID.
 
+Results show their **Binge group** in **Technical details** when available.
+VixSrc and Movy groups use the provider and quality, shared across servers.
+These groups stay the same across episodes and restarts so players can match
+the next episode. External addons keep their own binge groups unchanged.
+
 VixSrc lists each available HLS quality with its resolution and bitrate
 (preferably average bitrate), highest quality first. If its playlist has no
 quality metadata, DubLift offers **Auto quality**. VixSrc playback preserves

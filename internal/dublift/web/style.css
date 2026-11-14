@@ -752,7 +752,7 @@ code {
 [hidden] {
   display: none !important;
 }
-.session .name, .stream-title, .description, .file-details { white-space: pre-wrap; overflow-wrap: anywhere; }
+.session .name, .stream-title, .description, .file-details, .binge-group { white-space: pre-wrap; overflow-wrap: anywhere; }
 .session .content-name { margin: 10px 0 14px; overflow-wrap: anywhere; }
 .session.playing { border-color: var(--accent, #cdf475); }
 .sample-progress { color: #cdf475; }

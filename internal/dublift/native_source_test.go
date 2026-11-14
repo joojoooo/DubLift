@@ -134,6 +134,9 @@ func TestNativePlaybackRestartRecoversCookiesAndSelectedQuality(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if ticket.Stream.BehaviorHints.BingeGroup == "" || ticket.Stream.BehaviorHints.BingeGroup != selected.stream.BehaviorHints.BingeGroup {
+				t.Fatal("ticket lost binge group")
+			}
 			plain, _ := json.Marshal(ticket)
 			if bytes.Contains(plain, []byte("source-session")) || bytes.Contains(plain, []byte("private-cookie")) {
 				t.Fatal("playback ticket persisted cookies")
@@ -190,6 +193,9 @@ func TestNativePlaybackRestartRecoversCookiesAndSelectedQuality(t *testing.T) {
 				t.Fatal("resume did not recover cookies from the original provider")
 			}
 			u, _ := http.NewRequest("GET", url, nil)
+			if restarted.getSession(v.ID).stream.BehaviorHints.BingeGroup != selected.stream.BehaviorHints.BingeGroup {
+				t.Fatal("restart changed binge group")
+			}
 			if strings.Contains(restarted.playbackURL(u, restarted.getSession(v.ID)), "private-") {
 				t.Fatal("playback URL exposed credentials")
 			}
@@ -283,6 +289,9 @@ func TestVixNativeQualitiesOrderingAndPlayback(t *testing.T) {
 	if !strings.Contains(streams[2].Title, "1280×720") {
 		t.Fatal("missing resolution")
 	}
+	if streams[1].BehaviorHints.BingeGroup != "dublift:vixsrc:1080p" || streams[2].BehaviorHints.BingeGroup != "dublift:vixsrc:720p" {
+		t.Fatal("native listing lost binge groups")
+	}
 	if videoReads.Load() != 0 || disabledReads.Load() != 0 {
 		t.Fatal("listing probed video or queried a hidden source")
 	}
@@ -294,6 +303,9 @@ func TestVixNativeQualitiesOrderingAndPlayback(t *testing.T) {
 		provider := source.dashboardSource()
 		if views[i]["sourceID"] != provider.ID || views[i]["sourceName"] != provider.Name {
 			t.Fatalf("stream %d lost its configured source", i)
+		}
+		if views[i]["bingeGroup"] != streams[i].BehaviorHints.BingeGroup {
+			t.Fatalf("stream %d lost its dashboard binge group", i)
 		}
 	}
 	// Move VixSrc first, then verify that source ordering persists in the listing.

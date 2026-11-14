@@ -75,6 +75,7 @@ func vixQualityStreams(h *HLS, tracks []Track) []sourceQuality {
 			stream.Headers[key] = h.Origin.Headers.Get(key)
 		}
 		stream.BehaviorHints.Filename = "vixsrc-" + quality + ".m3u8"
+		stream.BehaviorHints.BingeGroup = builtinBingeGroup("vixsrc", quality)
 		return sourceQuality{stream, &nativePlayback{ProviderURL: h.Origin.Headers.Get("Origin"), Quality: quality, VariantURL: variantURL, Italian: italian}}
 	}
 	if h.Master == nil || len(h.Master.Variants) == 0 {

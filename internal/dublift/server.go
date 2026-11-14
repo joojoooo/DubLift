@@ -353,6 +353,7 @@ func (s *Server) status(r *http.Request) map[string]any {
 		v.mu.Lock()
 		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, nil), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
 		view["contentType"] = v.Content.Type
+		view["bingeGroup"] = v.stream.BehaviorHints.BingeGroup
 		view["sourceID"], view["sourceName"] = v.SourceID, v.SourceName
 		view["native"] = v.native != nil
 		view["italian"] = !v.Passthrough && (v.native == nil || v.native.Italian)

@@ -318,6 +318,11 @@ func (n *Network) normalizeMovySources(ctx context.Context, data movyPayload, se
 		create := func(quality, variantURL, technical string) movyChoice {
 			label, height := movyQuality(quality)
 			stream := Stream{URL: source.URL, Name: "Movy · " + label + " · 📡 " + strings.ToUpper(server[:1]) + server[1:], Title: "🎞️ " + technical, Headers: map[string]string{}, variantURL: variantURL}
+			groupQuality := "auto"
+			if height > 0 {
+				groupQuality = label
+			}
+			stream.BehaviorHints.BingeGroup = builtinBingeGroup("movy", groupQuality)
 			for key := range headers {
 				stream.Headers[key] = headers.Get(key)
 			}

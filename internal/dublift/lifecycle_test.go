@@ -120,13 +120,13 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			}))
 			defer origin.Close()
 			first = []json.RawMessage{
-				json.RawMessage(fmt.Sprintf(`{"name":"Zulu · 4K","title":"The Matrix\nFull title and size","description":"All provider details\nSecond line","url":%q,"behaviorHints":{"filename":"The.Matrix.1999.mkv","proxyHeaders":{"request":{"Referer":"https://required.test/"}},"videoSize":123456789},"subtitles":[{"id":"it","lang":"ita","url":"https://subs.test/1"}],"customField":{"keep":true}}`, origin.URL+"/video.m3u8")),
+				json.RawMessage(fmt.Sprintf(`{"name":"Zulu · 4K","title":"The Matrix\nFull title and size","description":"All provider details\nSecond line","url":%q,"behaviorHints":{"filename":"The.Matrix.1999.mkv","bingeGroup":"  External.Mixed/4K:v1 · group  ","proxyHeaders":{"request":{"Referer":"https://required.test/"}},"videoSize":123456789},"subtitles":[{"id":"it","lang":"ita","url":"https://subs.test/1"}],"customField":{"keep":true}}`, origin.URL+"/video.m3u8")),
 				json.RawMessage(`{"name":"Donation","externalUrl":"https://pengu.uk/donate"}`),
-				json.RawMessage(`{"name":"Torrent","infoHash":"0123456789abcdef","fileIdx":3,"sources":["tracker:test"],"behaviorHints":{"videoSize":555}}`),
+				json.RawMessage(`{"name":"Torrent","infoHash":"0123456789abcdef","fileIdx":3,"sources":["tracker:test"],"behaviorHints":{"videoSize":555,"bingeGroup":"Torrent:Exact_CASE"}}`),
 			}
 			second = []json.RawMessage{
-				json.RawMessage(fmt.Sprintf(`{"name":"Alpha","description":"Nonseekable original","url":%q,"headers":{"X-Test":"keep"}}`, origin.URL+"/no-range.mkv")),
-				json.RawMessage(`{"name":"External","externalUrl":"https://player.test/","unknown":17}`),
+				json.RawMessage(fmt.Sprintf(`{"name":"Alpha","description":"Nonseekable original","url":%q,"headers":{"X-Test":"keep"},"behaviorHints":{"bingeGroup":"Addon:1080p"}}`, origin.URL+"/no-range.mkv")),
+				json.RawMessage(`{"name":"External","externalUrl":"https://player.test/","unknown":17,"behaviorHints":{"bingeGroup":"External:Player"}}`),
 				json.RawMessage(`{"name":"Nearby","externalUrl":"https://pengu.uk/donate/"}`),
 			}
 			s := lifecycleServer(t)
@@ -164,8 +164,9 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 						t.Fatal(h)
 					}
 					if expectedHints, ok := e["behaviorHints"].(map[string]any); ok {
-						h["filename"] = expectedHints["filename"]
-						h["proxyHeaders"] = expectedHints["proxyHeaders"]
+						if proxy, ok := expectedHints["proxyHeaders"]; ok {
+							h["proxyHeaders"] = proxy
+						}
 						delete(h, "notWebReady")
 					} else {
 						delete(m, "behaviorHints")
@@ -186,6 +187,7 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 					Order                int
 					Title, Description   string
 					SourceID, SourceName string
+					BingeGroup           string
 				}
 			}
 			json.Unmarshal(w.Body.Bytes(), &state)
@@ -202,6 +204,13 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 				}
 				if state.Sessions[i].SourceID != provider.ID || state.Sessions[i].SourceName != provider.Name {
 					t.Fatal("dashboard lost the source of an addon or fallback stream")
+				}
+				var stream Stream
+				if err := json.Unmarshal(want[i], &stream); err != nil {
+					t.Fatal(err)
+				}
+				if state.Sessions[i].BingeGroup != stream.BehaviorHints.BingeGroup {
+					t.Fatalf("dashboard changed addon binge group %d: %q", i, state.Sessions[i].BingeGroup)
 				}
 			}
 			if state.Sessions[0].Title != "The Matrix\nFull title and size" || state.Sessions[0].Description != "All provider details\nSecond line" {

@@ -51,6 +51,43 @@ test('series headings remove repeated series names and preserve episode details'
   assert.deepEqual(streamText(session, 'Devs · S01E02'), ['Addon', '', 'Episode 2\nDevs · S01E03\n1080p']);
 });
 
+test('technical details show binge groups as text and update their visibility', () => {
+  const elements = new Map();
+  const card = {
+    dataset: {}, classList: { toggle() {} },
+    querySelector(selector) {
+      if (!elements.has(selector)) elements.set(selector, {
+        dataset: {}, textContent: '', replaceChildren() {},
+      });
+      return elements.get(selector);
+    },
+  };
+  const context = vm.createContext({
+    cards: new Map([['result', card]]), settings: {}, document: {},
+    setText: (element, value) => { element.textContent = value; },
+    updateContentLink() {}, clock: value => String(value || 0),
+  });
+  vm.runInContext(textCode, context);
+  vm.runInContext(app.slice(app.indexOf('function sessionMessages'), app.indexOf('let lastEvents')), context);
+  for (const session of [
+    { native: true, bingeGroup: 'dublift:vixsrc:1080p' },
+    { bingeGroup: 'dublift:movy:2160p' },
+    { passthrough: true, bingeGroup: '  External.Mixed/<img src=x>:v1 · group  ' },
+    { bingeGroup: '' }, {},
+  ]) {
+    context.session = { id: 'result', ...session };
+    vm.runInContext('updateCard(session)', context);
+    assert.equal(card.querySelector('.binge-group').textContent, session.bingeGroup || '');
+    assert.equal(card.querySelector('.binge-group-info').hidden, !session.bingeGroup);
+    assert.equal(card.querySelector('.technical-details').hidden, !session.bingeGroup);
+    assert.equal(card.querySelector('.binge-group').innerHTML, undefined);
+  }
+  context.session = { id: 'result', filename: 'source.mkv' };
+  vm.runInContext('updateCard(session)', context);
+  assert.equal(card.querySelector('.technical-details').hidden, false);
+  assert.equal(card.querySelector('.binge-group-info').hidden, true);
+});
+
 async function resolve(type, id, preset) {
   const elements = {
     'resolve-form': {}, 'resolve-status': {}, 'content-type': { value: type },

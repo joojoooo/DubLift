@@ -333,6 +333,9 @@ func TestMovyExtensionlessQualitiesPreserveMasterAndTicket(t *testing.T) {
 	if mediaReads.Load() != 0 {
 		t.Fatal("discovery fetched media")
 	}
+	if choices[0].stream.BehaviorHints.BingeGroup != "dublift:movy:2160p" || choices[1].stream.BehaviorHints.BingeGroup != "dublift:movy:1080p" {
+		t.Fatal("expanded HLS qualities lost binge groups")
+	}
 	c, _ := ParseContent("movie", "tmdb:603")
 	v := s.newSession(c, choices[1].stream)
 	other := s.newSession(c, choices[0].stream)
@@ -346,6 +349,9 @@ func TestMovyExtensionlessQualitiesPreserveMasterAndTicket(t *testing.T) {
 	restored, err := s.restorePlayback(v.ID, encoded)
 	if err != nil || restored.stream.variantURL != origin.URL+"/hd.m3u8" {
 		t.Fatal("ticket lost selected quality", err)
+	}
+	if restored.stream.BehaviorHints.BingeGroup != "dublift:movy:1080p" {
+		t.Fatal("ticket lost binge group")
 	}
 	asset, master, variant, err := s.inspectSource(context.Background(), restored.stream)
 	if err != nil || asset.Origin.URL != origin.URL+"/hd.m3u8" || variant.Audio != "en" || master.Master.Renditions[0].Language != "en" {
@@ -443,6 +449,13 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 			streams := listing()
 			if len(streams) != 2 || !strings.Contains(streams[0].Name, "Movy") || !strings.Contains(streams[1].Name, "Addon") {
 				t.Fatal("source order changed", streams)
+			}
+			if streams[0].BehaviorHints.BingeGroup != "dublift:movy:1080p" {
+				t.Fatal("Movy listing lost binge group")
+			}
+			views := s.status(httptest.NewRequest("GET", "/api/status", nil))["sessions"].([]map[string]any)
+			if views[0]["bingeGroup"] != streams[0].BehaviorHints.BingeGroup {
+				t.Fatal("Movy dashboard lost binge group")
 			}
 			for _, stream := range streams {
 				if strings.Contains(stream.URL, "/media/") != italian || strings.HasPrefix(stream.Name, "🇮🇹 ") != italian {

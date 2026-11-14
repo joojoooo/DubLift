@@ -860,6 +860,7 @@ function updateCard(v) {
   set(".stream-title", title);
   set(".description", description);
   set(".file-details", v.filename || "");
+  set(".binge-group", v.bingeGroup || "");
   card.classList.toggle("playing", !!v.playing);
   const messages = sessionMessages(v);
   set(".status", messages.status);
@@ -920,9 +921,10 @@ function updateCard(v) {
       .join("\n"),
   );
   card.querySelector(".file-info").hidden = !v.filename;
+  card.querySelector(".binge-group-info").hidden = !v.bingeGroup;
   card.querySelector(".track-info").hidden = !v.tracks?.length;
   card.querySelector(".alignment-info").hidden = !card.querySelector(".anchors").textContent;
-  card.querySelector(".technical-details").hidden = !v.filename && !v.tracks?.length && !card.querySelector(".anchors").textContent;
+  card.querySelector(".technical-details").hidden = !v.filename && !v.bingeGroup && !v.tracks?.length && !card.querySelector(".anchors").textContent;
   const errors = card.querySelector(".errors");
   const errorKey = JSON.stringify(messages.errors);
   if (errors.dataset.value !== errorKey) {

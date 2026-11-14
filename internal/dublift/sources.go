@@ -22,6 +22,16 @@ var builtinSources = []sourceDefinition{
 	{Type: "movy", Name: "Movy", Icon: "/movy.png", URLLabel: "Movy base URL", DefaultURL: movyDefaultURL},
 }
 
+// Only built-in provider names and canonical quality labels belong in
+// these groups. Content, origin URLs and playback state must never affect them.
+func builtinBingeGroup(provider, quality string) string {
+	quality = strings.ToLower(strings.Join(strings.Fields(quality), "-"))
+	if quality == "auto-quality" {
+		quality = "auto"
+	}
+	return strings.Join([]string{"dublift", provider, quality}, ":")
+}
+
 type dashboardSource struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
