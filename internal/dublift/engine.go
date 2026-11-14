@@ -52,6 +52,9 @@ type Track struct {
 	Selector string
 	Original bool
 	Subtitle bool
+	// Standalone is a VOD subtitle file, distinct from an HLS rendition or
+	// an embedded stream in Asset. It is never opened by the media engine.
+	Standalone *Origin
 }
 type ProbeStream struct {
 	Index     int    `json:"index"`

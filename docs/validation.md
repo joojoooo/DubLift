@@ -19,7 +19,15 @@ make release
 - **Tests:** local mock servers and synthetic media check discovery,
   config version resets, source toggles/order, upstream preservation, Movy
   metadata decoding/server discovery (including deferred script loaders),
-  server-provided subtitle preservation and VixSrc audio integration, VixSrc
+  server-provided subtitle preservation and VixSrc audio integration, standalone
+  official subtitles as distinct local HLS renditions without duplicate JSON
+  attachments, lazy/coalesced subtitle downloads and session-owned conversion
+  caching, extensionless UTF-8 SRT/WebVTT (BOMs, line endings, multiline cues,
+  emphasis, language deduplication and safe IDs), seek/window selection with
+  full cue timing across boundaries and empty or final segments,
+  rollover/discontinuity clocks independent of VixSrc timing,
+  isolated subtitle failures and bounded parsing/reads, cancellation/cache
+  invalidation, playback-ticket metadata and track reconstruction, VixSrc
   qualities and native playback across restarts, HTTP ranges and retries,
   HLS proxying, file remuxing/timing, generated fMP4 audio (including parallel
   requests, retries, byte ranges, short final GOPs, wrapped HLS clocks with
@@ -62,6 +70,22 @@ Title checks cover resolver presets, consistent headings, decorated title
 deduplication, and preserving technical stream details.
 Node.js is not needed to run the server.
 
+## Standalone subtitle regressions
+
+For focused subtitle changes, run:
+
+```sh
+go test -race ./internal/dublift -run '^Test(Standalone|GeneratedAudioWrappedHLSClock|SubtitleShift|MappedSubtitles|OriginalSubtitles|MovyListingUsesVixAudioAndSourceOrder|FallbackPreservesEveryFieldAndUpstreamOrder)' -count=1
+```
+
+Fixtures use local mock servers and synthetic media. Standalone files are
+content-detected UTF-8 WebVTT/SRT with an optional UTF-8 BOM; no subtitle catalog,
+FFmpeg subtitle conversion, or live provider is involved. Bounds are 200
+attachment entries, 4 MiB input, 8 MiB normalized/segment output, 20,000 cues,
+8 KiB per line, 64 KiB/1,024 lines per cue, and seven-day timestamps. Tests reject
+unsupported encodings, HTML, malformed cues, and WebVTT STYLE/REGION blocks,
+and verify that subtitle failures leave synthetic audio/video usable.
+
 ## Optional playback and provider checks
 
 With VLC installed, run:
@@ -99,6 +123,11 @@ success, decode playback, or download complete titles. Keep reports private.
 - Play through Stremio/Nuvio and VLC: verify video and Italian audio at
   startup, after forward/backward seeks, and after timing changes. Refresh
   results during playback and select a different stream to check lifecycle.
+- With a Movy result offering official subtitles, select audio and subtitles
+  independently in Stremio/Nuvio. Check multiple languages and duplicate-language
+  tracks, empty windows, boundary-spanning cues, and the final segment. Change
+  audio timing and seek: VixSrc subtitles should shift with its audio while
+  Movy subtitles keep the original video's timing.
 - Test from another LAN device with dynamic LAN address or configured Public base URL. Check real
   codecs/HDR, long playback, and slow or failing providers on target players.
 

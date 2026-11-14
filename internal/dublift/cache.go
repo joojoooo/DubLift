@@ -97,6 +97,9 @@ func (c *ByteCache) Put(ctx context.Context, key string, data []byte) {
 	c.evict()
 }
 func (c *ByteCache) Get(ctx context.Context, key string, build func() ([]byte, error)) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	originalKey := key
 	key = c.ownerKey(ctx, key)
 	c.mu.Lock()
@@ -123,11 +126,16 @@ func (c *ByteCache) Get(ctx context.Context, key string, build func() ([]byte, e
 	c.pending[key] = f
 	c.mu.Unlock()
 	b, e := build()
+	if e == nil && ctx.Err() != nil {
+		b, e = nil, ctx.Err()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	f.data = b
 	f.err = e
-	if e == nil && ctx.Err() == nil && epoch == c.epoch && int64(len(b)) <= c.max {
+	// DeleteOwner can invalidate a flight before request cancellation reaches
+	// its context, or while a restored session starts a new flight with this key.
+	if e == nil && ctx.Err() == nil && epoch == c.epoch && c.pending[key] == f && int64(len(b)) <= c.max {
 		c.items[key] = c.lru.PushFront(cacheEntry{key: key, data: b})
 		c.used += int64(len(b))
 		c.evict()

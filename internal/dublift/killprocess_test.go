@@ -27,4 +27,3 @@ func TestKillProcessAlreadyExited(t *testing.T) {
 		t.Fatalf("unexpected error for non-existent process: %v", err)
 	}
 }
-

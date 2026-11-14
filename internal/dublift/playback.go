@@ -221,7 +221,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(p) == 3 && strings.HasSuffix(p[2], ".m3u8") {
-			if track.Original && track.Asset.HLS != nil && track.Asset != v.video {
+			if track.Standalone == nil && track.Original && track.Asset.HLS != nil && track.Asset != v.video {
 				sendPlaylist(w, []byte(s.proxyPlaylist(v, track.Asset, !track.Subtitle)))
 			} else {
 				sendPlaylist(w, []byte(s.generatedPlaylist(v, track)))
@@ -257,7 +257,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			v.fileAudioSegmentRequested(n)
 		}
 		offset := 0.0
-		if !track.Original {
+		if !track.Original && track.Standalone == nil {
 			offset = s.playbackOffset(v, start)
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)

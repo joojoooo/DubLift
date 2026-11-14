@@ -80,6 +80,9 @@ func parseVTT(b []byte, segmentStart float64) ([]cue, error) {
 	return out, nil
 }
 func (s *Server) subtitles(ctx context.Context, v *Session, t Track, start, duration, offset, clockBase float64) ([]byte, error) {
+	if t.Standalone != nil {
+		return s.standaloneSubtitles(ctx, t, start, duration, clockBase)
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:%d\n\n", int64(math.Round(clockBase*90000))&((1<<33)-1))
 	seen := map[string]bool{}

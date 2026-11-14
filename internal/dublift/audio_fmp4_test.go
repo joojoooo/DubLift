@@ -303,7 +303,10 @@ func TestGeneratedAudioWrappedHLSClock(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			v := s.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{URL: origin.URL + "/source.m3u8"})
+			if err := os.WriteFile(filepath.Join(dir, "official"), []byte("\ufeffWEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:888888\n\n00:05.000 --> 00:19.000\nMovy VOD cue.\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			v := s.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{URL: origin.URL + "/source.m3u8", Subtitles: []Subtitle{{URL: origin.URL + "/official", Lang: "en"}}})
 			v.listedVix = []Track{
 				{ID: "italian", Name: "Italian · Vixsrc", Lang: "it", Asset: asset, Selector: "0:a:0"},
 				{ID: "original-subs", Name: "English", Lang: "en", Asset: subs, Original: true, Subtitle: true},
@@ -319,6 +322,24 @@ func TestGeneratedAudioWrappedHLSClock(t *testing.T) {
 			originalSubs := getBytes(t, local.URL+"/media/"+v.ID+"/track/original-subs/0.vtt")
 			if !bytes.Contains(originalSubs, []byte("00:00:01.000 --> 00:00:02.000\nOriginal cue.")) {
 				t.Fatal("wrapped audio clock changed original subtitle timing", string(originalSubs))
+			}
+			var official Track
+			for _, track := range v.tracks {
+				if track.Standalone != nil {
+					official = track
+				}
+			}
+			for _, n := range []int{2, 0, 3, 1, 0} {
+				base, err := s.sectionClock(v.ctx, v, n)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data := getBytes(t, fmt.Sprintf("%s/media/%s/track/%s/%d.vtt", local.URL, v.ID, official.ID, n))
+				const want = "00:00:05.000 --> 00:00:19.000\nMovy VOD cue."
+				stamp := fmt.Sprintf("MPEGTS:%d", int64(math.Round(base*90000))&((1<<33)-1))
+				if !bytes.Contains(data, []byte(want)) || !bytes.Contains(data, []byte(stamp)) {
+					t.Fatalf("standalone cue lost VOD timing in section %d: %s", n, data)
+				}
 			}
 			base := local.URL + "/media/" + v.ID + "/track/italian"
 			segments := make([][]byte, 4)

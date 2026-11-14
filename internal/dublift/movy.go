@@ -407,11 +407,7 @@ func appendMovySubtitles(stream *Stream, subtitles []movySubtitle) {
 			continue
 		}
 		seen[key] = true
-		stream.Subtitles = append(stream.Subtitles, struct {
-			ID   string `json:"id"`
-			URL  string `json:"url"`
-			Lang string `json:"lang"`
-		}{ID: "movy-" + identity(key)[:16], URL: subtitle.URL, Lang: lang})
+		stream.Subtitles = append(stream.Subtitles, Subtitle{ID: "movy-" + identity(key)[:16], URL: subtitle.URL, Lang: lang})
 	}
 }
 

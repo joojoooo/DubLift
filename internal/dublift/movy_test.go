@@ -389,7 +389,7 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 					io.WriteString(w, "#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvix-video.m3u8\n")
 				case "/en.m3u8", "/it.m3u8":
 					io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\naudio.ts\n#EXT-X-ENDLIST\n")
-				case "/video.m3u8", "/addon.mkv", "/audio.ts", "/vix-video.m3u8":
+				case "/video.m3u8", "/addon.mkv", "/audio.ts", "/vix-video.m3u8", "/eng.vtt":
 					mediaReads.Add(1)
 					w.WriteHeader(500)
 				default:
@@ -423,7 +423,10 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 			if strings.Contains(streams[0].URL, "/media/") != italian || strings.HasPrefix(streams[0].Name, "🇮🇹 ") != italian {
 				t.Fatal("Italian audio eligibility incorrect", streams[0])
 			}
-			if len(streams[0].Subtitles) != 1 || streams[0].Subtitles[0].URL != origin.URL+"/eng.vtt" || streams[0].Subtitles[0].Lang != "en" {
+			if italian && len(streams[0].Subtitles) != 0 {
+				t.Fatal("transformed listing retained JSON subtitles", streams[0].Subtitles)
+			}
+			if !italian && (len(streams[0].Subtitles) != 1 || streams[0].Subtitles[0].URL != origin.URL+"/eng.vtt" || streams[0].Subtitles[0].Lang != "en") {
 				t.Fatal("listing lost server-provided subtitles", streams[0].Subtitles)
 			}
 			if !italian && (streams[0].URL != origin.URL+"/video.m3u8" || streams[0].Headers["Referer"] != origin.URL+"/movie/603?play=true") {
@@ -438,6 +441,9 @@ func TestMovyListingUsesVixAudioAndSourceOrder(t *testing.T) {
 				for _, session := range s.sessions {
 					session.mu.Lock()
 					if session.SourceName == "Movy" && (session.native != nil || session.listedVix == nil || session.listedEnglish == nil || session.ContentName != "Fixture title") {
+						valid = false
+					}
+					if session.SourceName == "Movy" && len(session.stream.Subtitles) != 1 {
 						valid = false
 					}
 					session.mu.Unlock()

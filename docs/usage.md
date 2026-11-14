@@ -59,7 +59,11 @@ preparation or playback.
 The base URL controls Movy's title pages and player origin;
 its source service is handled by the built-in scraper. The scraper preserves
 each Movy server's own subtitle links and does not search separate subtitle
-catalogs.
+catalogs. During transformed playback, these official subtitles appear as local
+HLS tracks such as **English · Movy**, alongside original HLS and VixSrc
+subtitles. Audio and subtitles can be selected independently in Stremio/Nuvio;
+the transformed stream JSON no longer duplicates them as attachments. Original
+fallback responses retain their subtitle attachments and provider metadata.
 Only supported file/HLS sources are listed; DASH and DRM sources are excluded.
 
 The config stores `configVersion` (currently `2`) and an ordered `sources`
@@ -127,9 +131,25 @@ uses zero offset and manual timing remains available.
   **Search radius** for a larger timing difference. **Alignment samples**
   checks additional positions; different edits may still need manual timing.
 
-Vixsrc WebVTT subtitles follow the audio timing. Original external/HLS
-subtitles are preserved where practical; embedded file subtitles are not
-extracted.
+Vixsrc WebVTT subtitles follow the audio timing. Official Movy subtitles keep
+the original video's timeline, including after seeks or audio timing changes.
+Original HLS subtitles are preserved; embedded file subtitles are not extracted.
+Each generated standalone subtitle segment preserves the full timing of every
+cue overlapping its playback window, including cues that cross its boundaries.
+
+Standalone subtitle files support WebVTT and SRT encoded as UTF-8, with an
+optional UTF-8 BOM and LF or CRLF line endings. Formats are detected from the
+contents, so extensionless URLs work. Multiline cues and basic `<b>`, `<i>`, and
+`<u>` emphasis are preserved. UTF-16/legacy encodings, HTML responses, ASS/SSA,
+WebVTT STYLE/REGION blocks, and unsupported markup are rejected for that track.
+
+Listing and preparation register up to 200 attachment entries without fetching
+their bodies. A requested subtitle segment triggers a bounded download and text
+conversion, shared across concurrent requests and reused while resident in the
+session's rolling cache. Limits are 4 MiB per input file, 8 MiB for normalized
+data or a generated segment, 20,000 cues, 8 KiB per line, and 64 KiB or 1,024
+lines per cue. Cue timestamps may span up to seven days. Subtitle failures leave
+video, audio, and other tracks usable; failed conversions can be retried.
 
 Keep DubLift running while playing or seeking. Streams exposes the local HLS
 URL for VLC. Selecting a different stream replaces active playback; refreshing

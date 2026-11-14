@@ -104,4 +104,3 @@ func trapPidfdSendSignal(seccompNr uintptr) error {
 	}
 	return nil
 }
-

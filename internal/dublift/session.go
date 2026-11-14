@@ -16,6 +16,13 @@ import (
 	"github.com/bluenviron/gohlslib/v2/pkg/playlist"
 )
 
+type Subtitle struct {
+	ID      string            `json:"id"`
+	URL     string            `json:"url"`
+	Lang    string            `json:"lang"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
 type Stream struct {
 	raw json.RawMessage
 	// A Movy extensionless HLS master can advertise several qualities. Keep
@@ -35,11 +42,7 @@ type Stream struct {
 			Request map[string]string `json:"request,omitempty"`
 		} `json:"proxyHeaders,omitempty"`
 	} `json:"behaviorHints"`
-	Subtitles []struct {
-		ID   string `json:"id"`
-		URL  string `json:"url"`
-		Lang string `json:"lang"`
-	} `json:"subtitles,omitempty"`
+	Subtitles []Subtitle `json:"subtitles,omitempty"`
 }
 
 // Retain the complete upstream object, including torrent/external sources and
@@ -60,10 +63,14 @@ func (s Stream) MarshalJSON() ([]byte, error) {
 	return json.Marshal(plain(s))
 }
 func (s Stream) dubbed(local string) Stream {
-	return s.localPlayback(local, true)
+	return s.playbackResponse(local, true, true)
 }
 
 func (s Stream) localPlayback(local string, italian bool) Stream {
+	return s.playbackResponse(local, italian, false)
+}
+
+func (s Stream) playbackResponse(local string, italian, transformed bool) Stream {
 	b, _ := json.Marshal(s)
 	var fields map[string]json.RawMessage
 	json.Unmarshal(b, &fields)
@@ -80,6 +87,9 @@ func (s Stream) localPlayback(local string, italian bool) Stream {
 	delete(hints, "proxyHeaders") // Local endpoints do not need origin headers.
 	fields["behaviorHints"], _ = json.Marshal(hints)
 	delete(fields, "headers")
+	if transformed {
+		delete(fields, "subtitles") // Delivered only through local HLS renditions.
+	}
 	b, _ = json.Marshal(fields)
 	var out Stream
 	json.Unmarshal(b, &out)
@@ -429,6 +439,7 @@ func (s *Server) prepareMedia(ctx context.Context, v *Session) error {
 			}
 		}
 	}
+	v.registerStandaloneSubtitles()
 	// Bind cached alignment to the actual source identity and duration. Exact
 	// signed URL identity is deliberately conservative: different edits cannot
 	// accidentally inherit one another's alignment.
