@@ -93,6 +93,36 @@
         </div>
         <div id="playing-sessions" class="session-list"></div>
       </section>
+      <section id="automatic-next-episode" class="panel automatic-next-episode" aria-labelledby="automatic-next-episode-title" aria-busy="false" hidden>
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">AUTOMATIC PREPARATION</span>
+            <h2 id="automatic-next-episode-title">Up next</h2>
+          </div>
+          <span id="automatic-next-episode-state" class="pill">Waiting</span>
+        </div>
+        <h3 id="automatic-next-episode-episode" class="automatic-episode">Next episode</h3>
+        <p id="automatic-next-episode-message" class="automatic-message" role="status" aria-live="polite">Preparation starts near the end of this episode.</p>
+        <ol id="automatic-next-episode-steps" class="automatic-steps" aria-label="Preparation progress" hidden>
+          <li id="automatic-step-resolving"><span class="automatic-step-number" aria-hidden="true">1</span><span>Find episode</span></li>
+          <li id="automatic-step-searching"><span class="automatic-step-number" aria-hidden="true">2</span><span>Find stream</span></li>
+          <li id="automatic-step-preparing"><span class="automatic-step-number" aria-hidden="true">3</span><span>Prepare video</span></li>
+          <li id="automatic-step-aligning"><span class="automatic-step-number" aria-hidden="true">4</span><span>Check audio</span></li>
+        </ol>
+        <p id="automatic-next-episode-progress" class="automatic-progress" hidden></p>
+        <div id="automatic-next-episode-meta" class="automatic-meta" hidden>
+          <span id="automatic-next-episode-source" class="automatic-source" hidden></span>
+          <span id="automatic-next-episode-timing" class="automatic-audio" hidden></span>
+          <span id="automatic-next-episode-expires" class="automatic-expires" hidden></span>
+        </div>
+        <details id="automatic-next-episode-details" class="automatic-details" hidden>
+          <summary>Stream details</summary>
+          <dl>
+            <div id="automatic-next-episode-stream-row" hidden><dt>Stream</dt><dd id="automatic-next-episode-stream"></dd></div>
+            <div id="automatic-next-episode-audio-row" hidden><dt>Audio timing</dt><dd id="automatic-next-episode-audio-detail"></dd></div>
+          </dl>
+        </details>
+      </section>
       <div class="workspace">
         <section class="playback">
           <div class="section-heading">
@@ -209,6 +239,17 @@
             <button id="add-source" type="button" class="text-button">
               + Add addon source
             </button>
+            <hr />
+            <h3>Next episode</h3>
+            <label class="setting-toggle source-toggle">
+              <span>Automatically prepare the next episode</span>
+              <input id="next-episode-prefetch" type="checkbox" role="switch" aria-controls="next-episode-timing" aria-describedby="next-episode-help" checked />
+            </label>
+            <p id="next-episode-help" class="help">Prepare the next episode in the background to reduce waiting between episodes. Your player controls when to switch episodes.</p>
+            <div id="next-episode-timing" class="dependent-setting">
+              <label>Prepare before the end (minutes)<input id="next-episode-lead-minutes" type="number" min="1" max="30" value="5" aria-describedby="next-episode-timing-help" required /></label>
+              <p id="next-episode-timing-help" class="help">Start preparing this many minutes before the current episode ends. Increase this if the next episode is not ready in time.</p>
+            </div>
             <hr />
             <h3>Audio alignment</h3>
             <label

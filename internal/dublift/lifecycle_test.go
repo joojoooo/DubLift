@@ -149,6 +149,15 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 			}
 			for i := range want {
 				got, expected := jsonValue(t, result.Streams[i]), jsonValue(t, want[i])
+				source := cfg.Sources[0]
+				if i >= 2 {
+					source = cfg.Sources[1]
+				}
+				if hints, ok := expected.(map[string]any)["behaviorHints"].(map[string]any); ok {
+					if group, ok := hints["bingeGroup"].(string); ok && group != "" {
+						hints["bingeGroup"] = source.playerBingeGroup(group)
+					}
+				}
 				if italian && (i == 0 || i == 2) {
 					m, e := got.(map[string]any), expected.(map[string]any)
 					if _, attached := m["subtitles"]; attached {
@@ -209,8 +218,12 @@ func TestFallbackPreservesEveryFieldAndUpstreamOrder(t *testing.T) {
 				if err := json.Unmarshal(want[i], &stream); err != nil {
 					t.Fatal(err)
 				}
-				if state.Sessions[i].BingeGroup != stream.BehaviorHints.BingeGroup {
-					t.Fatalf("dashboard changed addon binge group %d: %q", i, state.Sessions[i].BingeGroup)
+				source := cfg.Sources[0]
+				if i >= 2 {
+					source = cfg.Sources[1]
+				}
+				if state.Sessions[i].BingeGroup != source.playerBingeGroup(stream.BehaviorHints.BingeGroup) {
+					t.Fatalf("dashboard lost player binge group %d: %q", i, state.Sessions[i].BingeGroup)
 				}
 			}
 			if state.Sessions[0].Title != "The Matrix\nFull title and size" || state.Sessions[0].Description != "All provider details\nSecond line" {

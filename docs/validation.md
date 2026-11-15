@@ -30,12 +30,17 @@ make release
   invalidation, playback-ticket metadata and track reconstruction, VixSrc
   qualities and native playback across restarts, unknown-language audio
   fallback/default selection and embedded AAC discovery (including mixed external
-  and embedded audio renditions), HTTP ranges and retries,
+  and embedded audio renditions), native subtitle preloading without playback
+  position or prefetch changes (including nested playlists), HTTP ranges and retries,
   HLS proxying, file remuxing/timing, generated fMP4 audio (including parallel
   requests, retries, byte ranges, short final GOPs, wrapped HLS clocks with
   TS initialization maps, bounded/ranged/encrypted initialization detection,
   and adjacent fragment clocks), alignment, dashboard APIs, and session/cache
-  lifecycle. The race detector checks executed
+  lifecycle, partial discovery results at provider deadlines with request/lookup/playback
+  cancellation preserved, next-episode thresholds/metadata/source restriction, exact binge-group
+  matching, the simple `dublift:` addon binge-group prefix and unchanged upstream
+  matching values, preparation/alignment reuse, one-use handoff, concurrent consumption,
+  cancellation and config migration chaining. The race detector checks executed
   Go code for data races.
 - **Vet / module verification:** static Go diagnostics and cached dependency
   integrity. These do not prove playback or provider availability.
@@ -59,6 +64,7 @@ regressions with Node.js (no third-party packages are needed):
 node --test scripts/dashboard-sources.test.cjs
 node --test scripts/dashboard-filters.test.cjs
 node --test scripts/dashboard-content.test.cjs
+node --test scripts/dashboard-prefetch.test.cjs
 ```
 
 These check valid addon additions, rapid reorder saves, draft URLs, failed
@@ -68,8 +74,21 @@ manifest validation during pending saves, and preserving other settings.
 They use a small DOM fixture and do not check browser rendering. Filter checks
 cover combined source/type selections, saved
 preferences, source refreshes, result counts, and keeping playback visible.
-Title checks cover resolver presets, consistent headings, decorated title
-deduplication, and preserving technical stream details.
+Next-episode controls check toggle/input loading, disabled behavior, saving,
+reloading, numeric validation attributes, preparation steps and audio-check
+progress, concise waiting and outcome messages, matched/manual/original/unmatched
+audio summaries, disclosure retention and clearing between episodes, and section
+visibility limited to enabled prefetch during series playback.
+API/event-stream regressions verify separate
+automatic summaries, finite outcome retention, handoff-to-playback rollover
+without new provider requests, cached-master adoption (including the IMDb
+S1E2 → S1E3 transition), public-base path prefixes on adopted master playlists,
+prepared alignment retention through cleanup and handoff, concurrent selection,
+exact media/source identity,
+master-only alias cleanup, unrelated-addon-lookup cancellation (including
+unresolved metadata and consumption races), and read-only polling. Title checks cover resolver
+presets, consistent headings, decorated title deduplication, and preserving technical
+stream details.
 Node.js is not needed to run the server.
 
 ## Standalone subtitle regressions

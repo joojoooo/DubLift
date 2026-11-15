@@ -7,6 +7,15 @@ import (
 )
 
 func (s *Server) discardLocked(v *Session) {
+	if s.playbackAlias == v {
+		s.playbackAliasID, s.playbackAlias = "", nil
+	}
+	if s.nextEpisodeLast.State == "waiting" && s.nextEpisodeLast.parentID == v.ID {
+		s.nextEpisodeLast = nextEpisodeDashboardStatus{}
+	}
+	if p := s.nextEpisode; p != nil && p.parent == v {
+		s.cancelNextEpisodeWithStatusLocked("canceled", "The playing session expired or was discarded.")
+	}
 	v.cancel()
 	delete(s.sessions, v.ID)
 	s.Engine.Cache.DeleteOwner(v.ID)
@@ -25,7 +34,7 @@ func (s *Server) beginLookup() (uint64, context.Context) {
 		v.mu.Unlock()
 		// Clients can refresh results or prefetch the next episode while a
 		// stream is playing. Only a new playback selection replaces that stream.
-		if !playing {
+		if !playing && !v.handedOff {
 			s.discardLocked(v)
 		}
 	}
@@ -41,10 +50,23 @@ func (s *Server) beginLookup() (uint64, context.Context) {
 // A GET of the selected master is the first signal a normal addon receives
 // from a player. HEAD is a capability check and must not consume the result set.
 func (s *Server) playerRequest(v *Session, r *http.Request) bool {
+	_, ok := s.selectPlayerSession(v, r)
+	return ok
+}
+
+func (s *Server) selectPlayerSession(v *Session, r *http.Request) (*Session, bool) {
 	s.mu.Lock()
+	// Another GET may already have adopted the prepared session while this
+	// request held the old result pointer. Resolve the one active master alias.
+	if alias := s.playbackAliasLocked(v.ID); alias != nil {
+		v = alias
+	}
+	if r.Method == "GET" {
+		v = s.adoptPreparedPlaybackLocked(v)
+	}
 	if s.sessions[v.ID] != v {
 		s.mu.Unlock()
-		return false
+		return nil, false
 	}
 	v.mu.Lock()
 	v.LastUsed, v.RequestAt, v.RequestMethod = time.Now(), time.Now(), r.Method
@@ -58,6 +80,16 @@ func (s *Server) playerRequest(v *Session, r *http.Request) bool {
 	}
 	v.mu.Unlock()
 	if first {
+		if p := s.nextEpisode; p != nil && p.content.Type == v.Content.Type && p.content.ID == v.Content.ID {
+			// This episode started through a previously listed URL or a different
+			// stream. Discard unused speculative work, then show the following episode.
+			s.rememberNextEpisodeLocked(p, "selected", "The episode started; unused automatic preparation was discarded.")
+			s.discardNextEpisodePrefetchLocked()
+		} else {
+			s.cancelNextEpisodeWithStatusLocked("canceled", "Automatic preparation canceled because playback switched to a different episode or title.")
+		}
+		v.handedOff = false
+		s.advanceNextEpisodeDashboardLocked(v)
 		// Invalidate unfinished lookup workers as well as already listed results.
 		s.generation++
 		if s.lookupCancel != nil {
@@ -74,7 +106,7 @@ func (s *Server) playerRequest(v *Session, r *http.Request) bool {
 	if first {
 		s.event("Playback detected: " + v.Name)
 	}
-	return true
+	return v, true
 }
 
 func (s *Server) collectLoop() {
@@ -92,6 +124,12 @@ func (s *Server) collectLoop() {
 func (s *Server) collectExpired(now time.Time) {
 	active, removed := map[string]bool{}, map[string]bool{}
 	s.mu.Lock()
+	if s.nextEpisodeLast.State != "waiting" && !s.nextEpisodeLast.Updated.IsZero() && now.Sub(s.nextEpisodeLast.Updated) >= nextEpisodeLifetime {
+		s.nextEpisodeLast = nextEpisodeDashboardStatus{}
+	}
+	if p := s.nextEpisode; p != nil && !now.Before(p.expires) {
+		s.cancelNextEpisodeWithStatusLocked("expired", "Automatic next-episode preparation expired.")
+	}
 	for _, v := range s.sessions {
 		v.mu.Lock()
 		idle, key := now.Sub(v.LastUsed), v.Key
@@ -101,6 +139,15 @@ func (s *Server) collectExpired(now time.Time) {
 			removed[key] = true
 		} else {
 			active[key] = true
+		}
+	}
+	// Unused prefetch sessions stay detached from stream results, but still
+	// own their saved timing until handoff, cancellation or expiry.
+	if p := s.nextEpisode; p != nil && p.ctx.Err() == nil {
+		for _, v := range p.sessions {
+			v.mu.Lock()
+			active[v.Key] = true
+			v.mu.Unlock()
 		}
 	}
 	if len(s.sessions) == 0 {

@@ -1,6 +1,7 @@
 package dublift
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -146,19 +147,23 @@ func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 		failure(w, 400, err)
 		return
 	}
+	if r.Method == "GET" {
+		if sessions := s.consumeNextEpisode(c); sessions != nil {
+			streamResponse(w, s.streamResponses(r, sessions))
+			return
+		}
+	}
 	s.listStreams(w, r, c, "")
 }
 
-func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, name string) {
-	generation, lookup := s.beginLookup()
-	ctx, cancel := context.WithCancel(lookup)
-	stop := context.AfterFunc(r.Context(), cancel)
-	defer func() { stop(); cancel() }()
-	// Discovery reads source listings, VixSrc quality metadata and Italian audio.
-	// Video probing, indexing and decoding wait for preparation or playback.
-	fetchCtx, fetchCancel := context.WithTimeout(ctx, 40*time.Second)
-	defer fetchCancel()
-	cfg := s.Config.Get()
+type listedStream struct {
+	stream Stream
+	native *nativePlayback
+	source Source
+}
+
+// Discovery is shared, but its caller owns lookup state and sessions.
+func (s *Server) discoverStreams(ctx context.Context, c Content, cfg Settings) ([]listedStream, vixBundle) {
 	type providerResult struct {
 		streams []Stream
 		err     error
@@ -171,9 +176,9 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 		}
 		wg.Go(func() {
 			if source.Type == "movy" {
-				id, err := s.Net.ResolveTMDB(fetchCtx, c, cfg.TMDBToken)
+				id, err := s.Net.ResolveTMDB(ctx, c, cfg.TMDBToken)
 				if err == nil {
-					providers[i].streams, err = s.Net.ResolveMovy(fetchCtx, source.BaseURL, c, id)
+					providers[i].streams, err = s.Net.ResolveMovy(ctx, source.BaseURL, c, id)
 				}
 				providers[i].err = err
 				return
@@ -185,36 +190,32 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 			}
 			u.Path = strings.TrimSuffix(u.Path, "/manifest.json") + "/stream/" + c.Type + "/" + id + ".json"
 			u.RawPath = ""
-			b, _, e := s.Net.Fetch(fetchCtx, Origin{u.String(), http.Header{"User-Agent": {userAgent}}}, manifestLimit)
-			var response struct {
-				Streams []Stream `json:"streams"`
-			}
+			b, _, e := s.Net.Fetch(ctx, Origin{u.String(), http.Header{"User-Agent": {userAgent}}}, manifestLimit)
+			var streams []Stream
 			if e == nil {
-				e = json.Unmarshal(b, &response)
+				limit := 0
+				if isSpeculativeWork(ctx) {
+					limit = nextEpisodeStreamLimit
+				}
+				streams, e = decodeProviderStreams(b, limit)
 			}
-			providers[i] = providerResult{response.Streams, e}
+			providers[i] = providerResult{streams, e}
 		})
 	}
 	bundleReady := make(chan vixBundle, 1)
 	go func() {
-		work, done := context.WithTimeout(fetchCtx, 15*time.Second)
+		work, done := context.WithTimeout(ctx, 15*time.Second)
 		defer done()
 		bundleReady <- s.resolveVixBundle(work, c)
 	}()
 	wg.Wait()
 	bundle := <-bundleReady
-	fetchCancel()
-	type listedStream struct {
-		stream Stream
-		native *nativePlayback
-		source dashboardSource
-	}
 	var upstream []listedStream
 	for i, source := range cfg.Sources {
 		if source.Disabled {
 			continue
 		}
-		provider := source.dashboardSource()
+		provider := source
 		if source.Type == "vixsrc" {
 			for _, quality := range vixQualityStreams(bundle.master, bundle.tracks) {
 				upstream = append(upstream, listedStream{stream: quality.stream, native: quality.native, source: provider})
@@ -222,7 +223,7 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 			continue
 		}
 		result := providers[i]
-		if result.err != nil {
+		if result.err != nil && !isSpeculativeWork(ctx) {
 			s.event(source.Name + ": " + result.err.Error())
 		}
 		for _, stream := range result.streams {
@@ -231,6 +232,103 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 			}
 		}
 	}
+	return upstream, bundle
+}
+
+// Speculation rejects oversized lists rather than allocating a session for
+// every tiny JSON entry or returning a truncated list. Ordinary discovery keeps
+// its existing complete-response behavior.
+func decodeProviderStreams(data []byte, limit int) ([]Stream, error) {
+	if limit == 0 {
+		var response struct {
+			Streams []Stream `json:"streams"`
+		}
+		err := json.Unmarshal(data, &response)
+		return response.Streams, err
+	}
+	var response struct {
+		Streams json.RawMessage `json:"streams"`
+	}
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, err
+	}
+	if len(response.Streams) == 0 || string(response.Streams) == "null" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(response.Streams))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
+		return nil, errors.New("source streams must be an array")
+	}
+	streams := []Stream{}
+	for decoder.More() {
+		if len(streams) == limit {
+			return nil, errors.New("source stream list exceeds automatic preparation limit")
+		}
+		var stream Stream
+		if err := decoder.Decode(&stream); err != nil {
+			return nil, err
+		}
+		streams = append(streams, stream)
+	}
+	_, err := decoder.Token()
+	return streams, err
+}
+
+func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, name string) {
+	generation, lookup := s.beginLookup()
+	ctx, cancel := context.WithCancel(lookup)
+	stop := context.AfterFunc(r.Context(), cancel)
+	defer func() { stop(); cancel() }()
+	cfg := s.Config.Get()
+	// A slow provider can exhaust discovery's budget without invalidating
+	// successful results. Only request/lookup cancellation discards them.
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, 40*time.Second)
+	defer fetchCancel()
+	upstream, bundle := s.discoverStreams(fetchCtx, c, cfg)
+	fetchCancel()
+	s.mu.Lock()
+	if generation != s.generation || ctx.Err() != nil {
+		s.mu.Unlock()
+		streamResponse(w, []Stream{})
+		return
+	}
+	sessions := s.listedSessionsLocked(c, upstream, bundle, name, nil)
+	s.mu.Unlock()
+	results := s.streamResponses(r, sessions)
+	s.mu.Lock()
+	current := generation == s.generation && ctx.Err() == nil
+	if generation == s.generation && !current {
+		for _, v := range sessions {
+			s.discardLocked(v)
+		}
+	}
+	if current {
+		if bundle.err != nil {
+			s.lookupStatus = fmt.Sprintf("Italian audio unavailable for dubbing · %d streams returned in source order", len(results))
+		} else {
+			italian := 0
+			for _, v := range sessions {
+				if !v.Passthrough && (v.native == nil || v.native.Italian) {
+					italian++
+				}
+			}
+			s.lookupStatus = fmt.Sprintf("%d Italian results · %d streams returned in source order", italian, len(results))
+		}
+	}
+	s.mu.Unlock()
+	if !current {
+		results = []Stream{}
+	} else {
+		go s.resolveContentName(c, cfg, sessions)
+	}
+	streamResponse(w, results)
+}
+
+func streamResponse(w http.ResponseWriter, results []Stream) {
+	jsonResponse(w, 200, map[string]any{"streams": results, "cacheMaxAge": 0, "staleRevalidate": 0, "staleError": 0})
+}
+
+func (s *Server) listedSessionsLocked(c Content, upstream []listedStream, bundle vixBundle, name string, speculative *speculativeWork) []*Session {
 	// Native stream titles describe quality, not the content. Use one title
 	// for the entire lookup, including native qualities and addon results.
 	if name = strings.TrimSpace(name); name == "" {
@@ -244,53 +342,29 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 	} else {
 		name = contentHeading(c, name)
 	}
-	results := make([]Stream, len(upstream))
-	s.mu.Lock()
-	if generation != s.generation || ctx.Err() != nil {
-		s.mu.Unlock()
-		jsonResponse(w, 200, map[string]any{"streams": []Stream{}, "cacheMaxAge": 0, "staleRevalidate": 0, "staleError": 0})
-		return
-	}
-	if bundle.err != nil {
-		s.lookupStatus = "Vixsrc Italian audio unavailable; returning original links…"
-	} else {
-		s.lookupStatus = "Vixsrc audio available; returning streams…"
-	}
 	sessions := make([]*Session, len(upstream))
 	for i, item := range upstream {
-		stream := item.stream
-		v := s.newSessionLocked(c, stream)
-		v.SourceID, v.SourceName = item.source.ID, item.source.Name
+		v := s.makeSession(c, item.stream, token())
+		if speculative != nil {
+			v.ctx = context.WithValue(v.ctx, speculativeWorkKey{}, speculative)
+		} else {
+			s.sessions[v.ID] = v
+		}
+		v.source = item.source
+		provider := item.source.dashboardSource()
+		v.SourceID, v.SourceName = provider.ID, provider.Name
 		v.native = item.native
 		if item.native != nil {
 			v.nativeMaster = bundle.master
 		}
+		v.Order, v.ContentName = i, name
 		v.listedReady = make(chan struct{})
-		v.Order = i
-		v.ContentName = name
-		v.ticket = s.sealPlayback(v)
-		v.Status = "Waiting in source order"
-		sessions[i] = v
-	}
-	s.mu.Unlock()
-	italianResults := 0
-	for i, item := range upstream {
-		stream := item.stream
-		results[i] = stream
-		v := sessions[i]
-		v.mu.Lock()
-		_, urlErr := httpURL(stream.URL)
+		_, urlErr := httpURL(item.stream.URL)
 		if item.native != nil {
 			v.Status = "Source audio and video · ready to prepare or play"
-			results[i] = stream.localPlayback(s.playbackURL(r, v), item.native.Italian)
-			if item.native.Italian {
-				italianResults++
-			}
 		} else if bundle.err == nil && urlErr == nil {
 			v.listedVix, v.listedEnglish = bundle.tracks, bundle.english
 			v.Status = "Vixsrc audio found · ready to prepare or play"
-			results[i] = stream.dubbed(s.playbackURL(r, v))
-			italianResults++
 		} else {
 			v.Passthrough = true
 			v.FallbackReason = "Upstream torrent or external stream"
@@ -299,30 +373,29 @@ func (s *Server) listStreams(w http.ResponseWriter, r *http.Request, c Content, 
 			}
 			v.Status = "Original stream · unchanged upstream link"
 		}
-		v.mu.Unlock()
+		v.ticket = s.sealPlayback(v)
 		close(v.listedReady)
+		sessions[i] = v
 	}
-	s.mu.Lock()
-	current := generation == s.generation && ctx.Err() == nil
-	if generation == s.generation && !current {
-		for _, v := range sessions {
-			s.discardLocked(v)
+	return sessions
+}
+
+func (s *Server) streamResponses(r *http.Request, sessions []*Session) []Stream {
+	results := make([]Stream, len(sessions))
+	for i, v := range sessions {
+		v.mu.Lock()
+		switch {
+		case v.Passthrough:
+			results[i] = v.stream
+		case v.native != nil:
+			results[i] = v.stream.localPlayback(s.playbackURL(r, v), v.native.Italian)
+		default:
+			results[i] = v.stream.dubbed(s.playbackURL(r, v))
 		}
+		results[i] = results[i].withBingeGroup(v.source.playerBingeGroup(v.stream.BehaviorHints.BingeGroup))
+		v.mu.Unlock()
 	}
-	if current {
-		if bundle.err != nil {
-			s.lookupStatus = fmt.Sprintf("Italian audio unavailable for dubbing · %d streams returned in source order", len(results))
-		} else {
-			s.lookupStatus = fmt.Sprintf("%d Italian results · %d streams returned in source order", italianResults, len(results))
-		}
-	}
-	s.mu.Unlock()
-	if !current {
-		results = []Stream{}
-	} else {
-		go s.resolveContentName(c, cfg, sessions)
-	}
-	jsonResponse(w, 200, map[string]any{"streams": results, "cacheMaxAge": 0, "staleRevalidate": 0, "staleError": 0})
+	return results
 }
 
 var contentYearRE = regexp.MustCompile(`\s+\((?:18|19|20|21)\d{2}\)$`)

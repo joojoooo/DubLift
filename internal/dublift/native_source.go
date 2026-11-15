@@ -270,12 +270,12 @@ func renditionMatches(kind playlist.MultivariantRenditionType, group string, v *
 	return false
 }
 
-func (v *Session) addNativeResource(origin Origin, position float64, track, video bool, depth int) string {
-	key := identity(origin.URL, fmt.Sprint(origin.Headers), strconv.FormatBool(track), strconv.FormatBool(video), decimal(position), "native", strconv.Itoa(depth))[:32]
+func (v *Session) addNativeResource(origin Origin, position float64, track, video, subtitle bool, depth int) string {
+	key := identity(origin.URL, fmt.Sprint(origin.Headers), strconv.FormatBool(track), strconv.FormatBool(video), strconv.FormatBool(subtitle), decimal(position), "native", strconv.Itoa(depth))[:32]
 	v.mu.Lock()
 	// Cancellation must not repopulate a discarded session's resource state.
 	if v.ctx.Err() == nil {
-		v.resources[key] = resource{Origin: origin, Position: position, Track: track, Video: video, PlaylistDepth: depth}
+		v.resources[key] = resource{Origin: origin, Position: position, Track: track, Video: video, Subtitle: subtitle, PlaylistDepth: depth}
 	}
 	v.mu.Unlock()
 	return "/media/" + v.ID + "/resource/" + key
@@ -283,7 +283,7 @@ func (v *Session) addNativeResource(origin Origin, position float64, track, vide
 
 // Preserve raw HLS tags, including unknown attributes, encryption and ranges.
 // A selected quality keeps only its variant and associated rendition groups.
-func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video bool, depth int) ([]byte, error) {
+func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video, subtitle bool, depth int) ([]byte, error) {
 	var variant *playlist.MultivariantVariant
 	var err error
 	if selected != "" {
@@ -326,7 +326,9 @@ func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video bool,
 			if err != nil {
 				return nil, err
 			}
-			position, childDepth, track := 0.0, 0, h.Master == nil
+			// Only timed audio/video requests establish a playback area.
+			// Players can preload every subtitle segment before playback begins.
+			position, childDepth, track := 0.0, 0, h.Master == nil && !subtitle
 			if h.Master != nil {
 				if selected != "" && origin.URL != selected {
 					pending = ""
@@ -341,14 +343,14 @@ func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video bool,
 				position = h.Segments[index].Start
 				index++
 			}
-			b.WriteString(v.addNativeResource(origin, position, track, video, childDepth) + "\n")
+			b.WriteString(v.addNativeResource(origin, position, track, video, subtitle, childDepth) + "\n")
 			continue
 		}
 		if variant != nil && strings.HasPrefix(line, "#EXT-X-I-FRAME-STREAM-INF:") {
 			continue
 		}
 		isRendition := strings.HasPrefix(line, "#EXT-X-MEDIA:")
-		childVideo := video
+		childVideo, childSubtitle := video, subtitle
 		if isRendition {
 			var attrs primitives.Attributes
 			if err := attrs.Unmarshal(strings.TrimPrefix(line, "#EXT-X-MEDIA:")); err != nil {
@@ -358,6 +360,7 @@ func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video bool,
 				continue
 			}
 			childVideo = attrs["TYPE"] == "VIDEO"
+			childSubtitle = attrs["TYPE"] == "SUBTITLES"
 			if preferred, ok := audioDefaults[attrs["GROUP-ID"]]; attrs["TYPE"] == "AUDIO" && ok {
 				selectedAudio := attrs["NAME"] == preferred.Name
 				// DEFAULT is explicit for every audio track; other attributes stay intact.
@@ -389,7 +392,7 @@ func (s *Server) nativePlaylist(v *Session, h *HLS, selected string, video bool,
 			if playlistURI {
 				childDepth = depth + 1
 			}
-			return v.addNativeResource(Origin{URL: url, Headers: h.Origin.Headers}, 0, false, childVideo, childDepth)
+			return v.addNativeResource(Origin{URL: url, Headers: h.Origin.Headers}, 0, false, childVideo, childSubtitle, childDepth)
 		}) + "\n")
 	}
 	return []byte(b.String()), nil

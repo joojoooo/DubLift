@@ -13,6 +13,8 @@ Italian audio from VixSrc to Movy and addon video without changing its quality.
 - Video passes through without re-encoding; generated audio uses AAC.
 - Built-in VixSrc and Movy sources, plus optional addons.
 - Source visibility toggles and ordering in the dashboard.
+- Automatic [next-episode preparation](docs/usage.md#automatic-next-episode-preparation)
+  using the current source and binge group.
 - Finite HLS streams and indexed MKV/MP4 files over HTTP(S).
 - A browser dashboard for guided setup, stream preparation, audio timing,
   and playback diagnostics. Open playback URLs in VLC too.

@@ -521,6 +521,7 @@ const fields = {
   alignmentSampleSeconds: "alignment-sample-seconds",
   alignmentSamples: "alignment-samples",
   cacheMB: "cache-mb",
+  nextEpisodeLeadMinutes: "next-episode-lead-minutes",
   ffmpeg: "ffmpeg",
   ffprobe: "ffprobe",
   tmdbToken: "tmdb-token",
@@ -540,12 +541,18 @@ async function loadSettings() {
   }
   for (const [key, id] of Object.entries(fields))
     $(id).value = settings[key] ?? "";
+  $("next-episode-prefetch").checked = settings.nextEpisodePrefetch;
+  nextEpisodeControls();
   $("confidence").value = settings.minConfidence;
   confidenceLabel();
   for (const container of [$("sources"), $("wizard-sources")]) {
     renderSources(container, settings.sources);
   }
 }
+function nextEpisodeControls() {
+  $("next-episode-lead-minutes").disabled = !$("next-episode-prefetch").checked;
+}
+$("next-episode-prefetch").onchange = nextEpisodeControls;
 function confidenceLabel() {
   $("confidence-value").textContent =
     Math.round(Number($("confidence").value) * 100) + "%";
@@ -565,9 +572,10 @@ $("settings-form").onsubmit = async (e) => {
   await waitSettingsWrites();
   const cfg = { ...settings };
   for (const [key, id] of Object.entries(fields))
-    cfg[key] = ["searchRadius", "alignmentSampleSeconds", "alignmentSamples", "cacheMB"].includes(key)
+    cfg[key] = ["searchRadius", "alignmentSampleSeconds", "alignmentSamples", "cacheMB", "nextEpisodeLeadMinutes"].includes(key)
       ? Number($(id).value)
       : $(id).value.trim();
+  cfg.nextEpisodePrefetch = $("next-episode-prefetch").checked;
   cfg.minConfidence = Number($("confidence").value);
   cfg.sources = readSources($("sources"));
   try {
@@ -937,6 +945,131 @@ function updateCard(v) {
     }
   }
 }
+function renderAutomaticNextEpisode(view, sessions = []) {
+  view ||= {};
+  const section = $("automatic-next-episode");
+  section.hidden = view.enabled !== true || !sessions.some(session => session.playing && session.contentType === "series");
+  const state = view.enabled === false ? "disabled" : view.state || "waiting";
+  const labels = {
+    queued: "Queued", resolving: "Finding episode", searching: "Finding stream",
+    preparing: "Preparing video", aligning: "Checking audio", ready: "Ready to play",
+    handedOff: "Sent to player", selected: "Playing", failed: "Couldn't prepare",
+    unavailable: "Not available", canceled: "Stopped", expired: "Expired",
+    waiting: "Scheduled", disabled: "Off",
+  };
+  const stages = ["resolving", "searching", "preparing", "aligning"];
+  const stageLabels = ["Find episode", "Find stream", "Prepare video", "Check audio"];
+  const active = state === "queued" || stages.includes(state);
+  const complete = state === "ready" || state === "handedOff";
+  section.dataset.state = state;
+  section.setAttribute("aria-busy", String(active));
+  const waitingReason = state === "waiting" ? view.trigger || view.message || "" : "";
+  const label = /binge group|source.*no longer|One attempt/.test(waitingReason) ? "Not scheduled" :
+    /duration|valid requested playback area|series.*(playback|stream)/.test(waitingReason) ? "Waiting" : labels[state] || "Waiting";
+  setText($("automatic-next-episode-state"), label);
+
+  const episode = view.content?.match(/:(\d+):(\d+)$/);
+  setText($("automatic-next-episode-episode"), view.contentName || (episode ? `Season ${Number(episode[1])} · Episode ${Number(episode[2])}` : "Next episode"));
+  setText($("automatic-next-episode-message"), automaticNextEpisodeMessage(view, state));
+  $("automatic-next-episode-steps").hidden = !active && !complete;
+  stages.forEach((stage, index) => {
+    const step = $("automatic-step-" + stage);
+    const status = complete || (active && index < stages.indexOf(state)) ? "complete" : state === stage ? "current" : "upcoming";
+    step.dataset.state = status;
+    step.setAttribute("aria-current", status === "current" ? "step" : "false");
+    step.setAttribute("aria-label", `${stageLabels[index]}: ${status === "current" ? "in progress" : status === "complete" ? "complete" : "not started"}`);
+  });
+
+  let progress = "";
+  if (state === "aligning") {
+    const phase = /download|decod/i.test(view.samplePhase) ? "Downloading audio samples" :
+      /calculat|match/i.test(view.samplePhase) ? "Comparing audio timing" :
+      /wait/i.test(view.samplePhase) ? "Waiting for audio samples" : "Checking audio timing";
+    const total = Number.isInteger(view.sampleTotal) && view.sampleTotal > 0 ? view.sampleTotal : 0;
+    const index = Math.max(1, Math.min(total, view.sampleIndex || 1));
+    progress = total ? `${phase} · Check ${index} of ${total}` : phase;
+  }
+  setText($("automatic-next-episode-progress"), progress);
+  $("automatic-next-episode-progress").hidden = !progress;
+
+  const timing = complete ? view.audioTiming || "" : "";
+  const unmatched = timing.startsWith("Offset 0 fallback");
+  const audio = unmatched ? "Audio sync needs checking" : timing.startsWith("Saved manual") ? "Saved audio delay" :
+    timing.startsWith("Audio timing matched") ? "Audio timing matched" : timing.startsWith("Original source") ? "Original audio" : "";
+  section.dataset.audio = unmatched ? "unmatched" : "";
+  if (unmatched) {
+    $("automatic-step-aligning").dataset.state = "warning";
+    $("automatic-step-aligning").setAttribute("aria-label", "Check audio: automatic timing unavailable");
+  }
+  setText($("automatic-next-episode-timing"), audio);
+  $("automatic-next-episode-timing").hidden = !audio;
+  if (state === "ready" && unmatched) {
+    setText($("automatic-next-episode-message"), "Ready to play. Check audio sync when the episode starts; automatic timing could not be matched.");
+  }
+  const source = view.sourceName ? `From ${view.sourceName}` : "";
+  setText($("automatic-next-episode-source"), source);
+  $("automatic-next-episode-source").hidden = !source;
+  const expiresAt = view.expires && !view.expires.startsWith("0001-") ? new Date(view.expires) : null;
+  const expires = state === "ready" && expiresAt && !Number.isNaN(expiresAt.getTime())
+    ? `Ready until ${expiresAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
+  setText($("automatic-next-episode-expires"), expires);
+  $("automatic-next-episode-expires").hidden = !expires;
+  $("automatic-next-episode-meta").hidden = !source && !audio && !expires;
+
+  const stream = state !== "waiting" && state !== "disabled" ? view.streamName || "" : "";
+  setText($("automatic-next-episode-stream"), stream);
+  const audioDetail = unmatched ? "Automatic timing could not be matched. No audio delay has been applied." :
+    timing.replace(/ · [\d.]+% confidence\.$/, ".");
+  setText($("automatic-next-episode-audio-detail"), audioDetail);
+  $("automatic-next-episode-stream-row").hidden = !stream;
+  $("automatic-next-episode-audio-row").hidden = !timing;
+  const details = $("automatic-next-episode-details");
+  const content = view.content || view.parentContent || "";
+  details.hidden = !stream && !timing;
+  if (details.hidden || section.dataset.content !== content) details.open = false;
+  section.dataset.content = content;
+}
+function automaticNextEpisodeMessage(view, state) {
+  const messages = {
+    queued: "Preparation will begin shortly. Your current episode keeps playing.",
+    resolving: "Looking up which episode comes next.",
+    searching: "Looking for a matching stream from your current source.",
+    preparing: "Getting the video ready for playback.",
+    aligning: "Matching Italian audio to the video.",
+    ready: "Prepared for your player when you continue watching.",
+    handedOff: "The prepared stream has been sent to your player. Your player controls when playback starts.",
+    selected: "The next episode has started.",
+    failed: "Preparation could not finish. Choose the next episode in your player to continue.",
+    unavailable: "The next episode could not be prepared. Choose a stream in your player to continue.",
+    canceled: "Background preparation stopped. Choose the next episode in your player when you're ready.",
+    expired: "This preparation has expired. Open the next episode in your player to continue.",
+    disabled: "Turn on automatic preparation in Settings to get the next episode ready ahead of time.",
+  };
+  if (state === "waiting") {
+    const reason = view.trigger || view.message || "";
+    if (/binge group/.test(reason)) return "This stream does not support automatic next-episode matching. Choose the next episode in your player.";
+    if (/source.*no longer/.test(reason)) return "This stream's source is disabled or unavailable. Check your sources in Settings.";
+    if (/One attempt/.test(reason)) return "No further preparation is scheduled for this episode. Choose the next episode in your player.";
+    if (/duration/.test(reason)) return "Waiting for the episode length before scheduling preparation.";
+    if (/valid requested playback area/.test(reason)) return "Preparation will be scheduled once playback progress is available.";
+    if (/series.*(playback|stream)/.test(reason)) return "Start watching a series to prepare the next episode automatically.";
+    if (/not yet known/.test(view.message || "")) return "The next episode will be identified when preparation starts near the end of this one.";
+    if (Number.isInteger(view.leadMinutes) && view.leadMinutes > 0) return `Starts about ${view.leadMinutes} ${view.leadMinutes === 1 ? "minute" : "minutes"} before this episode ends.`;
+    return "Preparation starts near the end of this episode.";
+  }
+  const reason = view.message || "";
+  if (state === "unavailable") {
+    if (/binge group/.test(reason)) return "No matching version of the next episode was found. Choose a stream in your player to continue.";
+    if (/released next episode|metadata/.test(reason)) return "No released next episode was found, or its episode details are unavailable.";
+  }
+  if (state === "failed" && /source returned/.test(reason)) return "Your source did not return a usable stream. Choose a stream in your player to continue.";
+  if (state === "canceled") {
+    if (/settings|sources changed|disabled/.test(reason)) return "Preparation stopped because your settings changed. Your current episode keeps playing.";
+    if (/different episode or title/.test(reason)) return "Your player requested a different episode or title, so this preparation stopped.";
+    if (/interval/.test(reason)) return "Preparation stopped after you moved away from the end of this episode.";
+  }
+  return messages[state] || "Waiting for preparation status.";
+}
 let lastEvents = "";
 let videoSample = null;
 function updateVideoDownload() {
@@ -968,6 +1101,7 @@ function renderStatus(state) {
     setText($("connection"), "Connected to local server");
     $("connection-dot").classList.remove("offline");
     renderManifestOptions(state);
+    renderAutomaticNextEpisode(state.automaticNextEpisode, state.sessions);
     setText($("session-count"), `${state.sessions.filter(v => v.playing).length} / ${state.sessions.length}`);
     setText($("lookup-status"), state.lookupStatus || "Waiting for an addon request or a title lookup.");
     setText($("cache-size"), `${mb(state.cacheBytes)} / ${mb(state.cacheMaxBytes)}`);

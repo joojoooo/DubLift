@@ -87,7 +87,7 @@ func TestVixUnknownAudioRenditions(t *testing.T) {
 			if len(qualities) != 1 || qualities[0].native.Italian != tc.wantNative {
 				t.Fatal("native Italian flag does not match audio eligibility")
 			}
-			b, err := s.nativePlaylist(v, h, "", true, 0)
+			b, err := s.nativePlaylist(v, h, "", true, false, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

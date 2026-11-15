@@ -29,7 +29,7 @@ func (s *Server) awaitPreparedAlignment(ctx context.Context, v *Session) error {
 	if !running || done == nil {
 		return nil
 	}
-	// Only the dashboard's Prepare action waits for alignment. Player requests
+	// Explicit and speculative preparation wait for alignment. Player requests
 	// always return as soon as essential media preparation finishes.
 	select {
 	case <-done:
@@ -46,7 +46,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	v := s.getSession(p[0])
+	v := s.mediaSession(p[0], len(p) == 2 && p[1] == "master.m3u8")
 	// Diagnostics redirects resolve the original from the live session or its
 	// authenticated resume ticket without probing or preparing any media.
 	if s.redirectOriginal.Load() {
@@ -80,7 +80,9 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p[1] == "master.m3u8" {
-		if !s.playerRequest(v, r) {
+		var selected bool
+		v, selected = s.selectPlayerSession(v, r)
+		if !selected {
 			http.Error(w, "stream result expired", 410)
 			return
 		}
@@ -88,6 +90,9 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 			return
 		}
+	}
+	if r.Method == "GET" {
+		defer s.Engine.foregroundRequest()()
 	}
 	ctx, release := sessionRequestContext(r.Context(), v)
 	defer release()
@@ -108,7 +113,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		b, err := s.nativePlaylist(v, v.nativeMaster, v.native.VariantURL, true, 0)
+		b, err := s.nativePlaylist(v, v.nativeMaster, v.native.VariantURL, true, false, 0)
 		if err != nil {
 			v.note(err)
 			failure(w, 502, err)
@@ -119,7 +124,11 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case p[1] == "master.m3u8":
-		b, err := s.master(v)
+		prefix := ""
+		if p[0] != v.ID {
+			prefix = s.base(r) + "/media/" + v.ID + "/"
+		}
+		b, err := s.masterWithPrefix(v, prefix)
 		if err != nil {
 			v.note(err)
 			failure(w, 500, err)
@@ -173,9 +182,10 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		start := v.boundaries[n]
-		if p[3] == "segment.m4s" {
+		if p[3] == "segment.m4s" && r.Method == "GET" {
 			v.position(start)
 			v.videoSegmentRequested(n)
+			s.maybePrefetchNextEpisode(v)
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
@@ -252,9 +262,10 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		}
 		start := v.boundaries[n]
 		duration := v.boundaries[n+1] - start
-		if !track.Subtitle {
+		if !track.Subtitle && r.Method == "GET" {
 			v.audioPosition(start)
 			v.fileAudioSegmentRequested(n)
+			s.maybePrefetchNextEpisode(v)
 		}
 		offset := 0.0
 		if !track.Original && track.Standalone == nil {
@@ -359,13 +370,20 @@ func serveBytes(w http.ResponseWriter, r *http.Request, kind string, data []byte
 	http.ServeContent(w, r, "segment", time.Time{}, bytes.NewReader(data))
 }
 func (s *Server) master(v *Session) ([]byte, error) {
+	return s.masterWithPrefix(v, "")
+}
+
+// An earlier master URL can select a warmed session with a different ID.
+// Root its child playlists at that session so relative URL resolution cannot
+// send the player back to the discarded result's media endpoints.
+func (s *Server) masterWithPrefix(v *Session, prefix string) ([]byte, error) {
 	m := playlist.Multivariant{Version: 7}
 	variant := playlist.MultivariantVariant{Bandwidth: 20000000}
 	if v.variant != nil {
 		variant = *v.variant
 		variant.Codecs = append([]string{}, v.variant.Codecs...)
 	}
-	variant.URI = "video.m3u8"
+	variant.URI = prefix + "video.m3u8"
 	variant.Audio = "audio"
 	variant.Subtitles = ""
 	variant.Video = ""
@@ -395,7 +413,7 @@ func (s *Server) master(v *Session) ([]byte, error) {
 	}
 	names := map[string]int{}
 	for _, t := range ordered {
-		uri := "track/" + t.ID + ".m3u8"
+		uri := prefix + "track/" + t.ID + ".m3u8"
 		uriPointer := &uri
 		if t.Original && !t.Subtitle && t.Asset == v.video && v.video.HLS != nil {
 			uriPointer = nil
@@ -550,7 +568,7 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 			failure(w, 502, err)
 			return
 		}
-		b, err := s.nativePlaylist(v, h, "", res.Video, res.PlaylistDepth)
+		b, err := s.nativePlaylist(v, h, "", res.Video, res.Subtitle, res.PlaylistDepth)
 		if err != nil {
 			v.note(err)
 			failure(w, 502, err)
@@ -564,8 +582,11 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request, v *Session, id
 		if v.video != nil && v.video.HLS != nil {
 			v.videoSegmentRequested(sort.SearchFloat64s(v.boundaries, res.Position))
 		}
-	} else if res.Track {
+	} else if res.Track && r.Method == "GET" {
 		v.audioPosition(res.Position)
+	}
+	if res.Track && r.Method == "GET" {
+		s.maybePrefetchNextEpisode(v)
 	}
 	if res.Video {
 		defer beginVideoDownload(context.WithValue(r.Context(), videoBytesKey{}, &v.videoDownload))()

@@ -23,6 +23,7 @@ other sources. Use the up/down arrows to set source order; results stay
 grouped in that order and addon results retain their original ordering. The
 X removes an addon source, even the last one. Built-in sources cannot be
 removed. These controls are also available during setup.
+Successful source results remain available when another source times out.
 
 In the dashboard's **Stream results**, **Sources** filters select VixSrc, Movy or
 individual addons independently of **TYPE** filters. Selecting multiple
@@ -41,7 +42,12 @@ If no title is available, the heading shows the content type and ID.
 Results show their **Binge group** in **Technical details** when available.
 VixSrc and Movy groups use the provider and quality, shared across servers.
 These groups stay the same across episodes and restarts so players can match
-the next episode. External addons keep their own binge groups unchanged.
+the next episode. External addon groups returned by DubLift use
+`dublift:<original-group>`, including original fallback links. For example,
+`Addon:4K` becomes `dublift:Addon:4K`. This separates DubLift results from the
+same addon installed directly in Stremio. The original group is kept exactly as
+the suffix, including case and whitespace. Missing or empty groups stay missing
+or empty.
 
 VixSrc lists each available HLS quality with its resolution and bitrate
 (preferably average bitrate), highest quality first. If its playlist has no
@@ -71,11 +77,13 @@ the transformed stream JSON no longer duplicates them as attachments. Original
 fallback responses retain their subtitle attachments and provider metadata.
 Only supported file/HLS sources are listed; DASH and DRM sources are excluded.
 
-The config stores `configVersion` (currently `2`) and an ordered `sources`
+The config stores `configVersion` (currently `3`) and an ordered `sources`
 array. On startup, older supported configs execute sequential migrations
 (`v1 -> v2` preserves all user settings and resets `publicURL` to empty for
-dynamic client resolution). Missing or unsupported versions replace the entire
-config with current defaults and start the setup wizard again.
+dynamic client resolution; `v2 -> v3` enables next-episode preparation with a
+5-minute lead while preserving existing settings, sources, credentials and
+setup). Missing or unsupported versions replace the entire config with current
+defaults and start the setup wizard again.
 
 ```sh
 ./bin/dublift -config /path/to/private/config.json
@@ -104,6 +112,123 @@ new or reset configs and can be changed in Settings. DNS normally uses the
 system resolver;
 `DUBLIFT_DNS` optionally selects a DNS server IP, with an optional port
 (`IP:PORT`, or `[IPv6]:PORT`).
+
+## Automatic next-episode preparation
+
+**Settings → Next episode → Automatically prepare the next episode** is enabled
+by default. **Prepare before the end (minutes)** defaults to **5**, with a range
+of **1–30**. These controls use **Save settings**; source autosaves and setup
+preserve their saved values. Disabling stops outstanding automatic work and
+clears unused results without stopping playback.
+
+A selected series session triggers one attempt when its **last requested area**
+reaches the interval before the known episode end. This is a media-request
+position, not an exact playback clock: buffering can trigger early, and seeks
+can jump into the interval. Video requests are authoritative once available;
+audio requests supply the position until then. The dashboard need not be open.
+Subtitle downloads do not update this position or trigger preparation.
+Polling, HEAD probes, listing, preparation and background reads do not trigger
+it. Movies, unknown/invalid durations or positions, missing binge groups and
+untracked sources are ineligible. A seek back outside the interval cancels an
+unused attempt; it does not rearm it. Failed, expired or consumed attempts also
+do not retry within that selected session.
+
+DubLift resolves an explicit next episode from addon episode metadata,
+Cinemeta, or TMDB with a configured token, including season transitions. For
+numeric IDs without a token, validated Movy title metadata can supply the IMDb
+identity for Cinemeta. Unknown next episodes, specials without another known
+special, and explicitly unreleased episodes are skipped. Incomplete or stale
+catalogs can prevent prefetch; DubLift does not assume episode + 1 exists.
+
+Only the **actual source connection** supplying the playing stream is searched
+for next-episode streams, whether an addon, Movy or VixSrc. Metadata requests
+and VixSrc Italian-audio dependencies may use other services. Results keep the
+source's order and complete fallback objects, with only the player-facing binge
+group namespace applied to addon results. The first stream with the
+**exact same original upstream bingeGroup**, including case and whitespace, is
+prepared using the same media preparation and audio alignment as **Prepare
+playback**. No different group is substituted; an incompatible first match or failed preparation leaves
+ordinary discovery available. Native VixSrc playback keeps its original tracks
+and needs no alignment. Saved/manual timing, confidence checks and zero-offset
+fallback follow the normal preparation rules.
+
+The dashboard's **Automatic preparation → Up next** panel is visible only
+while a series is playing and automatic preparation is enabled. It shows the
+next episode, a short status message, and four preparation steps: finding the
+episode, finding a stream, preparing video, and checking audio. While scheduled,
+it explains when preparation starts or why it cannot start. A ready result shows
+its audio timing status and expiry; a notice highlights audio that could not be
+matched. Expand **Stream details** to see the chosen stream and audio delay.
+The latest handoff, failure, cancellation or expiry remains visible for up to
+45 minutes. Once the handed-off episode is selected for playback with GET, the
+panel advances to the following episode in **Scheduled** state, using metadata
+already fetched. This also works when the player opens a next-episode URL from
+an earlier lookup, without requesting the prepared stream list again. This
+clears the previous stream's preparation details without starting another search
+or preparation. HEAD probes do not advance the panel.
+If no following episode is known, the panel says so instead of guessing an ID.
+This summary is separate from normal stream results and playback cards; viewing
+it does not trigger work, consume a result or extend a session.
+
+Automatic results stay separate from manual dashboard results. The **first GET** to
+`/stream/series/{exact-next-id}.json` after successful preparation atomically
+receives the restricted source results and their warmed sessions. This removes
+the one-use response entry. Further requests perform normal discovery across
+all enabled sources, as do dashboard **Resolve** requests and HEAD probes.
+Responses disable caching. A miss, unfinished attempt, failure, cancellation or
+expiry falls back immediately to ordinary discovery without waiting for the
+automatic attempt. Playback URLs use the consuming request's host/proxy headers
+or the configured Public base URL.
+
+If an earlier next-episode URL selects the exact same source and media as the
+ready prepared stream, DubLift adopts the warmed session and serves its child
+playlists through that session. Adopted master playlists for transformed playback
+keep any configured Public base URL path prefix. Repeated requests to that
+earlier master stay usable for the selected session's lifetime. If a different stream is selected
+for that episode, it follows normal playback preparation and unused speculative
+work is discarded; the panel still advances to the following episode. Selecting
+a different episode or title cancels the obsolete automatic preparation.
+
+The addon protocol provides no reliable distinction between a manual Stremio
+lookup and its automatic next-episode lookup: either can consume that first
+eligible GET. Player variants may choose among duplicate matching groups
+differently; DubLift follows [Stremio core’s first-match selection](https://github.com/Stremio/stremio-core/blob/development/src/models/player.rs)
+and exact group comparison. Previously fetched stream lists cannot be replaced
+proactively; warmed media reuse requires matching source/media identity.
+Passthrough/external playback cannot report media positions to DubLift, so it
+cannot trigger this feature.
+
+One speculative worker and one unused result are kept for the current playback
+context, with a **45-minute expiry from triggering**. Work yields between bounded
+reads and alignment stages while foreground media requests are outstanding;
+one background subprocess leaves engine capacity for foreground playback.
+Automatic preparation rejects source lists above 200 entries instead of
+truncating them; ordinary discovery remains available.
+An already running bounded stage can finish before yielding. Preparation,
+alignment download and calculation retain separate deadlines; waiting for
+foreground work before an alignment stage does not use its deadline. There are
+no whole-file downloads or general next-episode media prebuffers.
+
+A valid addon **GET** to `/stream/{type}/{id}.json` for anything other than the
+expected next episode cancels unused automatic work and clears its speculative
+response and media cache. The new request uses ordinary discovery, while current
+playback continues until a different stream is selected. Continued requests from
+the old episode do not recreate that canceled attempt. Dashboard **Resolve**,
+HEAD probes and invalid requests do not apply this rule. Once results have been
+handed off, their playback URLs retain normal ownership through later lookups.
+If episode metadata is still resolving, one requested identity is checked as
+soon as the expected episode is known; two distinct addon lookups cancel that
+unresolved attempt immediately rather than guessing an episode number.
+
+Switching playback, discarding/expiring its parent, changing the relevant source
+connection or alignment settings, disabling the feature, or shutting down
+cancels unused work and results. Preparation alone never marks the next episode
+as Playing or starts another prefetch. Handoff preserves the current episode
+until the player selects the next master with GET; HEAD never selects it.
+Handed-off sessions retain their prepared state through result refreshes and
+old-parent cleanup, then follow normal playback selection and idle expiry.
+Saved audio timing remains protected from cleanup while an unused prepared
+session is waiting for handoff.
 
 ## Playback and synchronization
 

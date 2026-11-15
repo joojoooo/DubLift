@@ -25,23 +25,30 @@ import (
 var dashboard embed.FS
 
 type Server struct {
-	Config           *Config
-	listenAddr       string
-	Net              *Network
-	Engine           *Engine
-	videoPrefetch    chan struct{}
-	Alignments       *AlignmentStore
-	mu               sync.Mutex
-	sessions         map[string]*Session
-	events           []string
-	ctx              context.Context
-	cancel           context.CancelFunc
-	generation       uint64
-	lookupCancel     context.CancelFunc
-	lookupStatus     string
-	playbackKey      cipher.AEAD
-	redirectOriginal atomic.Bool
-	manifestRequests atomic.Uint64
+	Config              *Config
+	listenAddr          string
+	Net                 *Network
+	Engine              *Engine
+	videoPrefetch       chan struct{}
+	Alignments          *AlignmentStore
+	mu                  sync.Mutex
+	sessions            map[string]*Session
+	playbackAliasID     string
+	playbackAlias       *Session
+	events              []string
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	generation          uint64
+	lookupCancel        context.CancelFunc
+	lookupStatus        string
+	nextEpisode         *nextEpisodePrefetch
+	nextEpisodeLast     nextEpisodeDashboardStatus
+	nextEpisodeWorker   chan struct{}
+	prefetchSettings    Settings
+	unsubscribeSettings func()
+	playbackKey         cipher.AEAD
+	redirectOriginal    atomic.Bool
+	manifestRequests    atomic.Uint64
 }
 
 type dashboardSettings struct {
@@ -73,12 +80,20 @@ func NewServer(c *Config) (*Server, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{Config: c, listenAddr: listenAddr, Net: n, Engine: e, Alignments: a, sessions: map[string]*Session{}, events: []string{}, ctx: ctx, cancel: cancel, playbackKey: key, videoPrefetch: make(chan struct{}, 1)}
+	s := &Server{Config: c, listenAddr: listenAddr, Net: n, Engine: e, Alignments: a, sessions: map[string]*Session{}, events: []string{}, ctx: ctx, cancel: cancel, playbackKey: key, videoPrefetch: make(chan struct{}, 1), nextEpisodeWorker: make(chan struct{}, 1)}
+	s.unsubscribeSettings = c.subscribeSettings(s.settingsChanged)
 	s.collectExpired(time.Now())
 	go s.collectLoop()
 	return s, nil
 }
-func (s *Server) Close() error { s.cancel(); return s.Engine.Close() }
+func (s *Server) Close() error {
+	s.cancel()
+	s.unsubscribeSettings()
+	s.mu.Lock()
+	s.cancelNextEpisodeWithStatusLocked("canceled", "Automatic preparation canceled because the server is closing.")
+	s.mu.Unlock()
+	return s.Engine.Close()
+}
 func (s *Server) event(msg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -347,13 +362,14 @@ func (s *Server) status(r *http.Request) map[string]any {
 		sessions = append(sessions, v)
 	}
 	events := append([]string{}, s.events...)
+	automaticNextEpisode := s.nextEpisodeDashboardLocked(time.Now())
 	s.mu.Unlock()
 	snapshots := []map[string]any{}
 	for _, v := range sessions {
 		v.mu.Lock()
 		view := map[string]any{"id": v.ID, "content": v.Content.ID, "contentName": v.ContentName, "name": v.stream.Name, "title": v.stream.Title, "description": v.stream.Description, "filename": v.stream.BehaviorHints.Filename, "sourceFormat": streamSourceFormat(v.stream, nil), "order": v.Order, "playing": v.Playing, "preparationStarted": v.preparationStarted, "preparationDone": false, "playbackAt": v.PlaybackAt, "requestAt": v.RequestAt, "requestMethod": v.RequestMethod, "lastActivity": v.LastUsed, "passthrough": v.Passthrough, "fallbackReason": v.FallbackReason, "sampleIndex": v.SampleIndex, "sampleTotal": v.SampleTotal, "samplePhase": v.SamplePhase, "status": v.Status, "errors": append([]string{}, v.Errors...), "created": v.Created, "position": v.Position, "positionAt": v.PositionAt, "aligning": v.Aligning, "videoBytes": v.videoDownload.bytes.Load(), "videoActive": v.videoDownload.active.Load(), "url": s.playbackURL(r, v), "originalUrl": v.stream.URL}
 		view["contentType"] = v.Content.Type
-		view["bingeGroup"] = v.stream.BehaviorHints.BingeGroup
+		view["bingeGroup"] = v.source.playerBingeGroup(v.stream.BehaviorHints.BingeGroup)
 		view["sourceID"], view["sourceName"] = v.SourceID, v.SourceName
 		view["native"] = v.native != nil
 		view["italian"] = !v.Passthrough && (v.native == nil || v.native.Italian)
@@ -411,18 +427,19 @@ func (s *Server) status(r *http.Request) map[string]any {
 	}
 	localManifestURL := localManifestURLForListen(s.listenAddr, port)
 	return map[string]any{
-		"sessions":         snapshots,
-		"sources":          sources,
-		"redirectOriginal": s.redirectOriginal.Load(),
-		"lookupStatus":     lookupStatus,
-		"events":           events,
-		"cacheBytes":       s.Engine.Cache.Used(),
-		"cacheMaxBytes":    int64(cfg.CacheMB) << 20,
-		"originBytes":      s.Net.Bytes.Load(),
-		"manifestURL":      s.base(r) + "/manifest.json",
-		"lanManifestURL":   lanManifestURL,
-		"localManifestURL": localManifestURL,
-		"manifestRequests": s.manifestRequests.Load(),
+		"sessions":             snapshots,
+		"sources":              sources,
+		"redirectOriginal":     s.redirectOriginal.Load(),
+		"lookupStatus":         lookupStatus,
+		"automaticNextEpisode": automaticNextEpisode,
+		"events":               events,
+		"cacheBytes":           s.Engine.Cache.Used(),
+		"cacheMaxBytes":        int64(cfg.CacheMB) << 20,
+		"originBytes":          s.Net.Bytes.Load(),
+		"manifestURL":          s.base(r) + "/manifest.json",
+		"lanManifestURL":       lanManifestURL,
+		"localManifestURL":     localManifestURL,
+		"manifestRequests":     s.manifestRequests.Load(),
 	}
 }
 

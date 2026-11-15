@@ -79,7 +79,7 @@ func TestConfigVersionReset(t *testing.T) {
 	}
 }
 
-func TestConfigV1ToV2Migration(t *testing.T) {
+func TestConfigV1ToV3Migration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	customSources := []Source{
 		{Type: "vixsrc", Name: "VixSrc", BaseURL: "https://vix.custom", Disabled: false},
@@ -115,8 +115,11 @@ func TestConfigV1ToV2Migration(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := cfg.Get()
-	if got.ConfigVersion != 2 {
-		t.Fatalf("expected configVersion 2, got %d", got.ConfigVersion)
+	if !got.NextEpisodePrefetch || got.NextEpisodeLeadMinutes != 5 {
+		t.Fatal("v1 → v2 → v3 did not apply prefetch defaults")
+	}
+	if got.ConfigVersion != currentConfigVersion {
+		t.Fatalf("expected current configVersion, got %d", got.ConfigVersion)
 	}
 	if got.PublicURL != "" {
 		t.Fatalf("expected publicURL to be reset to empty string, got %q", got.PublicURL)
@@ -164,7 +167,7 @@ func TestConfigV1ToV2Migration(t *testing.T) {
 	if err := json.Unmarshal(persistedBytes, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.ConfigVersion != 2 || persisted.PublicURL != "" {
+	if persisted.ConfigVersion != currentConfigVersion || persisted.PublicURL != "" {
 		t.Fatalf("persisted file not properly migrated: %+v", persisted)
 	}
 	if bytes.Contains(persistedBytes, []byte(`"legacyField"`)) {
@@ -306,5 +309,60 @@ func TestCurrentConfigValidationDoesNotReset(t *testing.T) {
 				t.Fatal("invalid current config was overwritten", err)
 			}
 		})
+	}
+}
+
+func TestConfigV2ToV3PrefetchMigrationAndPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	original := DefaultSettings()
+	original.ConfigVersion = 2
+	original.PublicURL = "https://preserved.test"
+	original.TMDBToken = "private-token"
+	original.SetupCompleted = true
+	original.CacheMB = 512
+	original.Sources = append(original.Sources, Source{Type: "addon", Name: "Private", ManifestURL: "https://addon.test/key/manifest.json"})
+	data, _ := json.Marshal(original)
+	var fields map[string]any
+	json.Unmarshal(data, &fields)
+	delete(fields, "nextEpisodePrefetch")
+	delete(fields, "nextEpisodeLeadMinutes")
+	data, _ = json.Marshal(fields)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := OpenConfigWithOptions(path, ConfigOptions{AppFFmpeg: "/managed/ffmpeg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original.ConfigVersion = 3
+	original.NextEpisodePrefetch = true
+	original.NextEpisodeLeadMinutes = 5
+	original.FFmpeg = "/managed/ffmpeg"
+	if !reflect.DeepEqual(cfg.Get(), original) {
+		t.Fatalf("migration lost settings: %+v", cfg.Get())
+	}
+	disabled := cfg.Get()
+	disabled.NextEpisodePrefetch = false
+	disabled.NextEpisodeLeadMinutes = 30
+	if err := cfg.Save(disabled); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenConfig(path)
+	if err != nil || !reflect.DeepEqual(reopened.Get(), disabled) {
+		t.Fatalf("explicitly disabled value lost: %v", err)
+	}
+	for _, lead := range []int{-1, 0, 31} {
+		invalid := disabled
+		invalid.NextEpisodeLeadMinutes = lead
+		if invalid.Validate() == nil {
+			t.Fatalf("accepted lead %d", lead)
+		}
+	}
+	for _, lead := range []int{1, 5, 30} {
+		valid := disabled
+		valid.NextEpisodeLeadMinutes = lead
+		if err := valid.Validate(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

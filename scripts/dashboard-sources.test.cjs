@@ -127,7 +127,7 @@ function fixture(sources = [vix], options = {}) {
   for (const id of ['sources', 'wizard-sources', 'add-source', 'wizard-add-source', 'wizard-next', 'wizard-error', 'toast', 'cache-mb']) {
     const el = new Element('div'); ids.set(id, el); body.append(el);
   }
-  let stored = { configVersion: 2, cacheMB: 256, minConfidence: 0.68, setupCompleted: false, sources: clone(sources) };
+  let stored = { configVersion: 3, cacheMB: 256, nextEpisodePrefetch: false, nextEpisodeLeadMinutes: 12, minConfidence: 0.68, setupCompleted: false, sources: clone(sources) };
   let gate, manifestGate, failSave = false, rejectManifest = !!options.rejectManifest, active = 0, maxActive = 0;
   const writes = [];
   const manifestRequests = [];
@@ -149,7 +149,7 @@ function fixture(sources = [vix], options = {}) {
       assert.ok(completing || url === '/api/settings');
       const candidate = completing ? { ...clone(stored), setupCompleted: true } : { ...clone(data), setupCompleted: stored.setupCompleted };
       if (!completing) {
-        assert.equal(data.configVersion, 2, 'settings saves must preserve the config version');
+        assert.equal(data.configVersion, 3, 'settings saves must preserve the config version');
         writes.push(clone(data));
       }
       active++; maxActive = Math.max(maxActive, active);
@@ -289,6 +289,8 @@ test('validated addon additions save automatically in settings and setup', async
     assert.equal(h.stored().sources[1].manifestURL, 'https://new.test/manifest.json');
     assert.equal(h.writes.length, 1);
     assert.equal(h.stored().cacheMB, 256);
+    assert.equal(h.stored().nextEpisodePrefetch, false);
+    assert.equal(h.stored().nextEpisodeLeadMinutes, 12);
     assert.equal(h.id('cache-mb').value, '512', 'source autosave must preserve other form edits');
     assert.equal(h.id(containerID === 'sources' ? 'wizard-sources' : 'sources').children.length, 2);
   }

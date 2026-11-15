@@ -25,6 +25,7 @@ type playbackTicket struct {
 	Order       int             `json:"order"`
 	Expires     int64           `json:"expires"`
 	Native      *nativePlayback `json:"native,omitempty"`
+	Source      Source          `json:"source"`
 	SourceID    string          `json:"sourceID,omitempty"`
 	SourceName  string          `json:"sourceName,omitempty"`
 	VariantURL  string          `json:"variantURL,omitempty"`
@@ -65,7 +66,7 @@ func openPlaybackKey(configPath string) (cipher.AEAD, error) {
 }
 
 func (s *Server) sealPlayback(v *Session) string {
-	return s.sealPlaybackTicket(playbackTicket{ID: v.ID, Type: v.Content.Type, Content: v.Content.ID, ContentName: v.ContentName, Stream: v.stream, Order: v.Order, Expires: time.Now().Add(time.Hour).Unix(), Native: v.native, SourceID: v.SourceID, SourceName: v.SourceName, VariantURL: v.stream.variantURL})
+	return s.sealPlaybackTicket(playbackTicket{ID: v.ID, Type: v.Content.Type, Content: v.Content.ID, ContentName: v.ContentName, Stream: v.stream, Order: v.Order, Expires: time.Now().Add(time.Hour).Unix(), Native: v.native, Source: v.source, SourceID: v.SourceID, SourceName: v.SourceName, VariantURL: v.stream.variantURL})
 }
 
 func (s *Server) sealPlaybackTicket(ticket playbackTicket) string {
@@ -117,12 +118,16 @@ func (s *Server) restorePlayback(id, encoded string) (*Session, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if v := s.playbackAliasLocked(id); v != nil {
+		return v, nil
+	}
 	if v := s.sessions[id]; v != nil {
 		return v, nil
 	}
 	ticket.Stream.variantURL = ticket.VariantURL
 	v := s.newSessionIDLocked(c, ticket.Stream, id)
 	v.Order, v.ticket, v.native = ticket.Order, encoded, ticket.Native
+	v.source = ticket.Source
 	v.SourceID, v.SourceName = ticket.SourceID, ticket.SourceName
 	v.ContentName = ticket.ContentName
 	if v.ContentName == "" {

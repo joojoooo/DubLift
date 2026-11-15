@@ -25,7 +25,7 @@ func TestNativePlaylistMakesImplicitByteRangesExplicit(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := s.newSession(Content{Type: "movie", ID: "tmdb:603"}, Stream{})
-	b, err := s.nativePlaylist(v, h, "", true, 0)
+	b, err := s.nativePlaylist(v, h, "", true, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

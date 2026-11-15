@@ -46,7 +46,7 @@ type Stream struct {
 }
 
 // Retain the complete upstream object, including torrent/external sources and
-// provider-specific metadata, so a passthrough response is truly unchanged.
+// provider-specific metadata. Response helpers patch only the intended fields.
 func (s *Stream) UnmarshalJSON(b []byte) error {
 	type plain Stream
 	if err := json.Unmarshal(b, (*plain)(s)); err != nil {
@@ -96,6 +96,29 @@ func (s Stream) playbackResponse(local string, italian, transformed bool) Stream
 	return out
 }
 
+// Rewrite only the authorized response hint, retaining the full upstream
+// object and unknown behavior hints even for torrent/external fallbacks.
+// The original stream and its resume ticket are never changed by rendering.
+func (s Stream) withBingeGroup(group string) Stream {
+	if group == s.BehaviorHints.BingeGroup {
+		return s
+	}
+	b, _ := json.Marshal(s)
+	var fields map[string]json.RawMessage
+	json.Unmarshal(b, &fields)
+	var hints map[string]json.RawMessage
+	json.Unmarshal(fields["behaviorHints"], &hints)
+	if hints == nil {
+		hints = map[string]json.RawMessage{}
+	}
+	hints["bingeGroup"], _ = json.Marshal(group)
+	fields["behaviorHints"], _ = json.Marshal(hints)
+	b, _ = json.Marshal(fields)
+	var out Stream
+	json.Unmarshal(b, &out)
+	return out
+}
+
 func (s Stream) Origin() Origin {
 	h := http.Header{}
 	for k, v := range s.Headers {
@@ -120,6 +143,9 @@ type Session struct {
 	Content                  Content `json:"content"`
 	Name                     string  `json:"name"`
 	ContentName              string
+	source                   Source
+	nextEpisodeAttempted     bool // guarded by Server.mu; one attempt per selected session
+	handedOff                bool // guarded by Server.mu; retain until playback selection or expiry
 	SourceID                 string
 	SourceName               string
 	Order                    int
@@ -182,6 +208,7 @@ type resource struct {
 	Position      float64
 	Track         bool
 	Video         bool
+	Subtitle      bool
 	PlaylistDepth int
 }
 
@@ -239,13 +266,18 @@ func (s *Server) newSessionLocked(c Content, stream Stream) *Session {
 	return s.newSessionIDLocked(c, stream, token())
 }
 func (s *Server) newSessionIDLocked(c Content, stream Stream, id string) *Session {
+	v := s.makeSession(c, stream, id)
+	s.sessions[v.ID] = v
+	return v
+}
+
+func (s *Server) makeSession(c Content, stream Stream, id string) *Session {
 	key := identity(c.Type, c.ID, stream.URL, fmt.Sprint(stream.Origin().Headers))
 	if stream.variantURL != "" {
 		key = identity(key, stream.variantURL)
 	}
 	ctx, cancel := context.WithCancel(context.WithValue(s.ctx, cacheOwnerKey{}, id))
 	v := &Session{ID: id, Key: key, lookupKey: key, Content: c, Name: stream.Name, Created: time.Now(), LastUsed: time.Now(), Status: "Available · waiting for player", Errors: []string{}, stream: stream, ready: make(chan struct{}), videoBase: -1, videoReady: map[int]bool{}, videoChanged: make(chan struct{}), resources: map[string]resource{}, ctx: ctx, cancel: cancel}
-	s.sessions[v.ID] = v
 	return v
 }
 func (s *Server) prepareSession(ctx context.Context, v *Session) error {
@@ -255,6 +287,10 @@ func (s *Server) prepareSession(ctx context.Context, v *Session) error {
 		v.mu.Unlock()
 		go func() {
 			defer close(v.ready)
+			if err := waitSpeculativeWork(v.ctx); err != nil {
+				v.prepareErr = err
+				return
+			}
 			work, cancel := context.WithTimeout(v.ctx, preparationTimeout)
 			defer cancel()
 			if v.listedReady != nil {

@@ -84,6 +84,9 @@ func (n *Network) request(ctx context.Context, o Origin, method, byteRange strin
 }
 
 func (n *Network) requestWithClient(ctx context.Context, o Origin, method, byteRange string, client *http.Client) (*http.Response, error) {
+	if err := waitSpeculativeWork(ctx); err != nil {
+		return nil, err
+	}
 	if _, e := httpURL(o.URL); e != nil {
 		return nil, e
 	}

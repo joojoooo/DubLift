@@ -16,7 +16,7 @@ import (
 
 // Bump this when the config format changes. Unsupported versions reset to
 // defaults; older supported versions execute sequential migrations.
-const currentConfigVersion = 2
+const currentConfigVersion = 3
 
 type Source struct {
 	Type        string `json:"type"`
@@ -39,6 +39,8 @@ type Settings struct {
 	FFprobe                string   `json:"ffprobe"`
 	TMDBToken              string   `json:"tmdbToken"`
 	Sources                []Source `json:"sources"`
+	NextEpisodePrefetch    bool     `json:"nextEpisodePrefetch"`
+	NextEpisodeLeadMinutes int      `json:"nextEpisodeLeadMinutes"`
 	SetupCompleted         bool     `json:"setupCompleted"`
 }
 
@@ -52,6 +54,8 @@ func DefaultSettings() Settings {
 		AlignmentSampleSeconds: 5,
 		AlignmentSamples:       1,
 		CacheMB:                256,
+		NextEpisodePrefetch:    true,
+		NextEpisodeLeadMinutes: 5,
 		FFmpeg:                 "ffmpeg",
 		FFprobe:                "ffprobe",
 		Sources:                defaultSources(),
@@ -140,11 +144,19 @@ type configMigration func(data map[string]any) error
 
 var configMigrations = map[int]configMigration{
 	1: migrateV1ToV2,
+	2: migrateV2ToV3,
 }
 
 func migrateV1ToV2(data map[string]any) error {
 	data["publicURL"] = ""
 	data["configVersion"] = 2
+	return nil
+}
+
+func migrateV2ToV3(data map[string]any) error {
+	data["nextEpisodePrefetch"] = true
+	data["nextEpisodeLeadMinutes"] = 5
+	data["configVersion"] = 3
 	return nil
 }
 
@@ -178,6 +190,9 @@ func (c Settings) Validate() error {
 	if c.ConfigVersion != currentConfigVersion {
 		return errors.New("unsupported config version; reload the dashboard")
 	}
+	if c.NextEpisodeLeadMinutes < 1 || c.NextEpisodeLeadMinutes > 30 {
+		return errors.New("next episode lead time must be 1–30 minutes")
+	}
 	if c.AlignmentSampleSeconds < 5 || c.AlignmentSampleSeconds > 40 {
 		return errors.New("alignment sample length must be 5–40 seconds")
 	}
@@ -205,10 +220,12 @@ func (c Settings) Validate() error {
 }
 
 type Config struct {
-	mu      sync.RWMutex
-	path    string
-	value   Settings
-	options ConfigOptions
+	saveMu    sync.Mutex
+	mu        sync.RWMutex
+	path      string
+	value     Settings
+	options   ConfigOptions
+	listeners map[string]func(Settings, Settings)
 }
 
 // ConfigOptions carries process-supplied settings and defaults.
@@ -351,18 +368,29 @@ func (c *Config) Get() Settings {
 	return s
 }
 func (c *Config) Save(s Settings) error {
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
 	c.options.applyManaged(&s)
 	s = s.normalizedSources()
 	if e := s.Validate(); e != nil {
 		return e
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if e := atomicJSON(c.path, s); e != nil {
+		c.mu.Unlock()
 		return e
 	}
 	s.Sources = append([]Source{}, s.Sources...)
+	old := c.value
 	c.value = s
+	listeners := make([]func(Settings, Settings), 0, len(c.listeners))
+	for _, changed := range c.listeners {
+		listeners = append(listeners, changed)
+	}
+	c.mu.Unlock()
+	for _, changed := range listeners {
+		changed(old, s)
+	}
 	return nil
 }
 func atomicJSON(path string, v any) error {
@@ -399,4 +427,16 @@ func token() string {
 		panic(e)
 	}
 	return hex.EncodeToString(b)
+}
+
+func (c *Config) subscribeSettings(changed func(Settings, Settings)) func() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.listeners == nil {
+		c.listeners = map[string]func(Settings, Settings){}
+	}
+	id := token()
+	c.listeners[id] = changed
+	changed(c.value, c.value)
+	return func() { c.mu.Lock(); delete(c.listeners, id); c.mu.Unlock() }
 }

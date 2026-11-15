@@ -17,7 +17,9 @@
   Defer source probing, indexing, and decoding until preparation or playback.
 - Preserve upstream ordering and complete fallback stream objects, including
   unknown JSON fields. The explicit donation-link exclusion in `discovery.go`
-  is intentional.
+  is intentional. Prefix player-facing addon binge groups with `dublift:`,
+  while retaining the exact upstream group internally for
+  prefetch matching and resume tickets.
 - Transformed playback uses local playlists and media endpoints. Preserve
   origin headers/cookies, HLS resource URLs, byte ranges, and media clocks.
 - Stream-copy source video. Keep origin reads, caches, extraction windows,

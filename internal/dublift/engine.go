@@ -78,17 +78,19 @@ type Probe struct {
 	} `json:"format"`
 }
 type Engine struct {
-	Config           *Config
-	Net              *Network
-	Cache            *ByteCache
-	mu               sync.Mutex
-	jobs             map[string]*mediaJob
-	base             string
-	srv              *http.Server
-	slots            chan struct{}
-	backgroundSlots  chan struct{}
-	foregroundFiles  map[string]*fileActivity
-	rangeReadTimeout time.Duration
+	Config             *Config
+	Net                *Network
+	Cache              *ByteCache
+	mu                 sync.Mutex
+	jobs               map[string]*mediaJob
+	base               string
+	srv                *http.Server
+	slots              chan struct{}
+	backgroundSlots    chan struct{}
+	foregroundFiles    map[string]*fileActivity
+	foregroundRequests int
+	foregroundIdle     chan struct{}
+	rangeReadTimeout   time.Duration
 }
 type fileActivity struct {
 	count int
@@ -651,7 +653,10 @@ func (e *Engine) run(ctx context.Context, binary string, args []string, limit in
 }
 
 func (e *Engine) runOutput(ctx context.Context, binary string, args []string, out io.Writer, packetInfo ...io.Writer) error {
-	if background, _ := ctx.Value(backgroundWorkKey{}).(bool); background {
+	if err := waitSpeculativeWork(ctx); err != nil {
+		return err
+	}
+	if background, _ := ctx.Value(backgroundWorkKey{}).(bool); background || isSpeculativeWork(ctx) {
 		select {
 		case e.backgroundSlots <- struct{}{}:
 			defer func() { <-e.backgroundSlots }()

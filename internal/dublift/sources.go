@@ -32,6 +32,15 @@ func builtinBingeGroup(provider, quality string) string {
 	return strings.Join([]string{"dublift", provider, quality}, ":")
 }
 
+// Prefix player-visible addon groups with DubLift's namespace. Sessions keep
+// the exact upstream value for matching; source identity stays separate.
+func (source Source) playerBingeGroup(upstream string) string {
+	if source.Type != "addon" || upstream == "" {
+		return upstream
+	}
+	return "dublift:" + upstream
+}
+
 type dashboardSource struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`

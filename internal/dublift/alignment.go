@@ -465,7 +465,11 @@ func findAnchor(ctx context.Context, source, vix PCMExtractor, vixAt, expectedOf
 		if options.Phase != nil {
 			options.Phase(fmt.Sprintf("%s near %.0fs · limit %s", stage, at, options.DownloadTimeout))
 		}
-		work, cancel := context.WithTimeout(ctx, options.DownloadTimeout)
+		if err := waitSpeculativeWork(ctx); err != nil {
+			return nil, err
+		}
+		stageCtx := context.WithValue(ctx, speculativeStageKey{}, true)
+		work, cancel := context.WithTimeout(stageCtx, options.DownloadTimeout)
 		defer cancel()
 		pcm, err := extractor(work, at, length)
 		if err != nil || work.Err() != nil {
@@ -486,6 +490,9 @@ func findAnchor(ctx context.Context, source, vix PCMExtractor, vixAt, expectedOf
 	}
 	if options.Phase != nil {
 		options.Phase(fmt.Sprintf("Calculating English audio alignment · limit %s", options.CalculationTimeout))
+	}
+	if err := waitSpeculativeWork(ctx); err != nil {
+		return Anchor{}, err
 	}
 	// Network and decoder time never consume the calculation deadline.
 	work, cancel := context.WithTimeout(ctx, options.CalculationTimeout)
