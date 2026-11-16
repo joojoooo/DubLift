@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
@@ -31,18 +32,55 @@ func videoWindowOverflow(current, incoming, published, limit int) error {
 type windowClock struct {
 	mu sync.Mutex
 	packetClock
+	ends    []videoBoundary
+	version int
+	updated func() error
+}
+
+// A boundary's decode timestamp identifies the end of the preceding GOP even
+// when reordered pictures present before its keyframe's indexed PTS.
+type videoBoundary struct {
+	decode float64
+	known  bool
+}
+
+func newWindowClock(bounds []float64, unmarked bool) *windowClock {
+	c := &windowClock{ends: make([]videoBoundary, len(bounds)-1)}
+	if !unmarked {
+		c.packet = func(dts, pts float64, key bool) {
+			if !key {
+				return
+			}
+			for i, end := range bounds[1:] {
+				if !c.ends[i].known && math.Abs(bounds[0]+pts-end) < .025 {
+					c.ends[i] = videoBoundary{decode: bounds[0] + dts + 1, known: true}
+					c.version++
+				}
+			}
+		}
+	}
+	return c
 }
 
 func (c *windowClock) Write(b []byte) (int, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.packetClock.Write(b)
+	known, version := c.known, c.version
+	n, err := c.packetClock.Write(b)
+	changed := c.known != known || c.version != version
+	c.mu.Unlock()
+	// The side pipe can lag stdout. Wake publication here as well as on media
+	// writes so a complete segment never waits for the following GOP's output.
+	if err == nil && changed && c.updated != nil {
+		err = c.updated()
+	}
+	return n, err
 }
 
 // One sequential FFmpeg extraction publishes each complete HLS segment as it
 // arrives. Stop the window after its output budget once at least one segment
 // is available; the remaining segments can be extracted in a fresh window.
 type videoWindowWriter struct {
+	mu                     sync.Mutex
 	raw                    []byte
 	parsed, complete, next int
 	writeErr               error
@@ -56,6 +94,11 @@ type videoWindowWriter struct {
 }
 
 func (w *videoWindowWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
 	if err := videoWindowOverflow(len(w.raw), len(b), w.next, videoWindowLimit); err != nil {
 		w.writeErr = err
 		return 0, w.writeErr
@@ -87,7 +130,7 @@ func (w *videoWindowWriter) Write(b []byte) (int, error) {
 			if w.unmarked && w.fragments%16 != 0 {
 				continue
 			}
-			if err := w.flush(false); err != nil {
+			if err := w.flushLocked(false); err != nil {
 				w.writeErr = err
 				return 0, err
 			}
@@ -97,8 +140,22 @@ func (w *videoWindowWriter) Write(b []byte) (int, error) {
 }
 
 func (w *videoWindowWriter) flush(final bool) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.writeErr != nil {
+		return w.writeErr
+	}
+	err := w.flushLocked(final)
+	if !final && err != nil {
+		w.writeErr = err
+	}
+	return err
+}
+
+func (w *videoWindowWriter) flushLocked(final bool) error {
 	w.clock.mu.Lock()
 	first, known := w.clock.first, w.clock.known
+	ends := append([]videoBoundary(nil), w.clock.ends...)
 	w.clock.mu.Unlock()
 	if !known {
 		if final {
@@ -109,7 +166,11 @@ func (w *videoWindowWriter) flush(final bool) error {
 	for w.next < len(w.bounds)-1 {
 		start, end := w.bounds[w.next], w.bounds[w.next+1]
 		completeEnd := !final || end < w.duration-.01
-		data, err := placeFragmentsMode(w.raw[:w.complete], w.bounds[0]+first+1, start+1, end+1, completeEnd, w.sequence+uint32(w.next), w.unmarked)
+		var boundary videoBoundary
+		if w.next < len(ends) {
+			boundary = ends[w.next]
+		}
+		data, err := placeFragmentsMode(w.raw[:w.complete], w.bounds[0]+first+1, start+1, end+1, completeEnd, w.sequence+uint32(w.next), w.unmarked, final, boundary)
 		if err != nil {
 			if final {
 				return err
@@ -148,7 +209,8 @@ func (e *Engine) videoWindowAttempt(ctx context.Context, a *Asset, bounds []floa
 	}
 	defer cleanup()
 	unmarked := a.unmarkedVideo.Load()
-	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), sequence: videoSequence(a, start), unmarked: unmarked, clock: &windowClock{}, publish: publish}
+	w := &videoWindowWriter{bounds: bounds, duration: a.Duration(), sequence: videoSequence(a, start), unmarked: unmarked, clock: newWindowClock(bounds, unmarked), publish: publish}
+	w.clock.updated = func() error { return w.flush(false) }
 	err = e.runOutput(ctx, e.Config.Get().FFmpeg, videoArgsMode(u, skip, start, end-start, unmarked), w, w.clock)
 	if errors.Is(w.writeErr, errVideoWindowFull) {
 		if originErr, metadata := inputFailure.failure(); originErr != nil && !metadata {

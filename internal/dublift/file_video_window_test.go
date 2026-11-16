@@ -13,7 +13,274 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4/seekablebuffer"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/mp4/codecs"
 )
+
+func TestVideoWindowWaitsForShortGOPAtBoundary(t *testing.T) {
+	for _, unmarked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unmarked=%t", unmarked), func(t *testing.T) {
+			var init seekablebuffer.Buffer
+			movie := fmp4.Init{Tracks: []*fmp4.InitTrack{{ID: 1, TimeScale: 1000, Codec: &codecs.H264{
+				SPS: []byte{0x67, 0x42, 0xc0, 0x28, 0xd9, 0x00, 0x78, 0x02, 0x27, 0xe5, 0x84, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc9, 0x20},
+				PPS: []byte{0x68, 0x00},
+			}}}}
+			if err := movie.Marshal(&init); err != nil {
+				t.Fatal(err)
+			}
+			// At 25 fps the marked path has a 0.4-second GOP before the
+			// boundary. The per-frame fallback checks after every 16 frames;
+			// its boundary leaves one frame inside the coverage tolerance.
+			boundary := 150
+			ends := []int{140, 150, 190, 200}
+			if unmarked {
+				boundary = 161
+				ends = nil
+				for i := 1; i <= 200; i++ {
+					ends = append(ends, i)
+				}
+			}
+			var segments [][]byte
+			w := &videoWindowWriter{
+				bounds: []float64{0, float64(boundary) * .04, 8}, duration: 8,
+				unmarked: unmarked, clock: &windowClock{packetClock: packetClock{known: true}},
+				publish: func(n int, data []byte) error {
+					if n != len(segments) {
+						t.Fatalf("out-of-order segment %d", n)
+					}
+					segments = append(segments, data)
+					return nil
+				},
+			}
+			if _, err := w.Write(init.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+			if !unmarked {
+				w.clock = newWindowClock(w.bounds, false)
+				w.clock.updated = func() error { return w.flush(false) }
+				// The side pipe can run ahead of stdout, even while the short
+				// final GOP is still arriving. Its boundary alone is insufficient.
+				clock := fmt.Sprintf("#tb 0: 1/1000\n0, 0, 0, 40, 1, 0\n0, %d, %d, 40, 1, 0\n", boundary*40, boundary*40)
+				if _, err := w.clock.Write([]byte(clock)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			first := 0
+			for _, end := range ends {
+				track := &fmp4.PartTrack{ID: 1, BaseTime: uint64(first * 40)}
+				for i := first; i < end; i++ {
+					track.Samples = append(track.Samples, &fmp4.Sample{
+						Duration: 40, IsNonSyncSample: i != first,
+						Payload: []byte{byte(i)},
+					})
+				}
+				var fragment seekablebuffer.Buffer
+				part := fmp4.Part{Tracks: []*fmp4.PartTrack{track}}
+				if err := part.Marshal(&fragment); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Write(fragment.Bytes()); err != nil {
+					t.Fatal(err)
+				}
+				if end < boundary && len(segments) != 0 {
+					t.Fatalf("published before the short GOP completed: received %d of %d frames", end, boundary)
+				}
+				if !unmarked && end == boundary && len(segments) != 1 {
+					t.Fatal("complete segment waited for the following GOP")
+				}
+				first = end
+			}
+			if len(segments) != 1 {
+				t.Fatalf("published %d segments before extraction completed, want 1", len(segments))
+			}
+			if err := w.flush(true); err != nil {
+				t.Fatal(err)
+			}
+			if len(segments) != 2 {
+				t.Fatalf("published %d segments after completion, want 2", len(segments))
+			}
+			next := 0
+			for n, data := range segments {
+				_, media, err := splitFMP4(data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var parts fmp4.Parts
+				if err := parts.Unmarshal(media); err != nil {
+					t.Fatal(err)
+				}
+				track := parts[0].Tracks[0]
+				if track.BaseTime != uint64(1000+next*40) {
+					t.Fatalf("segment %d has a discontinuous decode clock: %d", n, track.BaseTime)
+				}
+				for _, sample := range track.Samples {
+					if !bytes.Equal(sample.Payload, []byte{byte(next)}) || sample.Duration != 40 {
+						t.Fatalf("frame %d was dropped, changed, or reordered", next)
+					}
+					next++
+				}
+			}
+			if next != 200 {
+				t.Fatalf("retained %d of 200 frames", next)
+			}
+		})
+	}
+}
+
+func TestVideoWindowPublishesAtBoundaryPacket(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		start, preroll, reorder int
+	}{
+		{name: "closed_gop"},
+		{name: "seek_with_preroll", start: 10, preroll: 2},
+		{name: "open_gop", start: 10, preroll: 2, reorder: 80},
+	} {
+		for _, clockFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/clock_first=%t", tc.name, clockFirst), func(t *testing.T) {
+				var init seekablebuffer.Buffer
+				movie := fmp4.Init{Tracks: []*fmp4.InitTrack{{ID: 1, TimeScale: 1000, Codec: &codecs.H264{
+					SPS: []byte{0x67, 0x42, 0xc0, 0x28, 0xd9, 0x00, 0x78, 0x02, 0x27, 0xe5, 0x84, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc9, 0x20},
+					PPS: []byte{0x68, 0x00},
+				}}}}
+				if err := movie.Marshal(&init); err != nil {
+					t.Fatal(err)
+				}
+				bounds := []float64{float64(tc.start), float64(tc.start + 2), float64(tc.start + 18)}
+				var segments [][]byte
+				w := &videoWindowWriter{bounds: bounds, duration: float64(tc.start + 20), clock: newWindowClock(bounds, false),
+					publish: func(n int, data []byte) error {
+						if n != len(segments) {
+							t.Fatalf("out-of-order segment %d", n)
+						}
+						segments = append(segments, data)
+						return nil
+					},
+				}
+				w.clock.updated = func() error { return w.flush(false) }
+				writeClock := func(text string) {
+					t.Helper()
+					for _, b := range []byte(text) {
+						if _, err := w.clock.Write([]byte{b}); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				initialClock := fmt.Sprintf("#tb 0: 1/1000\n0, %d, %d, 40, 1, 0\n", -tc.preroll*1000-tc.reorder, -tc.preroll*1000)
+				// A reordered non-key packet can have the boundary PTS before
+				// the final GOP is complete. Only the key packet certifies it.
+				initialClock += "0, 1600, 2000, 40, 1, 0, F=0x0\n"
+				boundary := fmt.Sprintf("0, %d, 2000, 40, 1, 0\n", 2000-tc.reorder)
+				if clockFirst {
+					writeClock(initialClock)
+					writeClock(boundary)
+				}
+				write := func(data []byte) {
+					t.Helper()
+					if _, err := w.Write(data); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fragment := func(base, count int) []byte {
+					t.Helper()
+					track := &fmp4.PartTrack{ID: 1, BaseTime: uint64(base)}
+					for i := 0; i < count; i++ {
+						sample := &fmp4.Sample{Duration: 40, IsNonSyncSample: i != 0, Payload: []byte{byte(i)}}
+						if i == 0 {
+							sample.PTSOffset = int32(tc.reorder)
+						}
+						track.Samples = append(track.Samples, sample)
+					}
+					var out seekablebuffer.Buffer
+					part := fmp4.Part{Tracks: []*fmp4.PartTrack{track}}
+					if err := part.Marshal(&out); err != nil {
+						t.Fatal(err)
+					}
+					return out.Bytes()
+				}
+				write(init.Bytes())
+				if tc.preroll > 0 {
+					write(fragment(0, tc.preroll*25))
+				}
+				media := fragment(tc.preroll*1000, 50)
+				write(media[:len(media)-1])
+				if len(segments) != 0 {
+					t.Fatal("published before the last sample's payload arrived")
+				}
+				write(media[len(media)-1:])
+				if !clockFirst {
+					writeClock(initialClock)
+					if len(segments) != 0 {
+						t.Fatal("non-key packet certified the boundary")
+					}
+					writeClock(boundary)
+				}
+				if len(segments) != 1 {
+					t.Fatal("complete two-second segment waited for the following 16-second GOP")
+				}
+				_, media, err := splitFMP4(segments[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				var parts fmp4.Parts
+				if err := parts.Unmarshal(media); err != nil {
+					t.Fatal(err)
+				}
+				track := parts[0].Tracks[0]
+				if want := uint64((tc.start+1)*1000 - tc.reorder); track.BaseTime != want || len(track.Samples) != 50 {
+					t.Fatalf("wrong segment clock or sample count: base=%d, samples=%d", track.BaseTime, len(track.Samples))
+				}
+				for i, sample := range track.Samples {
+					if !bytes.Equal(sample.Payload, []byte{byte(i)}) || sample.Duration != 40 {
+						t.Fatalf("sample %d changed or disappeared", i)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestVideoWindowPublishesBeforeFollowingGOP(t *testing.T) {
+	ffmpegAvailable(t)
+	path := filepath.Join(t.TempDir(), "source.mp4")
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=24", "-t", "20", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "2", "-g", "480", "-sc_threshold", "0", "-force_key_frames", "0,2,18", "-movflags", "+faststart", path)
+	origin := httptest.NewServer(http.FileServer(http.Dir(filepath.Dir(path))))
+	defer origin.Close()
+	engine := testEngine(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	bounds := []float64{0, 2, 18, 20}
+	var segment []byte
+	w := &videoWindowWriter{bounds: bounds, duration: 20, sequence: 1, clock: newWindowClock(bounds, false),
+		publish: func(n int, data []byte) error {
+			if n != 0 {
+				return fmt.Errorf("unexpected segment %d", n)
+			}
+			segment = data
+			cancel()
+			return nil
+		},
+	}
+	w.clock.updated = func() error { return w.flush(false) }
+	// Read at playback speed: the following GOP cannot finish before the
+	// deadline. Its boundary packet must release the complete first segment.
+	args := append([]string{"-re"}, videoArgs(origin.URL+"/source.mp4", 0, 0, 20)...)
+	err := engine.runOutput(ctx, "ffmpeg", args, w, w.clock)
+	if !errors.Is(err, context.Canceled) || len(segment) == 0 {
+		t.Fatalf("first segment waited for the following GOP: err=%v, bytes=%d", err, len(segment))
+	}
+	out := filepath.Join(t.TempDir(), "segment.mp4")
+	if err := os.WriteFile(out, segment, 0600); err != nil {
+		t.Fatal(err)
+	}
+	lo, hi := packetTimes(t, out, "v:0")
+	if lo < .99 || lo > 1.01 || hi < 2.99 || hi > 3.01 {
+		t.Fatalf("first segment lost its packet clocks: %.3f..%.3f", lo, hi)
+	}
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", out, "-map", "0:v:0", "-f", "null", "-")
+}
 
 func TestVideoWindowOverflowPolicy(t *testing.T) {
 	if err := videoWindowOverflow(7, 2, 1, 8); !errors.Is(err, errVideoWindowFull) {

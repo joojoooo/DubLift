@@ -7,17 +7,18 @@ import (
 	"strings"
 )
 
-// Read FFmpeg's framecrc timebase and first packet PTS, then discard further
-// records. This uses constant memory even for large remuxed output segments.
+// Read FFmpeg's framecrc timebase and first packet PTS. An optional observer
+// receives later packet clocks without retaining their records.
 type packetClock struct {
 	line           string
 	scale, first   float64
 	known, invalid bool
+	packet         func(dts, pts float64, key bool)
 }
 
 func (p *packetClock) Write(data []byte) (int, error) {
 	n := len(data)
-	for len(data) > 0 && !p.known && !p.invalid {
+	for len(data) > 0 && (!p.known || p.packet != nil) && !p.invalid {
 		i := 0
 		for i < len(data) && data[i] != '\n' {
 			i++
@@ -58,5 +59,27 @@ func (p *packetClock) parse(line string) {
 		p.invalid = true
 		return
 	}
-	p.first, p.known = float64(pts)*p.scale, true
+	if !p.known {
+		p.first, p.known = float64(pts)*p.scale, true
+	}
+	if p.packet != nil {
+		dts, err := strconv.ParseInt(strings.TrimSpace(fields[1]), 10, 64)
+		if err != nil || math.Abs(float64(dts)*p.scale) > 24*3600 {
+			p.invalid = true
+			return
+		}
+		// framecrc omits F= for the default key-packet flag (0x1).
+		key := true
+		for _, field := range fields[6:] {
+			if flags, ok := strings.CutPrefix(strings.TrimSpace(field), "F="); ok {
+				value, err := strconv.ParseUint(flags, 0, 32)
+				if err != nil {
+					p.invalid = true
+					return
+				}
+				key = value&1 != 0
+			}
+		}
+		p.packet(float64(dts)*p.scale, float64(pts)*p.scale, key)
+	}
 }

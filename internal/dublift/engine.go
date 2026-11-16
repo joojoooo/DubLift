@@ -692,7 +692,11 @@ func (e *Engine) runOutput(ctx context.Context, binary string, args []string, ou
 		defer sideReader.Close()
 		cmd.ExtraFiles = []*os.File{sideWriter}
 		sideDone = make(chan error, 1)
-		go func() { _, err := io.Copy(packetInfo[0], sideReader); sideDone <- err }()
+		go func() {
+			_, err := io.Copy(packetInfo[0], sideReader)
+			sideReader.Close()
+			sideDone <- err
+		}()
 	}
 	err := cmd.Start()
 	if sideWriter != nil {
@@ -976,7 +980,7 @@ func (e *Engine) videoAttempt(ctx context.Context, a *Asset, start, duration flo
 	// still exits successfully. Do not cache that fragment as a complete HLS
 	// segment: the next segment would jump over the missing video frames.
 	completeEnd := start+duration < a.Duration()-.01
-	return placeFragmentsMode(raw, start+clock.first+1, start+1, start+duration+1, completeEnd, videoSequence(a, start), unmarked)
+	return placeFragmentsMode(raw, start+clock.first+1, start+1, start+duration+1, completeEnd, videoSequence(a, start), unmarked, true, videoBoundary{})
 }
 
 var errNoVideoPacketTimestamps = errors.New("remux produced no video packet timestamps")
@@ -1021,10 +1025,10 @@ func videoArgsMode(u string, skip, start, duration float64, unmarked bool) []str
 // Rebase fragment metadata, keep only complete GOPs before the next indexed
 // boundary, and preserve every compressed video sample byte-for-byte.
 func placeFragments(raw []byte, first, start, end float64, completeEnd bool, sequence uint32) ([]byte, error) {
-	return placeFragmentsMode(raw, first, start, end, completeEnd, sequence, false)
+	return placeFragmentsMode(raw, first, start, end, completeEnd, sequence, false, true, videoBoundary{})
 }
 
-func placeFragmentsMode(raw []byte, first, start, end float64, completeEnd bool, sequence uint32, unmarked bool) ([]byte, error) {
+func placeFragmentsMode(raw []byte, first, start, end float64, completeEnd bool, sequence uint32, unmarked, final bool, boundary videoBoundary) ([]byte, error) {
 	init, media, err := splitFMP4(raw)
 	if err != nil {
 		return nil, err
@@ -1059,6 +1063,7 @@ func placeFragmentsMode(raw []byte, first, start, end float64, completeEnd bool,
 	out.Write(init)
 	var combined *fmp4.PartTrack
 	var decodeEnd int64
+	reachedEnd := false
 	firstPTS, lastEnd := math.Inf(1), math.Inf(-1)
 	for _, p := range parts {
 		if len(p.Tracks) != 1 || len(p.Tracks[0].Samples) == 0 {
@@ -1071,6 +1076,7 @@ func placeFragmentsMode(raw []byte, first, start, end float64, completeEnd bool,
 			continue
 		}
 		if pts >= end-.025 {
+			reachedEnd = true
 			break
 		}
 		if base < 0 {
@@ -1093,6 +1099,18 @@ func placeFragmentsMode(raw []byte, first, start, end float64, completeEnd bool,
 	}
 	if combined == nil {
 		return nil, errors.New("no video samples at requested seek position")
+	}
+	// Coverage tolerances validate a finished extraction; they cannot prove
+	// that a streaming segment is complete. A scene cut can leave a short GOP
+	// still in flight inside that tolerance. The boundary packet's DTS proves
+	// completeness only once every preceding sample has reached stdout. This
+	// avoids waiting for the following GOP's payload, including for open GOPs
+	// whose final presentation timestamp precedes the next keyframe's PTS.
+	if boundary.known && decodeEnd == int64(math.Round(boundary.decode*float64(scale))) {
+		reachedEnd = true
+	}
+	if !final && !reachedEnd {
+		return nil, errors.New("video segment is waiting for its next boundary")
 	}
 	endTolerance := .5
 	if unmarked {

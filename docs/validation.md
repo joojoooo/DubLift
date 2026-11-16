@@ -32,8 +32,10 @@ make release
   fallback/default selection and embedded AAC discovery (including mixed external
   and embedded audio renditions), native subtitle preloading without playback
   position or prefetch changes (including nested playlists), HTTP ranges and retries,
-  HLS proxying, file remuxing/timing, generated fMP4 audio (including parallel
-  requests, retries, byte ranges, short final GOPs, wrapped HLS clocks with
+  HLS proxying, file remuxing/timing, progressive video publication with complete
+  short GOPs at segment boundaries and publication before the following GOP
+  (including reordered clocks and either pipe arrival order), generated fMP4 audio
+  (including parallel requests, retries, byte ranges, short final GOPs, wrapped HLS clocks with
   TS initialization maps, bounded/ranged/encrypted initialization detection,
   and adjacent fragment clocks), alignment, dashboard APIs, and session/cache
   lifecycle, partial discovery results at provider deadlines with request/lookup/playback
