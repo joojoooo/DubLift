@@ -35,7 +35,10 @@ make release
   HLS proxying, file remuxing/timing, progressive video publication with complete
   short GOPs at segment boundaries and publication before the following GOP
   (including reordered clocks and either pipe arrival order), generated fMP4 audio
-  (including parallel requests, retries, byte ranges, short final GOPs, wrapped HLS clocks with
+  (including parallel requests, retries, temporary HLS failures, preserved
+  rate limits with mixed source failures, rejected silence padding after
+  failed/truncated source reads, cancellation, byte
+  ranges, short final GOPs, wrapped HLS clocks with
   TS initialization maps, bounded/ranged/encrypted initialization detection,
   and adjacent fragment clocks), alignment, dashboard APIs, and session/cache
   lifecycle, partial discovery results at provider deadlines with request/lookup/playback

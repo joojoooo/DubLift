@@ -143,10 +143,12 @@ type cacheOnlyFileKey struct{}
 type cacheMissKey struct{}
 type mediaInputFailureKey struct{}
 type mediaInputFailure struct {
-	mu       sync.Mutex
-	err      error
-	metadata bool
-	video    bool
+	mu           sync.Mutex
+	err          error
+	rateLimitErr error
+	metadata     bool
+	video        bool
+	audio        bool
 }
 
 func recordMediaInputFailure(ctx context.Context, err error) {
@@ -161,17 +163,26 @@ func recordMediaInputFailureKind(ctx context.Context, err error, metadata bool) 
 	if errors.Is(err, context.DeadlineExceeded) {
 		if failure.video {
 			err = errors.New("the upstream video download timed out")
+		} else if failure.audio {
+			err = errors.New("the upstream audio download timed out")
 		} else {
 			err = errors.New("the origin download timed out before the English clip was available")
 		}
 	} else if errors.Is(err, io.ErrUnexpectedEOF) {
 		if failure.video {
 			err = errors.New("the upstream closed the download before the full video segment arrived")
+		} else if failure.audio {
+			err = errors.New("the upstream closed the download before the full audio segment arrived")
 		} else {
 			err = errors.New("the origin closed the download before the full English clip arrived")
 		}
 	}
 	failure.mu.Lock()
+	// Keep quota exhaustion independently of which metadata or media error
+	// supplies the primary diagnostic, so it always stops extraction retries.
+	if failure.rateLimitErr == nil && errors.Is(err, errOriginRateLimited) {
+		failure.rateLimitErr = err
+	}
 	// A recoverable metadata read must not hide a later media read failure.
 	if failure.err == nil || (failure.metadata && !metadata) {
 		failure.err = err
@@ -183,7 +194,11 @@ func recordMediaInputFailureKind(ctx context.Context, err error, metadata bool) 
 func (f *mediaInputFailure) failure() (error, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.err, f.metadata
+	err := f.err
+	if f.rateLimitErr != nil && !errors.Is(err, errOriginRateLimited) {
+		err = errors.Join(err, f.rateLimitErr)
+	}
+	return err, f.metadata
 }
 
 type mediaJob struct {
@@ -864,6 +879,23 @@ func decimal(v float64) string { return strconv.FormatFloat(v, 'f', 6, 64) }
 // Audio segments share the source presentation clock. Silence pads Vixsrc
 // gaps at either end; only audio is encoded, always at normal speed.
 func (e *Engine) Audio(ctx context.Context, t Track, start, duration, offset, clockBase float64, sequence uint32) ([]byte, error) {
+	finish := e.foregroundFile(t.Asset)
+	defer finish()
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var data []byte
+		data, err = e.audioAttempt(ctx, t, start, duration, offset, clockBase, sequence)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err == nil || errors.Is(err, errOriginRateLimited) {
+			return data, err
+		}
+	}
+	return nil, err
+}
+
+func (e *Engine) audioAttempt(ctx context.Context, t Track, start, duration, offset, clockBase float64, sequence uint32) ([]byte, error) {
 	base := audioBoundary(start + clockBase)
 	end := audioBoundary(start + duration + clockBase)
 	if base < 0 || end < base || duration <= 0 || math.IsNaN(duration) || math.IsInf(duration, 0) {
@@ -874,8 +906,8 @@ func (e *Engine) Audio(ctx context.Context, t Track, start, duration, offset, cl
 	end = max(end, base+audioFrameSamples)
 	start = float64(base)/audioSampleRate - clockBase
 	duration = float64(end-base) / audioSampleRate
-	finish := e.foregroundFile(t.Asset)
-	defer finish()
+	inputFailure := &mediaInputFailure{audio: true}
+	ctx = context.WithValue(ctx, mediaInputFailureKey{}, inputFailure)
 	vixStart := start - offset
 	leading := max(0, -vixStart)
 	inputStart := max(0, vixStart)
@@ -903,10 +935,19 @@ func (e *Engine) Audio(ctx context.Context, t Track, start, duration, offset, cl
 	defer cleanup()
 	args = append(args, "-t", decimal(duration), "-vn", "-sn", "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "192k", "-ac", "2", "-ar", strconv.Itoa(audioSampleRate), "-f", "adts", "pipe:1")
 	encoded, err := e.run(ctx, e.Config.Get().FFmpeg, args, 4<<20)
-	if err != nil {
-		return nil, err
+	var fragment []byte
+	if err == nil {
+		fragment, err = audioFragment(encoded, base, int((end-base)/audioFrameSamples), sequence)
 	}
-	return audioFragment(encoded, base, int((end-base)/audioFrameSamples), sequence)
+	// HLS decoding can skip failed resources and still exit successfully.
+	// apad may even conceal a short read with silence. Discard that attempt
+	// and reopen the bounded window instead of publishing missing audio.
+	// Unavailable file seek metadata is harmless if decoding and frame-count
+	// validation succeeded; reads containing media bytes remain fatal.
+	if originErr, metadata := inputFailure.failure(); originErr != nil && (!metadata || err != nil) {
+		return nil, fmt.Errorf("upstream audio download failed: %w", originErr)
+	}
+	return fragment, err
 }
 func (e *Engine) Video(ctx context.Context, a *Asset, start, duration float64) ([]byte, error) {
 	finish := e.foregroundFile(a)

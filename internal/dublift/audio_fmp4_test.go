@@ -2,7 +2,9 @@ package dublift
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -12,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/fmp4"
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/mp4/codecs"
@@ -58,6 +62,225 @@ func TestAudioBoundaryIgnoresSubsampleRoundingNoise(t *testing.T) {
 		if got := audioBoundary(boundary); got != 282*1024 {
 			t.Fatalf("boundary %.17g moved to sample %d", boundary, got)
 		}
+	}
+}
+
+func TestGeneratedAudioRetriesTemporaryHLSFailure(t *testing.T) {
+	ffmpegAvailable(t)
+	dir := t.TempDir()
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000", "-t", "10", "-c:a", "aac", "-hls_time", "2", "-hls_playlist_type", "vod", filepath.Join(dir, "audio.m3u8"))
+	for _, empty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("empty_segment=%t", empty), func(t *testing.T) {
+			var requests atomic.Int64
+			var recovered atomic.Bool
+			files := http.FileServer(http.Dir(dir))
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/audio2.ts" {
+					recovered.Store(true)
+				}
+				if r.URL.Path == "/audio1.ts" {
+					requests.Add(1)
+				}
+				if r.URL.Path == "/audio1.ts" && !recovered.Load() {
+					if empty {
+						data, err := os.ReadFile(filepath.Join(dir, "audio1.ts"))
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						// A successful HTTP read with only TS headers leaves a timestamp
+						// gap. Retry incomplete AAC output even without a proxy error.
+						http.ServeContent(w, r, "audio1.ts", time.Time{}, bytes.NewReader(data[:564]))
+						return
+					}
+					http.Error(w, "temporary source failure", http.StatusServiceUnavailable)
+					return
+				}
+				files.ServeHTTP(w, r)
+			}))
+			defer origin.Close()
+			engine := testEngine(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			a, err := engine.OpenAsset(ctx, Origin{URL: origin.URL + "/audio.m3u8"}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := engine.Audio(ctx, Track{Asset: a, Selector: "0:a:0"}, 0, 6.122667, 0, 1, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if requests.Load() < 2 {
+				t.Fatal("audio was accepted without retrying the failed source segment")
+			}
+			if got := len(audioPart(t, data).Tracks[0].Samples); got != 287 {
+				t.Fatalf("got %d audio frames, want 287", got)
+			}
+			healthy, err := engine.Audio(ctx, Track{Asset: a, Selector: "0:a:0"}, 0, 6.122667, 0, 1, 1)
+			if err != nil || !bytes.Equal(data, healthy) {
+				t.Fatal("recovered audio differs from an uninterrupted extraction", err)
+			}
+		})
+	}
+}
+
+func TestGeneratedAudioRejectsFailedHLSEvenWhenPadded(t *testing.T) {
+	ffmpegAvailable(t)
+	dir := t.TempDir()
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000", "-t", "10", "-c:a", "aac", "-hls_time", "2", "-hls_playlist_type", "vod", filepath.Join(dir, "audio.m3u8"))
+	for _, truncated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("truncated=%t", truncated), func(t *testing.T) {
+			var failed atomic.Bool
+			failed.Store(true)
+			var starts atomic.Int64
+			files := http.FileServer(http.Dir(dir))
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/audio0.ts" {
+					starts.Add(1)
+				}
+				if r.URL.Path == "/audio3.ts" && failed.Load() {
+					if !truncated {
+						http.Error(w, "source unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					data, err := os.ReadFile(filepath.Join(dir, "audio3.ts"))
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					start, end, err := requestRange(r.Header.Get("Range"), int64(len(data)))
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+					w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+					w.WriteHeader(http.StatusPartialContent)
+					// Keep the TS headers but omit nearly all audio, while claiming
+					// the complete range. EOF padding must not hide the short read.
+					w.Write(data[start:min(start+564, end+1)])
+					return
+				}
+				files.ServeHTTP(w, r)
+			}))
+			defer origin.Close()
+			engine := testEngine(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			a, err := engine.OpenAsset(ctx, Origin{URL: origin.URL + "/audio.m3u8"}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			get := func() ([]byte, error) {
+				return engine.Cache.Get(ctx, "audio-window", func() ([]byte, error) {
+					return engine.Audio(ctx, Track{Asset: a, Selector: "0:a:0"}, 0, 6.122667, 0, 1, 1)
+				})
+			}
+			data, err := get()
+			if err == nil || len(data) != 0 || !strings.Contains(err.Error(), "upstream audio download failed") {
+				t.Fatal("failed source was accepted or lost its origin error", err)
+			}
+			if got := starts.Load(); got != 2 {
+				t.Fatalf("opened %d extraction windows, want two bounded attempts", got)
+			}
+			if _, ok := engine.Cache.Lookup(ctx, "audio-window"); ok {
+				t.Fatal("failed audio was cached")
+			}
+			failed.Store(false)
+			if _, err := get(); err != nil {
+				t.Fatal("failed request prevented later recovery", err)
+			}
+		})
+	}
+}
+
+func TestGeneratedAudioRateLimitStopsRetryAfterMixedFailures(t *testing.T) {
+	ffmpegAvailable(t)
+	dir := t.TempDir()
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000", "-t", "10", "-c:a", "aac", "-hls_time", "2", "-hls_playlist_type", "vod", filepath.Join(dir, "audio.m3u8"))
+	for _, tc := range []struct {
+		name, transient, rateLimited string
+	}{
+		{name: "rate_limit_only", rateLimited: "/audio3.ts"},
+		{name: "after_transient_failure", transient: "/audio1.ts", rateLimited: "/audio3.ts"},
+		{name: "before_transient_failure", transient: "/audio3.ts", rateLimited: "/audio1.ts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var starts, transientReads, rateLimitedReads atomic.Int64
+			files := http.FileServer(http.Dir(dir))
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/audio0.ts":
+					starts.Add(1)
+				case tc.transient:
+					transientReads.Add(1)
+					http.Error(w, "temporary source failure", http.StatusServiceUnavailable)
+					return
+				case tc.rateLimited:
+					rateLimitedReads.Add(1)
+					// A delay beyond the origin retry budget must also stop the
+					// outer extraction retry, regardless of other segment failures.
+					w.Header().Set("Retry-After", "60")
+					http.Error(w, "provider quota exhausted", http.StatusTooManyRequests)
+					return
+				}
+				files.ServeHTTP(w, r)
+			}))
+			defer origin.Close()
+			engine := testEngine(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			a, err := engine.OpenAsset(ctx, Origin{URL: origin.URL + "/audio.m3u8"}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := engine.Audio(ctx, Track{Asset: a, Selector: "0:a:0"}, 0, 6.122667, 0, 1, 1)
+			if !errors.Is(err, errOriginRateLimited) || len(data) != 0 {
+				t.Fatal("audio lost the rate limit or published failed source audio", err)
+			}
+			if got := starts.Load(); got != 1 {
+				t.Fatalf("opened %d extraction windows after a rate limit, want one", got)
+			}
+			if rateLimitedReads.Load() == 0 || tc.transient != "" && transientReads.Load() == 0 {
+				t.Fatal("extraction did not encounter the configured source failures")
+			}
+		})
+	}
+}
+
+func TestGeneratedAudioCancellationStopsRetry(t *testing.T) {
+	ffmpegAvailable(t)
+	dir := t.TempDir()
+	command(t, "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000", "-t", "10", "-c:a", "aac", "-hls_time", "2", "-hls_playlist_type", "vod", filepath.Join(dir, "audio.m3u8"))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var starts atomic.Int64
+	files := http.FileServer(http.Dir(dir))
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/audio0.ts" {
+			starts.Add(1)
+		}
+		if r.URL.Path == "/audio1.ts" {
+			cancel()
+			http.Error(w, "canceled playback", http.StatusServiceUnavailable)
+			return
+		}
+		files.ServeHTTP(w, r)
+	}))
+	defer origin.Close()
+	engine := testEngine(t)
+	a, err := engine.OpenAsset(ctx, Origin{URL: origin.URL + "/audio.m3u8"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := engine.Audio(ctx, Track{Asset: a, Selector: "0:a:0"}, 0, 6.122667, 0, 1, 1)
+	if !errors.Is(err, context.Canceled) || len(data) != 0 || starts.Load() != 1 {
+		t.Fatal("canceled audio was retried or published", err, starts.Load())
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.jobs) != 0 {
+		t.Fatal("canceled extraction kept its media job")
 	}
 }
 

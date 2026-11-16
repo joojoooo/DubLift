@@ -311,7 +311,10 @@ there is no whole-title download or disk media cache.
 Generated audio uses AAC-LC in fragmented MP4 with a shared initialization
 segment. Players must support fMP4 HLS audio; segment retries and parallel
 downloads preserve the same media clock. Original HLS renditions retain their
-source format.
+source format. DubLift retries a failed generated audio window once within the
+request deadline, unless the provider's rate-limit retry budget is exhausted.
+Failed source reads are rejected even if the encoder pads the missing audio
+with silence.
 
 ## Troubleshooting
 
@@ -321,6 +324,11 @@ source format.
   usable font on Linux.
 - **Audio is out of sync:** match at the current position or set a manual
   delay, then seek/reopen. Different cuts may not match reliably.
+- **Audio briefly disappears:** an `incomplete encoded audio` error means the
+  encoder returned fewer AAC frames than the playback window requires. A
+  temporary audio-source failure can cause this; seeking back may succeed
+  after the source recovers. If the bounded retry fails, the dashboard reports
+  the error and recovery depends on the player's retry behavior.
 - **Playback stalls:** check **Video download** and provider errors. Origin
   speed below the video's bitrate, quotas, or expired URLs can interrupt
   playback even if preparation succeeds. `Idle` means no video request is

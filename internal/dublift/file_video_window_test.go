@@ -629,6 +629,15 @@ func TestFinalVideoSegmentHandlesMatroskaInputFailures(t *testing.T) {
 			}
 			w := httptest.NewRecorder()
 			s.media(w, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/media/%s/video/%d/segment.m4s", v.ID, last), nil))
+			start, end := v.boundaries[last], v.boundaries[last+1]
+			_, audioErr := s.Engine.Audio(v.ctx, Track{Asset: v.video, Selector: "0:a:0"}, start, end-start, 0, 1, uint32(last+1))
+			if tc.truncateMedia {
+				if audioErr == nil || !strings.Contains(audioErr.Error(), "upstream audio download failed") {
+					t.Fatal("truncated MKV audio was accepted or lost its origin error", audioErr)
+				}
+			} else if audioErr != nil {
+				t.Fatal("unavailable MKV metadata prevented complete audio extraction", audioErr)
+			}
 			if tc.rejectCues && rejectedCues.Load() == 0 {
 				t.Fatal("remux did not encounter the unavailable cue range")
 			}
